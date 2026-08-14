@@ -1,9 +1,17 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, protocol, shell } = require("electron");
 const path = require("node:path");
 const { validateRequest, sanitizeHeaders } = require("./allowlist.cjs");
 const { EmbeddedRenderer } = require("./renderer-server.cjs");
 const { DesktopCapabilities, handleDesktopAction } = require("./desktop-capabilities.cjs");
 const { PremiereBridge } = require("./premiere-bridge.cjs");
+const {
+  registerMediaProtocolPrivileges,
+  createMediaProtocolHandler,
+} = require("./media-protocol.cjs");
+
+// Must happen before app.whenReady() — Electron silently ignores privilege
+// registration for a scheme that's already been used or after boot.
+registerMediaProtocolPrivileges(protocol);
 
 const isDev = !app.isPackaged || process.env["ASSISTANT_EDITOR_DEV"] === "1";
 const DEV_RENDERER_URL = process.env["ASSISTANT_EDITOR_RENDERER_URL"] || "http://localhost:8080";
@@ -220,20 +228,32 @@ app.whenReady().then(() => {
     },
     // Same principle as the folder dialog: the renderer supplies content + a
     // suggested name, the OS save dialog picks the actual destination path.
+    // Filters follow the suggested filename's extension so each of the three
+    // export formats (CMX3600 EDL, Premiere XMEML, FCPXML) gets a sensible
+    // default in the OS dialog rather than one hardcoded to ".edl".
     showSaveDialog: async (suggestedName) => {
       const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+      const ext = path.extname(String(suggestedName || "")).toLowerCase();
+      const filterByExt = {
+        ".edl": { name: "CMX3600 EDL", extensions: ["edl"] },
+        ".xml": { name: "Premiere / Final Cut Pro 7 XML (XMEML)", extensions: ["xml"] },
+        ".fcpxml": { name: "Final Cut Pro X / Resolve XML (FCPXML)", extensions: ["fcpxml"] },
+      };
+      const primary = filterByExt[ext];
       const options = {
         title: "Export sequence",
         defaultPath: suggestedName,
-        filters: [
-          { name: "CMX3600 EDL", extensions: ["edl"] },
-          { name: "All files", extensions: ["*"] },
-        ],
+        filters: [...(primary ? [primary] : []), { name: "All files", extensions: ["*"] }],
       };
       const res = await (parent ? dialog.showSaveDialog(parent, options) : dialog.showSaveDialog(options));
       return res.canceled || !res.filePath ? null : res.filePath;
     },
   });
+  // Serves real media (originals + generated proxies) to the renderer's <video>
+  // elements, scoped to whichever mediaRoot the renderer has authorized via
+  // setActiveMediaRoot (see desktop-capabilities.cjs). Registered once, here,
+  // after `capabilities` exists so the handler always reads its *current* state.
+  protocol.handle("ae-media", createMediaProtocolHandler(() => capabilities?.activeMediaRoot ?? null));
   // Re-authorise roots persisted by previous sessions.
   void capabilities.readAll();
   void premiere.start().then((res) => {

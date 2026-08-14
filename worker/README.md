@@ -98,6 +98,25 @@ from "Demo Mode" to "Live" within a few seconds.
 4. Once complete, **Selects** and **Stories** populate from real analysis. Building a
    timeline from a chosen story also calls the reasoning provider to assemble the cut.
 
+## Validating the whole pipeline end-to-end
+
+`validate_e2e.py` (this folder) runs the entire pipeline above — import,
+proxy generation, transcription, visual analysis, selects, stories, a real
+`/build` prompt, preview-source verification, and EDL/XMEML/FCPXML export —
+against your own real footage and API keys, and prints a clear PASS/FAIL/SKIP
+per stage instead of you having to click through the app to find out where
+something broke:
+
+```sh
+source .venv/bin/activate
+python validate_e2e.py --media-root "/path/to/real/footage"
+```
+
+See `../VALIDATION.md` for what each stage checks, how to read the results,
+and the handful of things (does it actually scrub smoothly, does the exported
+file really import into Premiere/Resolve/FCP) that only a human looking at a
+screen can verify.
+
 ## Costs
 
 Every Analyze run makes real API calls: one transcription call per clip with audio,

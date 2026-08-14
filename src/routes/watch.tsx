@@ -10,12 +10,14 @@ import {
   Play,
   ScanEye,
 } from "lucide-react";
+import { MediaPlayer } from "@/components/ae/MediaPlayer";
 import { PageHeader } from "@/components/ae/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { useAE } from "@/lib/ae/store";
+import { previewSrcForClip } from "@/lib/ae/media-url";
 import type { Clip } from "@/lib/ae/types";
 
 export const Route = createFileRoute("/watch")({
@@ -313,6 +315,18 @@ function WatchPage() {
             {active ? (
               <div className="mt-3 space-y-4">
                 <div className="font-tc text-sm">{active.filename}</div>
+
+                {desktopCapabilities ? (
+                  previewSrcForClip(active) ? (
+                    <MediaPlayer key={active.id} src={previewSrcForClip(active)} />
+                  ) : (
+                    <p className="rounded border border-border bg-surface px-2.5 py-2 text-[11px] text-muted-foreground">
+                      No preview yet — run Analyze (or re-run it) to generate a playable proxy
+                      for this clip.
+                    </p>
+                  )
+                ) : null}
+
                 <dl className="grid grid-cols-2 gap-y-2 text-xs">
                   <dt className="text-muted-foreground">Duration</dt>
                   <dd className="font-tc">{secs(active.durationSeconds)}</dd>

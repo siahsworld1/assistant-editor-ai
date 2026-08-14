@@ -205,6 +205,60 @@ def extract_frames(path: Path, out_dir: Path, count: int = 8) -> list[Path]:
     return frames
 
 
+PROXY_MAX_WIDTH = 960
+PROXY_DIR_NAME = ".ae_proxies"
+
+
+def generate_proxy(src: Path, dest: Path, max_width: int = PROXY_MAX_WIDTH) -> bool:
+    """Transcodes `src` to an H.264/AAC MP4 proxy at `dest`, scaled to at most
+    `max_width` wide (never upscaled), with a moov atom at the front
+    (`-movflags +faststart`) so it starts streaming/seeking immediately over the
+    ae-media:// protocol instead of needing the whole file first.
+
+    This exists for two real reasons, not just as a checklist item:
+      1. Chromium's <video> element cannot decode many professional camera
+         formats at all (ProRes in a .mov, various MXF wrappers, some HEVC
+         variants) — without a proxy, in-app preview would silently fail to
+         play the original master on a real documentary shoot.
+      2. A 960px H.264 proxy scrubs smoothly; a 4K/6K camera original does not,
+         even when Chromium *can* decode it.
+
+    Returns False (never raises) on any failure — proxy generation is a
+    best-effort preview convenience, not something that should ever fail the
+    analysis pass for that clip.
+    """
+    if not ffmpeg_available():
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    scale_filter = f"scale='min({max_width},iw)':-2"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(src),
+                "-vf", scale_filter,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(dest),
+            ],
+            capture_output=True, timeout=1800, check=True,
+        )
+        return dest.exists() and dest.stat().st_size > 0
+    except (subprocess.SubprocessError, OSError):
+        dest.unlink(missing_ok=True)
+        return False
+
+
+def proxy_is_current(src: Path, dest: Path) -> bool:
+    """True if `dest` already exists and is newer than `src` — used to skip
+    re-encoding on repeat Analyze runs when the source file hasn't changed."""
+    try:
+        return dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime
+    except OSError:
+        return False
+
+
 def frame_timecode(index: int, count: int, duration: float, fps: float = 24.0) -> str:
     step = duration / (count + 1)
     seconds = step * (index + 1)

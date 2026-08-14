@@ -43,6 +43,14 @@ contextBridge.exposeInMainWorld("assistantEditorDesktop", {
         content: typeof content === "string" ? content : "",
       },
     }),
+  // Authorizes the ae-media:// playback protocol to serve from this root (must
+  // already be a folder the user picked via chooseMediaFolder). Pass "" to
+  // deauthorize (e.g. when no project is open).
+  setActiveMediaRoot: (root) =>
+    ipcRenderer.invoke("assistant-editor:desktop", {
+      action: "setActiveMediaRoot",
+      payload: { root: typeof root === "string" ? root : "" },
+    }),
 });
 
 // Premiere Pro (UXP) integration status + a fixed command vocabulary.

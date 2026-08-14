@@ -133,6 +133,25 @@ def _analyze_one_clip(
     clip_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        # Proxy generation: a scaled-down H.264/AAC MP4 that Chromium's <video>
+        # element can actually decode and scrub, unlike many camera-original
+        # formats (ProRes/MXF/HEVC variants). Lives under the media root itself
+        # (media_root/.ae_proxies/<clipId>.mp4) so the same authorized-root
+        # boundary that gates the ae-media:// playback protocol already covers
+        # it — no separate allowlist entry needed. Skipped for audio-only files
+        # (nothing to scale; the original plays fine as-is) and never fails the
+        # clip — a missing proxy just means preview falls back to the original.
+        if ext not in media.AUDIO_ONLY_EXTENSIONS and STORE.media_root:
+            proxy_dir = Path(STORE.media_root) / media.PROXY_DIR_NAME
+            proxy_dest = proxy_dir / f"{clip_id}.mp4"
+            if media.proxy_is_current(path, proxy_dest):
+                clip.proxy_rel_path = f"{media.PROXY_DIR_NAME}/{clip_id}.mp4"
+            elif media.generate_proxy(path, proxy_dest):
+                clip.proxy_rel_path = f"{media.PROXY_DIR_NAME}/{clip_id}.mp4"
+            else:
+                log.warning("proxy generation failed for %s — preview will fall back to the original file", path.name)
+            STORE.upsert_clip(clip)
+
         if info["has_audio"]:
             wav_path = clip_dir / "audio.wav"
             if media.extract_audio(path, wav_path):

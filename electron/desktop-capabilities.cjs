@@ -100,6 +100,11 @@ class DesktopCapabilities {
     this.showSaveDialog = deps.showSaveDialog;
     /** Roots the user explicitly picked (or previously persisted). */
     this.authorizedRoots = new Set();
+    /** The mediaRoot of whichever project the renderer currently has open — the
+     * only root the ae-media:// playback protocol (media-protocol.cjs) will ever
+     * serve from. Never set except via setActiveMediaRoot below, which requires
+     * the root to already be in authorizedRoots. */
+    this.activeMediaRoot = null;
   }
 
   get storePath() {
@@ -165,7 +170,8 @@ class DesktopCapabilities {
   /**
    * User-gated file export: the renderer supplies content + a suggested filename
    * only — the OS save dialog picks the real destination path, so the renderer
-   * can never write to an arbitrary location on disk. Used for EDL/XML export.
+   * can never write to an arbitrary location on disk. Used for CMX3600 EDL,
+   * Premiere XMEML, and FCPXML export.
    */
   async exportFile(suggestedName, content) {
     if (typeof content !== "string" || !content) {
@@ -185,6 +191,25 @@ class DesktopCapabilities {
     } catch {
       return { ok: false, error: "Could not write the export file to that location." };
     }
+  }
+
+  /**
+   * Called by the renderer whenever the open project (or its mediaRoot) changes.
+   * Only a root already authorised via the folder picker may become active — this
+   * is what lets the ae-media:// protocol trust `this.activeMediaRoot` without
+   * re-deriving authorization itself. Passing "" (no project open / no media yet)
+   * clears it, which makes every media request 404 until a real root is set again.
+   */
+  async setActiveMediaRoot(root) {
+    if (root === "" || root == null) {
+      this.activeMediaRoot = null;
+      return { ok: true };
+    }
+    if (typeof root !== "string" || !isAuthorizedRoot(root, this.authorizedRoots)) {
+      return { ok: false, error: "This folder has not been authorised by the desktop picker." };
+    }
+    this.activeMediaRoot = path.normalize(root);
+    return { ok: true };
   }
 
   /** Metadata-only recursive listing of an authorised root. */
@@ -251,6 +276,7 @@ const ACTIONS = new Set([
   "chooseMediaFolder",
   "indexMedia",
   "exportFile",
+  "setActiveMediaRoot",
 ]);
 
 /** Dispatcher used by the IPC handler. Rejects anything outside the action list. */
@@ -272,6 +298,8 @@ async function handleDesktopAction(caps, action, payload) {
         return await caps.indexMedia(payload?.path);
       case "exportFile":
         return await caps.exportFile(payload?.suggestedName, payload?.content);
+      case "setActiveMediaRoot":
+        return await caps.setActiveMediaRoot(payload?.root);
       default:
         return { ok: false, error: "Unsupported action" };
     }

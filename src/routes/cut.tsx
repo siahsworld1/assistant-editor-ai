@@ -1,14 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Download, Hammer, Loader2 } from "lucide-react";
+import { Download, Hammer, Loader2, Pause, Play } from "lucide-react";
 import { toast } from "sonner";
+import { MediaPlayer } from "@/components/ae/MediaPlayer";
 import { PageHeader } from "@/components/ae/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
 import { formatDuration, useAE } from "@/lib/ae/store";
+import { useTimelinePlayback } from "@/lib/ae/timeline-playback";
 import type { EditDecisionLane, UniversalTimeline } from "@/lib/ae/types";
 import { buildCmx3600Edl, edlFilename, validateTimelineForExport } from "@/lib/nle/edl";
+import { buildFcpxml, fcpxmlFilename } from "@/lib/nle/fcpxml";
+import { buildXmeml, xmemlFilename } from "@/lib/nle/xmeml";
 
 export const Route = createFileRoute("/cut")({
   head: () => ({
@@ -55,20 +59,31 @@ function CutPage() {
   const timeline = version.timeline;
   const scale = Math.max(timeline.totalSeconds, targetSeconds);
   const story = stories.find((s) => s.id === chosenStoryId);
+  const clips = project?.clips ?? [];
+  const mediaRoot = project?.mediaRoot ?? "";
+
+  const playback = useTimelinePlayback(timeline, clips);
 
   const lanes: EditDecisionLane[] = ["interview", "b-roll", "audio"];
 
+  type ExportFormat = "edl" | "xmeml" | "fcpxml";
+  const FORMAT_LABEL: Record<ExportFormat, string> = {
+    edl: "CMX3600 EDL",
+    xmeml: "Premiere / FCP7 XML (XMEML)",
+    fcpxml: "Final Cut Pro X / Resolve XML (FCPXML)",
+  };
+
   // Real export: validated against the actual clip list, then written to disk via
-  // the native save dialog. Currently CMX3600 EDL only — see src/lib/nle/edl.ts for
-  // why that's the one real format shipped so far, rather than three unverified ones.
-  const exportTimeline = async (targetName: string, timelineToExport: UniversalTimeline) => {
+  // the native save dialog. Three formats share one validation gate
+  // (validateTimelineForExport) — see src/lib/nle/{edl,xmeml,fcpxml}.ts for what
+  // each format actually is and which apps import it natively.
+  const exportTimeline = async (targetName: string, timelineToExport: UniversalTimeline, format: ExportFormat) => {
     if (!desktopCapabilities || !window.assistantEditorDesktop) {
       toast.error("Export requires the desktop companion", {
         description: "Run the app with `npm run dev:desktop`, not a plain browser tab.",
       });
       return;
     }
-    const clips = project?.clips ?? [];
     const { ok, errors, usable } = validateTimelineForExport(timelineToExport, clips);
     if (!ok) {
       toast.error("Nothing valid to export", { description: errors[0] ?? "Timeline failed validation." });
@@ -79,15 +94,36 @@ function CutPage() {
         description: `${errors.length} event(s) were dropped: ${errors[0]}`,
       });
     }
-    const edl = buildCmx3600Edl(timelineToExport, usable, clips);
-    const result = await window.assistantEditorDesktop.exportFile(edlFilename(timelineToExport), edl);
+
+    let content: string;
+    let filename: string;
+    let warnings: string[] = [];
+    if (format === "edl") {
+      content = buildCmx3600Edl(timelineToExport, usable, clips);
+      filename = edlFilename(timelineToExport);
+    } else if (format === "xmeml") {
+      const built = buildXmeml(timelineToExport, usable, clips, mediaRoot);
+      content = built.xml;
+      warnings = built.warnings;
+      filename = xmemlFilename(timelineToExport);
+    } else {
+      const built = buildFcpxml(timelineToExport, usable, clips, mediaRoot);
+      content = built.xml;
+      warnings = built.warnings;
+      filename = fcpxmlFilename(timelineToExport);
+    }
+
+    const result = await window.assistantEditorDesktop.exportFile(filename, content);
     if (result.cancelled) return;
     if (!result.ok) {
       toast.error("Export failed", { description: result.error ?? "Unknown error." });
       return;
     }
+    if (warnings.length > 0) {
+      toast.warning(`Exported with ${warnings.length} note(s)`, { description: warnings[0] });
+    }
     toast.success(`Exported to ${targetName}`, {
-      description: `${usable.length} events written as CMX3600 EDL → ${result.path}`,
+      description: `${usable.length} events written as ${FORMAT_LABEL[format]} → ${result.path}`,
     });
   };
 
@@ -116,6 +152,52 @@ function CutPage() {
       <div className="space-y-4 px-6 py-5">
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
           <div className="space-y-4">
+            {desktopCapabilities && (
+              <div className="panel p-4">
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                    Preview
+                  </div>
+                  {!playback.hasPlayableMedia && (
+                    <span className="text-[11px] text-muted-foreground">
+                      No analyzed clips with a real preview yet
+                    </span>
+                  )}
+                </div>
+                <MediaPlayer
+                  ref={playback.playerRef}
+                  src={playback.activeSegment?.src ?? null}
+                  startAtSeconds={playback.pendingStart}
+                  hideControls
+                  onTimeUpdate={playback.handleTimeUpdate}
+                  onDurationChange={playback.handleSegmentReady}
+                  onPlayStateChange={playback.handlePlayStateChange}
+                  onEnded={playback.handleEnded}
+                  className="mx-auto max-w-md"
+                />
+                <div className="mx-auto mt-2 flex max-w-md items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={playback.togglePlay}
+                    disabled={!playback.hasPlayableMedia}
+                    className="grid size-7 shrink-0 place-items-center rounded-full bg-secondary text-secondary-foreground disabled:opacity-40"
+                  >
+                    {playback.isPlaying ? (
+                      <Pause className="size-3.5" />
+                    ) : (
+                      <Play className="size-3.5 translate-x-px" />
+                    )}
+                  </button>
+                  <span className="font-tc text-[11px] text-primary">
+                    {formatDuration(playback.playheadSeconds)}
+                  </span>
+                  <span className="font-tc text-[11px] text-muted-foreground">
+                    / {formatDuration(timeline.totalSeconds)}
+                  </span>
+                </div>
+              </div>
+            )}
+
             <div className="panel p-5">
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
@@ -142,7 +224,7 @@ function CutPage() {
                 </div>
               </div>
 
-              <div className="mt-5 space-y-2">
+              <div className="relative mt-5 space-y-2">
                 <div className="relative h-5 border-b border-border">
                   {Array.from({ length: 9 }).map((_, i) => (
                     <span
@@ -154,6 +236,35 @@ function CutPage() {
                     </span>
                   ))}
                 </div>
+
+                {/* Scrub target, aligned to the track columns (112px label + 12px gap-3
+                    before each lane's track div starts) so its coordinate space matches
+                    the `left: pct%` math each lane item below already uses. */}
+                {desktopCapabilities && (
+                  <div
+                    className="absolute inset-y-0 left-[124px] right-0 z-10 cursor-pointer"
+                    onPointerDown={(e) => {
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const seekFromClientX = (clientX: number) => {
+                        const pct = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+                        playback.seek(pct * scale);
+                      };
+                      seekFromClientX(e.clientX);
+                      const onMove = (ev: PointerEvent) => seekFromClientX(ev.clientX);
+                      const onUp = () => {
+                        window.removeEventListener("pointermove", onMove);
+                        window.removeEventListener("pointerup", onUp);
+                      };
+                      window.addEventListener("pointermove", onMove);
+                      window.addEventListener("pointerup", onUp);
+                    }}
+                  >
+                    <div
+                      className="pointer-events-none absolute inset-y-0 w-px bg-warning"
+                      style={{ left: `${Math.min(100, (playback.playheadSeconds / scale) * 100)}%` }}
+                    />
+                  </div>
+                )}
 
                 {lanes.map((lane) => {
                   const items = timeline.decisions.filter((d) => d.lane === lane);
@@ -289,31 +400,43 @@ function CutPage() {
               </div>
               <ul className="mt-2 space-y-2">
                 {nle.map((n) => (
-                  <li
-                    key={n.id}
-                    className="flex items-center justify-between gap-2 rounded border border-border bg-surface px-3 py-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate text-xs font-medium">{n.name}</div>
-                      <div className="truncate font-tc text-[10px] text-muted-foreground">
-                        CMX3600 EDL (File → Import)
-                      </div>
+                  <li key={n.id} className="rounded border border-border bg-surface px-3 py-2">
+                    <div className="mb-1.5 truncate text-xs font-medium">{n.name}</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => void exportTimeline(n.name, timeline, "edl")}
+                      >
+                        <Download className="size-3" /> EDL
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => void exportTimeline(n.name, timeline, "xmeml")}
+                      >
+                        <Download className="size-3" /> XML
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => void exportTimeline(n.name, timeline, "fcpxml")}
+                      >
+                        <Download className="size-3" /> FCPXML
+                      </Button>
                     </div>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => void exportTimeline(n.name, timeline)}
-                    >
-                      <Download className="size-3.5" /> Export
-                    </Button>
                   </li>
                 ))}
               </ul>
               <p className="mt-2 text-[11px] text-muted-foreground">
-                Writes a real .edl file to disk via the native save dialog — nothing is sent
-                anywhere. Import it manually in each application; there is no live-push
-                integration for these three yet (Premiere has a separate, experimental live
-                bridge — see Settings).
+                Writes a real file to disk via the native save dialog — nothing is sent
+                anywhere. EDL and XML (XMEML) import into Premiere Pro and Final Cut Pro 7;
+                FCPXML imports natively into Final Cut Pro X and DaVinci Resolve. Import
+                manually in each application; there is no live-push integration for these
+                three yet (Premiere has a separate, experimental live bridge — see Settings).
               </p>
             </div>
           </aside>

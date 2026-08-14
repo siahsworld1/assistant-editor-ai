@@ -1,0 +1,110 @@
+"""Real (non-mocked) tests for proxy generation. Uses ffmpeg's lavfi test sources
+to synthesize a tiny real video+audio file, then runs the actual proxy transcode
+against it and verifies the output with ffprobe — no mocking of ffmpeg itself.
+Skips cleanly if ffmpeg/ffprobe aren't on PATH rather than failing the suite.
+
+Run from worker/: `python3 -m unittest discover -s tests -v`
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import media  # noqa: E402
+
+
+def _ffmpeg_present() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def _make_synthetic_clip(dest: Path, width: int = 1920, height: int = 1080, seconds: float = 1.0) -> bool:
+    """A real (tiny) H.264/AAC .mov, generated purely from ffmpeg's built-in test
+    sources — no fixture binary checked into the repo, matching the project's
+    "no fixtures outside tests" rule while still exercising real ffmpeg I/O."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"testsrc=size={width}x{height}:rate=24:duration={seconds}",
+                "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                str(dest),
+            ],
+            capture_output=True, timeout=60, check=True,
+        )
+        return dest.exists() and dest.stat().st_size > 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+@unittest.skipUnless(_ffmpeg_present(), "ffmpeg/ffprobe not on PATH")
+class TestGenerateProxy(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ae-proxy-test-"))
+        self.src = self.tmp / "source_4k.mov"
+        ok = _make_synthetic_clip(self.src, width=1920, height=1080, seconds=1.0)
+        if not ok:
+            self.skipTest("Could not synthesize a test clip with this ffmpeg build.")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_generates_a_real_playable_h264_proxy(self):
+        dest = self.tmp / media.PROXY_DIR_NAME / "clip-001.mp4"
+        ok = media.generate_proxy(self.src, dest, max_width=960)
+        self.assertTrue(ok, "generate_proxy reported failure")
+        self.assertTrue(dest.exists())
+        self.assertGreater(dest.stat().st_size, 0)
+
+        # Verify with ffprobe — a real playability check, not just "a file exists".
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(dest)],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(proc.stdout or "{}")
+        streams = data.get("streams", [])
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        self.assertIsNotNone(video, "proxy has no decodable video stream")
+        self.assertIsNotNone(audio, "proxy has no decodable audio stream")
+        self.assertEqual(video.get("codec_name"), "h264")
+        self.assertLessEqual(int(video.get("width", 0)), 960)
+
+    def test_never_upscales_a_smaller_source(self):
+        small_src = self.tmp / "small_source.mov"
+        self.assertTrue(_make_synthetic_clip(small_src, width=480, height=270, seconds=1.0))
+        dest = self.tmp / media.PROXY_DIR_NAME / "clip-002.mp4"
+        self.assertTrue(media.generate_proxy(small_src, dest, max_width=960))
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(dest)],
+            capture_output=True, text=True, timeout=30,
+        )
+        video = next(s for s in json.loads(proc.stdout)["streams"] if s.get("codec_type") == "video")
+        self.assertLessEqual(int(video["width"]), 480)
+
+    def test_returns_false_and_cleans_up_on_a_bogus_source(self):
+        bogus = self.tmp / "not_a_real_video.mov"
+        bogus.write_bytes(b"this is not a video file")
+        dest = self.tmp / media.PROXY_DIR_NAME / "clip-bad.mp4"
+        ok = media.generate_proxy(bogus, dest)
+        self.assertFalse(ok)
+        self.assertFalse(dest.exists())
+
+    def test_proxy_is_current_reflects_mtimes(self):
+        dest = self.tmp / media.PROXY_DIR_NAME / "clip-003.mp4"
+        self.assertFalse(media.proxy_is_current(self.src, dest))
+        self.assertTrue(media.generate_proxy(self.src, dest))
+        self.assertTrue(media.proxy_is_current(self.src, dest))
+
+
+if __name__ == "__main__":
+    unittest.main()

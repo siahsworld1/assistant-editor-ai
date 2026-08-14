@@ -48,6 +48,11 @@ export interface Clip {
   /** Path relative to the project's mediaRoot. Required for export (reel refs) and
    * for locating the real source file on disk (playback, future NLE re-link). */
   relPath?: string | undefined;
+  /** Path (relative to mediaRoot) of a generated H.264/AAC preview proxy, if the
+   * engine has produced one for this clip (worker/media.py::generate_proxy). When
+   * present, playback prefers this over `relPath` — Chromium can't decode every
+   * camera-original format, but every proxy is guaranteed playable. */
+  proxyRelPath?: string | undefined;
   role: ClipRole;
   durationSeconds: number;
   camera: string;

@@ -20,6 +20,7 @@ class ClipState:
     resolution: str
     fps: float
     rel_path: str = ""
+    proxy_rel_path: str = ""
     speakers: list[str] = field(default_factory=list)
     state: str = "pending"  # pending | analyzing | analyzed | error
     progress: int = 0
@@ -33,6 +34,7 @@ class ClipState:
             "id": self.id,
             "filename": self.filename,
             "relPath": self.rel_path,
+            "proxyRelPath": self.proxy_rel_path,
             "role": self.role,
             "durationSeconds": self.duration_seconds,
             "camera": self.camera,
@@ -116,6 +118,11 @@ class ProjectStore:
                 "summary": self.snapshot_summary(),
                 "analysisState": self.analysis_state,
                 "analysisProgress": self.analysis_progress,
+                # Additive, backward-compatible: existing consumers that don't know
+                # this key ignore it. Added so a caller polling GET /project (e.g.
+                # worker/validate_e2e.py) can report *why* analysisState == "error"
+                # instead of just that it happened.
+                "error": self.error,
             }
 
     def health_json(self) -> dict:

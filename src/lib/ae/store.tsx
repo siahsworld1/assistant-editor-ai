@@ -515,6 +515,15 @@ export function AEProvider({ children }: { children: ReactNode }) {
     }
   }, [applyActive]);
 
+  // Authorizes the desktop companion's ae-media:// playback protocol to stream
+  // from whichever project is actually open, whenever that changes. This is the
+  // only place activeMediaRoot is ever set — see electron/media-protocol.cjs,
+  // which refuses every request until this has run at least once.
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.assistantEditorDesktop?.available) return;
+    void window.assistantEditorDesktop.setActiveMediaRoot(activeProject?.mediaRoot || "");
+  }, [activeProject?.mediaRoot]);
+
   const loadDemo = useCallback(() => {
     setProject(structuredClone(demoProject));
     setNle(structuredClone(demoNle));

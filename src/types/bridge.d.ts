@@ -31,6 +31,11 @@ export interface DesktopExportResponse {
   path?: string;
 }
 
+export interface DesktopMediaRootResponse {
+  ok: boolean;
+  error?: string;
+}
+
 export interface DesktopCapabilitiesApi {
   available: true;
   version: string;
@@ -40,6 +45,9 @@ export interface DesktopCapabilitiesApi {
   chooseMediaFolder(): Promise<DesktopFolderResponse>;
   indexMedia(path: string): Promise<DesktopMediaIndexResponse>;
   exportFile(suggestedName: string, content: string): Promise<DesktopExportResponse>;
+  /** Authorizes the ae-media:// playback protocol to stream from this mediaRoot
+   * (must already be authorized via chooseMediaFolder). Pass "" to deauthorize. */
+  setActiveMediaRoot(root: string): Promise<DesktopMediaRootResponse>;
 }
 
 declare global {

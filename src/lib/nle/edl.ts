@@ -14,8 +14,7 @@
 // limitations".
 
 import type { Clip, UniversalTimeline } from "../ae/types";
-
-const TC_RE = /^(\d{1,2}):(\d{2}):(\d{2}):(\d{2})$/;
+import { TC_RE, secondsToTc } from "./timecode";
 
 export interface TimelineValidationResult {
   ok: boolean;
@@ -61,16 +60,6 @@ export function validateTimelineForExport(
   }
 
   return { ok: usable.length > 0, errors, usable };
-}
-
-function secondsToTc(seconds: number, fps: number): string {
-  const s = Math.max(0, seconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = Math.floor(s % 60);
-  const f = Math.floor((s - Math.floor(s)) * fps);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(h)}:${p(m)}:${p(sec)}:${p(f)}`;
 }
 
 /** CMX3600 reel names are conventionally short, uppercase, alnum-only. */

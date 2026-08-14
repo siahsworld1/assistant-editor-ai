@@ -374,10 +374,12 @@ function normalizeClips(v: unknown): Clip[] {
     const state = str(pick(raw, "state", "status"), "pending");
     const note = str(pick(raw, "note", "comment"));
     const relPath = str(pick(raw, "relPath", "rel_path"));
+    const proxyRelPath = str(pick(raw, "proxyRelPath", "proxy_rel_path"));
     return {
       id: str(pick(raw, "id", "clipId"), `clip-${i + 1}`),
       filename: str(pick(raw, "filename", "name", "file", "path"), `clip-${i + 1}`),
       ...(relPath ? { relPath } : {}),
+      ...(proxyRelPath ? { proxyRelPath } : {}),
       role: (CLIP_ROLES as string[]).includes(role) ? (role as Clip["role"]) : "interview",
       durationSeconds: num(pick(raw, "durationSeconds", "duration"), 0),
       camera: str(pick(raw, "camera", "device"), "—"),

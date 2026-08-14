@@ -182,3 +182,148 @@ configured provider or degrades that capability to "skipped," same as before. No
 provider beyond the two included ships in this repo; adding one is one new file
 plus one registry line, but that work itself wasn't done since no third vendor was
 requested.
+
+## Video preview, FCPXML/XMEML export, and a real local validation script (third pass)
+
+Scoped, in order, to close the three gaps the previous pass's "still demo-only"
+section named explicitly: no video preview, only one export format, and nothing
+run against real footage with real API keys.
+
+### Video preview/playback (real, new this pass)
+
+- **Media serving**: `electron/media-protocol.cjs` registers a privileged
+  `ae-media://` custom protocol (`protocol.registerSchemesAsPrivileged` +
+  `protocol.handle`, wired in `electron/main.cjs`) instead of relaxing
+  `webSecurity` or opening a second HTTP port. It streams real file bytes with
+  full HTTP Range support (206 Partial Content, `Content-Range`) — required for
+  `<video>` scrubbing, not just playback from byte zero. Every request is
+  resolved through `resolveWithinRoot()`, which rejects `..` traversal
+  (including mid-path), absolute paths, and embedded null bytes, and requires
+  the resolved path to stay inside the project's authorized `mediaRoot` — the
+  same authorization boundary `desktop-capabilities.cjs` already enforces for
+  folder access, not a new one. `desktop-capabilities.cjs` gained
+  `setActiveMediaRoot()`, called from `store.tsx` whenever the active project
+  changes, so the protocol handler always knows the current authorized root.
+- **Real proxies**: `worker/media.py::generate_proxy` transcodes every non-
+  audio-only clip to a scaled (≤960px wide), H.264/AAC, faststart MP4 during
+  Analyze (`worker/pipeline.py::_analyze_one_clip`), because Chromium's
+  `<video>` element can't decode many camera-original formats (ProRes, MXF,
+  some HEVC variants) and can't scrub a 4K master smoothly. Proxies live at
+  `mediaRoot/.ae_proxies/<clipId>.mp4` — the leading dot means both the
+  worker's own `walk_media_root` and the Electron folder indexer already skip
+  it, so proxies never get re-ingested as source clips. A missing/failed proxy
+  never fails the clip; playback falls back to the original file. 4 new real
+  (ffmpeg-synthesized-clip, ffprobe-verified) tests in
+  `worker/tests/test_proxy.py`.
+- **Player + timeline playback**: `src/components/ae/MediaPlayer.tsx` is a real
+  `<video>`-backed player (play/pause, scrub bar, time display, honest
+  `MediaError`-code-to-message mapping) exposing an imperative
+  `{play,pause,seek,getCurrentTime,getDuration}` handle.
+  `src/lib/ae/timeline-playback.ts` is a new hook that turns a
+  `UniversalTimeline`'s decisions into playable segments and drives the player
+  across cut points — advancing to the next segment at a decision boundary,
+  skipping segments with no resolvable source, auto-resuming playback across a
+  `src` change. Wired into `watch.tsx` (single-clip preview) and `cut.tsx`
+  (full timeline playback, with a draggable/clickable playhead overlay on the
+  lane view).
+
+**Verified**: the security-critical path logic (`resolveWithinRoot`,
+`contentTypeFor`) was run for real (`node` — see the media-url/exporter
+verification note below) against traversal attempts, absolute paths, and an
+embedded null byte, all correctly rejected. All four touched `.cjs` files pass
+`node --check`. `timeline-playback.ts` passes `node --experimental-strip-types`
+syntax checking. **Not verified**: this sandbox has no Electron runtime and no
+`node_modules`, so the actual protocol registration, a real Range request
+round-trip against Chromium's `<video>` element, and the React player/hook
+wiring were reviewed by hand, not executed. Running `npm run dev:desktop` on
+real hardware is the next real check — `validate_e2e.py`'s `preview` stage (see
+below) verifies the *precondition* (the exact file the player would receive is
+real and ffprobe-decodable), which is as far as a headless script can go.
+
+### FCPXML + XMEML export, alongside the existing CMX3600 EDL
+
+- `src/lib/nle/timecode.ts` — timecode math (`secondsToTc`/`tcToSeconds`/
+  `framesForSeconds`) extracted out of `edl.ts` so all three exporters and the
+  new playback hook share one implementation instead of three copies.
+- `src/lib/nle/xmeml.ts` — Premiere Pro / Final Cut Pro 7's XML sequence
+  format. Real parallel `<track>` elements per lane (interview/b-roll/audio),
+  frame-accurate in/out/duration from source timecodes.
+- `src/lib/nle/fcpxml.ts` — Final Cut Pro X / DaVinci Resolve's format: a
+  deduplicated `<resources>`/`<asset>` section referenced by id, and a single
+  `<spine>` timeline with explicit `<gap>` elements filling real timing gaps
+  (FCPXML requires a contiguous spine). Deliberately does not attempt FCPXML's
+  connected-clip/lane anchoring for genuinely overlapping decisions — no real
+  Final Cut Pro or Resolve install was available to verify that math against,
+  and a wrong anchoring guess silently misplaces clips on import, which is
+  worse than not supporting it. Today's pipeline never produces overlapping
+  decisions; an overlap is dropped with a warning rather than guessed at. Same
+  honest-scope call this codebase already made for EDL-vs-native-export in the
+  previous pass.
+- The CUT page's single "Export" button became three (EDL / XML / FCPXML), and
+  `electron/main.cjs`'s save-dialog filters now key off the file extension.
+
+**Verified**: 30 real assertions run via `node --experimental-strip-types`
+against copies of the actual source files (Node ESM needs explicit `.ts`
+extensions this project's Vite-style extensionless imports don't have, so the
+copies have that one mechanical rewrite and nothing else) — timecode round-
+trips, XMEML track/DOCTYPE/frame-accuracy/missing-path-warning checks, FCPXML
+DOCTYPE/asset-clip/gap-frame-math/overlap-drop/asset-dedup/audio-skip checks,
+and a regression check that the pre-existing EDL exporter still works after
+the shared `timecode.ts` refactor. All passed, after this process caught and
+fixed a real bug in the verification harness itself (a `<video>`-tag string-
+slice that broke on a nested `</video>` closing tag inside a clip's own file
+block) — the same bug existed in the checked-in `tests/xmeml.test.ts` and was
+fixed there too. **Not verified**: an actual Premiere/Resolve/FCP import of
+either format — see `VALIDATION.md`'s manual checklist.
+
+### Local, real end-to-end validation script
+
+`worker/validate_e2e.py`, run on your own machine with your own `.env`/
+`ffmpeg`/footage, starts the real `server.py` Flask app (not a mock — the same
+code the desktop app talks to) and drives it over real HTTP through every
+stage: import → analyze (proxies/transcription/visual analysis) → selects →
+stories → a real `/build` prompt → preview-source verification → export (runs
+the actual TypeScript exporters, via `npx vitest`, against *this run's real
+decisions*, writing real `.edl`/`.xml`/`.fcpxml` files). Each stage prints
+PASS/FAIL/SKIP with the real reason, never a silent pass — see `VALIDATION.md`
+for what each stage checks and the handful of things (does playback actually
+scrub smoothly, does the file really import into a real NLE) no headless
+script can verify.
+
+Two real bugs were found and fixed while building this, both because it was
+actually run rather than just read:
+
+- `vitest.config.ts` never included the `@/*`-alias plugin (`vite.config.ts`'s
+  own alias, from `@lovable.dev/vite-tanstack-config`, is not shared with
+  Vitest — they're two separate configs) — every existing test file imports via
+  `@/lib/...`, so `npm test` would have failed to resolve those imports
+  entirely. Fixed by adding `vite-tsconfig-paths` (already a dependency) to
+  `vitest.config.ts`.
+- `werkzeug`'s `BaseWSGIServer` calls `sys.exit(1)` directly on a port-already-
+  in-use error instead of letting `OSError` propagate — `validate_e2e.py`'s own
+  `except OSError` around server startup didn't catch that, so a taken port
+  used to kill the whole script with no report written. Fixed by also catching
+  `SystemExit` there. Caught by a real subprocess test
+  (`worker/tests/test_validate_e2e.py`) that binds the target port first and
+  asserts a clean, reported `FAIL` rather than a crash.
+
+`worker/tests/test_validate_e2e.py` runs the actual script as a subprocess
+against real ffmpeg-synthesized footage with no API keys configured (this
+sandbox has neither the `openai` nor `anthropic` SDK installed, so this also
+confirms `get_transcription_provider()`/`get_reasoning_provider()` never
+attempt an SDK import before the API-key check) and asserts the real, honest
+result: `import_footage`/`worker_startup`/`analyze_run`/`proxies` genuinely
+PASS (nothing about those needs a key), `transcription`/`visual_analysis`/
+`selects` genuinely FAIL with the real cause named, and everything downstream
+correctly SKIPs rather than false-passing or mis-blaming a later stage. 35/35
+worker tests passing (`python3 -m unittest discover -s tests -v`), up from 32.
+
+**Not run by me**: the AI-dependent stages (transcription, visual analysis,
+selects, stories, decisions) and the actual export-file-into-a-real-NLE step —
+both require the user's own API keys and, for the NLE step, a real copy of
+Premiere/Resolve/FCP, neither of which exist in this sandbox. That is the one
+remaining gap between "the code paths exist and this script proves the harness
+itself is honest" and "this was validated against real footage with real keys"
+— which is exactly the state `validate_e2e.py` and `VALIDATION.md` exist to let
+the user close themselves, with a script that will tell them plainly if
+something's actually broken instead of asking them to trust that it works.
