@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Assistant Editor AI</title>
+    <link rel="stylesheet" href="src/panel.css" />
+  </head>
+  <body>
+    <div class="panel">
+      <header class="head">
+        <div class="brand">
+          <span class="dot" id="conn-dot"></span>
+          <span class="brand-name">Assistant Editor</span>
+        </div>
+        <span class="ver" id="version">v0.4.0</span>
+      </header>
+
+      <section class="card">
+        <div class="row">
+          <span class="k">Desktop</span>
+          <span class="v" id="conn-state">checking…</span>
+        </div>
+        <div class="row">
+          <span class="k">Project</span>
+          <span class="v" id="project-name">—</span>
+        </div>
+        <div class="row">
+          <span class="k">Sequence</span>
+          <span class="v" id="sequence-name">—</span>
+        </div>
+        <div class="row">
+          <span class="k">Selection</span>
+          <span class="v" id="selection-count">0 items</span>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button class="btn primary" id="btn-analyze">Analyze Footage</button>
+        <button class="btn" id="btn-send-selection">Send Selection to Assistant Editor</button>
+        <button class="btn" id="btn-open">Open Assistant Editor</button>
+        <div class="sep"></div>
+        <button class="btn" id="btn-build-selects">Build Selects Sequence</button>
+        <button class="btn" id="btn-build-story">Build Story Cut</button>
+        <button class="btn warn" id="btn-apply-latest">Apply Latest Cut</button>
+        <p class="note">
+          Builds always create a new versioned sequence (e.g. <em>Community Doc — AE v001</em>).
+          The active sequence is never overwritten.
+        </p>
+      </section>
+
+      <section class="card diag">
+        <div class="diag-head">
+          <span>Diagnostics</span>
+          <button class="link" id="btn-refresh">Refresh</button>
+        </div>
+        <div class="row"><span class="k">Bridge</span><span class="v" id="d-endpoint">—</span></div>
+        <div class="row"><span class="k">Protocol</span><span class="v" id="d-protocol">—</span></div>
+        <div class="row"><span class="k">Host</span><span class="v" id="d-host">—</span></div>
+        <div class="row"><span class="k">Last sync</span><span class="v" id="d-sync">never</span></div>
+        <div class="row"><span class="k">Capabilities</span><span class="v" id="d-caps">—</span></div>
+        <p class="err" id="d-error" hidden></p>
+      </section>
+
+      <footer class="status" id="status">Idle</footer>
+    </div>
+    <script src="src/adapter.js"></script>
+    <script src="src/bridge-client.js"></script>
+    <script src="src/panel.js"></script>
+  </body>
+</html>

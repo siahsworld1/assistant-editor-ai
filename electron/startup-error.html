@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+    <title>Assistant Editor AI</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0; height: 100vh; display: flex; align-items: center; justify-content: center;
+        background: #0b0c0e; color: #e8e6e3;
+        font: 13px/1.6 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+      }
+      main { max-width: 520px; padding: 28px; border: 1px solid #232528; border-radius: 8px; background: #101113; }
+      .kicker { font-size: 10px; letter-spacing: .18em; text-transform: uppercase; color: #d98a2b; }
+      h1 { font-size: 17px; font-weight: 600; margin: 10px 0 8px; }
+      p { color: #9a9a9a; margin: 0 0 10px; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #c9c7c3; }
+      .row { display: flex; gap: 8px; margin-top: 18px; }
+      button {
+        font: inherit; padding: 7px 14px; border-radius: 6px; cursor: pointer;
+        border: 1px solid #2b2d31; background: #17181b; color: #e8e6e3;
+      }
+      button.primary { background: #d98a2b; border-color: #d98a2b; color: #16120b; font-weight: 600; }
+      button:hover { filter: brightness(1.1); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="kicker">Assistant Editor AI · v0.3.1-connected</div>
+      <h1>The interface could not start</h1>
+      <p>The desktop companion could not launch its local interface process. Your media and projects are untouched.</p>
+      <p><code id="detail"></code></p>
+      <div class="row">
+        <button class="primary" id="retry">Retry</button>
+        <button id="quit">Quit</button>
+      </div>
+    </main>
+    <script>
+      window.assistantEditorShell.onMessage(function (m) {
+        document.getElementById("detail").textContent = m;
+      });
+      document.getElementById("retry").addEventListener("click", function () {
+        window.assistantEditorShell.retry();
+      });
+      document.getElementById("quit").addEventListener("click", function () {
+        window.assistantEditorShell.quit();
+      });
+    </script>
+  </body>
+</html>
