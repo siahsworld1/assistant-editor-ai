@@ -112,17 +112,28 @@ def handle_error(exc):
 
 if __name__ == "__main__":
     import media
+    from providers.base import ProviderError
+    from providers.registry import get_reasoning_provider, get_transcription_provider
 
     if not media.ffmpeg_available():
         log.warning(
             "ffmpeg/ffprobe not found on PATH — analysis will fail until you `brew install ffmpeg`."
         )
-    import os
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        log.warning("OPENAI_API_KEY is not set — transcription will be skipped.")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        log.warning("ANTHROPIC_API_KEY is not set — selects/stories/build reasoning will be skipped.")
+    # Provider-agnostic startup check: whichever vendor is selected (via
+    # ASSISTANT_EDITOR_TRANSCRIPTION_PROVIDER / ASSISTANT_EDITOR_REASONING_PROVIDER,
+    # see providers/registry.py) gets probed the same way — this never hardcodes
+    # a specific vendor's env var name.
+    try:
+        transcription_provider = get_transcription_provider()
+        log.info("Transcription provider: %s", transcription_provider.name)
+    except ProviderError as exc:
+        log.warning("Transcription provider unavailable — transcription will be skipped. %s", exc)
+    try:
+        reasoning_provider = get_reasoning_provider()
+        log.info("Reasoning provider: %s", reasoning_provider.name)
+    except ProviderError as exc:
+        log.warning("Reasoning provider unavailable — selects/stories/build reasoning will be skipped. %s", exc)
 
     log.info("Assistant Editor AI worker listening on http://%s:%s", HOST, PORT)
     app.run(host=HOST, port=PORT, threaded=True)

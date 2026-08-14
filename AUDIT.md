@@ -132,3 +132,53 @@ export a Premiere-compatible timeline.
 Not marking this complete — video preview and multi-NLE-native export remain, and
 nothing here has been run against real footage with real API keys by anyone but
 the user, who needs to do that next.
+
+## Model-agnostic provider refactor (second pass)
+
+Following the vertical slice above, the AI-vendor coupling was deliberately
+removed. `worker/ai_client.py` (which imported and called the `openai`/`anthropic`
+SDKs directly inside business-logic functions) has been deleted and replaced with:
+
+- `worker/providers/base.py` — `TranscriptionProvider` / `ReasoningProvider`
+  abstract interfaces, `TextBlock`/`ImageBlock` content primitives, `ProviderError`.
+- `worker/providers/openai_provider.py` — `OpenAIWhisperTranscriptionProvider`
+  (transcription — the only ASR product in this stack) and `OpenAIReasoningProvider`
+  (GPT-4o), a second, independent `ReasoningProvider` implementation.
+- `worker/providers/anthropic_provider.py` — `AnthropicReasoningProvider` (Claude),
+  the default reasoning implementation.
+- `worker/providers/registry.py` — env-var-driven provider selection
+  (`ASSISTANT_EDITOR_TRANSCRIPTION_PROVIDER`, `ASSISTANT_EDITOR_REASONING_PROVIDER`).
+  Unknown or unconfigured providers raise `ProviderError`, caught individually by
+  transcription and reasoning so one missing key degrades only that capability.
+- `worker/reasoning.py` — the vendor-agnostic editorial-reasoning architecture: every
+  prompt (visual evidence, selects, stories, timeline build) and the logic that turns
+  model output into validated app data. Imports no vendor SDK.
+- `worker/pipeline.py` — refactored to resolve providers once per analysis run and
+  thread them through with dependency-injection-friendly optional parameters, so
+  tests can supply fakes directly without touching the registry, an API key, or the
+  network.
+
+Genuine proof this is a real abstraction, not an interface with one implementation
+behind it: `OpenAIReasoningProvider` (GPT-4o) and `AnthropicReasoningProvider`
+(Claude) both implement `ReasoningProvider` and are switchable via one env var with
+no other code change. `worker/tests/fakes.py` supplies fake providers used across
+`worker/tests/test_reasoning.py`, `worker/tests/test_providers.py`, and a new
+`TestBuildTimelineWithInjectedProvider` suite in `worker/tests/test_pipeline.py` —
+the full selects/stories/build logic runs and is asserted against in tests with zero
+API keys, zero network access, and neither vendor SDK installed (confirmed: this
+sandbox has neither `openai` nor `anthropic` installed, and the full suite still
+passes). 28/28 tests passing (`python3 -m unittest discover -s tests -v` from
+`worker/`).
+
+What did not change: the actual editorial *content* of the prompts (verbatim,
+moved from `ai_client.py` into `reasoning.py`), the `_validate_decisions` gate, and
+`server.py`'s route contract. `server.py`'s startup warnings were generalized to
+probe whichever provider is configured rather than hardcoding `OPENAI_API_KEY`/
+`ANTHROPIC_API_KEY` checks.
+
+Not built in this pass (noted, not hidden): no automatic fallback from one vendor
+to another mid-run if the configured provider fails — a single run either uses its
+configured provider or degrades that capability to "skipped," same as before. No
+provider beyond the two included ships in this repo; adding one is one new file
+plus one registry line, but that work itself wasn't done since no third vendor was
+requested.

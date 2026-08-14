@@ -6,16 +6,45 @@ a separate process you run alongside the app — it is not started automatically
 It does real work:
 
 - Walks the media folder you picked in the app (Projects → Import Media).
-- Extracts audio with `ffmpeg` and transcribes it with OpenAI's Whisper API.
+- Extracts audio with `ffmpeg` and transcribes it (Whisper by default).
 - Detects electrical hum (50/60Hz) with real FFT analysis on the extracted audio.
-- Samples frames from each video clip and asks Claude to describe what's in them
-  (faces, motion, scenes, b-roll, graphics, and technical issues like soft focus).
-- Asks Claude to rank the strongest moments into "selects", assemble story
-  candidates from those selects, and build a timeline for a chosen story.
+- Samples frames from each video clip and asks a vision-capable reasoning model to
+  describe what's in them (faces, motion, scenes, b-roll, graphics, and technical
+  issues like soft focus).
+- Asks that same reasoning model to rank the strongest moments into "selects",
+  assemble story candidates from those selects, and build a timeline for a chosen
+  story.
 
 Speaker names are inferred from filenames that follow an `..._INT_<NAME>_...`-style
 convention (matching the sample project). If your footage doesn't name speakers this
 way, clips will just show "Unknown speaker" instead of failing.
+
+## Model-agnostic by design
+
+Assistant Editor AI is not built around any one AI vendor. "Transcription" and
+"reasoning" (vision + selects/stories/timeline) are each an interface —
+`TranscriptionProvider` / `ReasoningProvider` in `worker/providers/base.py` — with
+swappable implementations selected by environment variable:
+
+```sh
+# .env
+ASSISTANT_EDITOR_TRANSCRIPTION_PROVIDER=openai      # only ASR option today (Whisper)
+ASSISTANT_EDITOR_REASONING_PROVIDER=anthropic       # or: openai (GPT-4o)
+```
+
+The prompts and editorial logic — what makes a good "select," how a story is
+proposed, how a timeline is assembled and validated — live in `worker/reasoning.py`
+and `worker/pipeline.py`, neither of which imports a vendor SDK. That's where this
+app's real value lives: the footage-analysis pipeline, the editorial-reasoning
+architecture, the Edit Decision validation gate, and the timeline/export engine —
+not a dependency on any single model provider. Adding support for another vendor
+means writing one new file in `worker/providers/` and registering it in
+`worker/providers/registry.py`; nothing else in the app changes.
+
+`worker/tests/fakes.py` provides fake providers used by the test suite, so the
+reasoning/pipeline logic is verified without any API key, network access, or vendor
+SDK at all — see `worker/tests/test_reasoning.py` and the
+`TestBuildTimelineWithInjectedProvider` tests in `worker/tests/test_pipeline.py`.
 
 ## One-time setup
 
@@ -33,8 +62,13 @@ way, clips will just show "Unknown speaker" instead of failing.
    ```sh
    cp .env.example .env
    ```
-   - `OPENAI_API_KEY` — from https://platform.openai.com/api-keys (used only for Whisper transcription)
-   - `ANTHROPIC_API_KEY` — from https://console.anthropic.com/settings/keys (used for vision + reasoning)
+   - `OPENAI_API_KEY` — from https://platform.openai.com/api-keys (used for Whisper transcription,
+     and for reasoning if you set `ASSISTANT_EDITOR_REASONING_PROVIDER=openai`)
+   - `ANTHROPIC_API_KEY` — from https://console.anthropic.com/settings/keys (used for vision +
+     reasoning with the default `ASSISTANT_EDITOR_REASONING_PROVIDER=anthropic`)
+
+   You only need the key for whichever provider(s) you've selected — see
+   "Model-agnostic by design" above.
 
 ## Running
 
@@ -62,24 +96,28 @@ from "Demo Mode" to "Live" within a few seconds.
    depending on length and how many clips you have. Progress updates live via the
    Projects panel while it runs.
 4. Once complete, **Selects** and **Stories** populate from real analysis. Building a
-   timeline from a chosen story also calls Claude to assemble the cut.
+   timeline from a chosen story also calls the reasoning provider to assemble the cut.
 
 ## Costs
 
-Every Analyze run makes real API calls: one Whisper transcription per clip with audio,
-one Claude vision call per clip, and one Claude call each for selects/stories/build.
-Costs scale with clip count and length — for a handful of short test clips this is
-cents, not dollars, but a full documentary's worth of raw interview footage will add
-up. Check your usage on the OpenAI and Anthropic dashboards if you're unsure.
+Every Analyze run makes real API calls: one transcription call per clip with audio,
+one vision call per clip, and one reasoning call each for selects/stories/build — all
+against whichever provider(s) you've configured. Costs scale with clip count and
+length — for a handful of short test clips this is cents, not dollars, but a full
+documentary's worth of raw interview footage will add up. Check your usage on your
+configured provider(s)' dashboard(s) if you're unsure (OpenAI and/or Anthropic).
 
 ## Known limitations
 
 - No true speaker diarization — one speaker per clip, inferred from the filename.
-- Soft focus / rolling shutter / exposure issues are Claude's read on sampled frames,
-  not a calibrated computer-vision measurement — treat them as a first pass, not a QC
-  report.
+- Soft focus / rolling shutter / exposure issues are the reasoning model's read on
+  sampled frames, not a calibrated computer-vision measurement — treat them as a
+  first pass, not a QC report.
 - No persistence: state lives in memory while `server.py` runs. Restarting the worker
   clears everything; re-run Analyze after a restart.
 - `/nle` (Premiere/FCP/Resolve detection) is not implemented here — Premiere
   integration is handled by a separate bridge already in the desktop app
   (`electron/premiere-bridge.cjs`), unrelated to this worker.
+- Only one reasoning/transcription provider runs at a time (selected via `.env`) —
+  there's no per-call fallback from one vendor to another yet if the configured one
+  is down; that would be a natural next step now that the interface exists.

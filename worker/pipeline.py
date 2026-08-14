@@ -1,8 +1,16 @@
-"""Orchestrates a full analysis pass: walk media -> ffprobe -> transcribe (OpenAI) ->
-sample + describe frames (Claude vision) -> rank selects (Claude) -> propose stories
-(Claude). Also builds a timeline for POST /build. Designed so a failure on one clip
-never kills the whole run — clips that error are marked state="error" and skipped for
-downstream reasoning, but everything else still completes.
+"""Orchestrates a full analysis pass: walk media -> ffprobe -> transcribe ->
+sample + describe frames (vision) -> rank selects -> propose stories. Also
+builds a timeline for POST /build. Designed so a failure on one clip never
+kills the whole run — clips that error are marked state="error" and skipped
+for downstream reasoning, but everything else still completes.
+
+This module knows nothing about which AI vendor answers a call — it resolves a
+TranscriptionProvider and a ReasoningProvider once per run (via
+providers/registry.py, env-var-selected) and passes them down to
+worker/reasoning.py, which holds the actual prompts/business logic. Every
+function that needs a provider also accepts one as an optional parameter so
+tests can inject a fake (worker/tests/fakes.py) without touching the registry,
+an API key, or the network at all.
 """
 
 from __future__ import annotations
@@ -13,8 +21,10 @@ import tempfile
 import traceback
 from pathlib import Path
 
-import ai_client
 import media
+import reasoning
+from providers.base import ProviderError, ReasoningProvider, TranscriptionProvider
+from providers.registry import get_reasoning_provider, get_transcription_provider
 from store import STORE, ClipState
 
 log = logging.getLogger("assistant-editor-worker")
@@ -29,6 +39,22 @@ def run_analysis(project_id: str | None, media_root: str | None):
     except Exception as exc:  # noqa: BLE001 - top-level background job guard
         log.error("analysis failed: %s\n%s", exc, traceback.format_exc())
         STORE.fail(str(exc))
+
+
+def _resolve_transcription_provider() -> TranscriptionProvider | None:
+    try:
+        return get_transcription_provider()
+    except ProviderError as exc:
+        log.warning("transcription provider unavailable: %s", exc)
+        return None
+
+
+def _resolve_reasoning_provider() -> ReasoningProvider | None:
+    try:
+        return get_reasoning_provider()
+    except ProviderError as exc:
+        log.warning("reasoning provider unavailable: %s", exc)
+        return None
 
 
 def _run_analysis(project_id: str | None, media_root: str | None):
@@ -46,25 +72,38 @@ def _run_analysis(project_id: str | None, media_root: str | None):
         STORE.fail(f"No supported media files found under {media_root}.")
         return
 
+    # Resolved once per run, independently — a missing OPENAI_API_KEY only
+    # degrades transcription; a missing ANTHROPIC_API_KEY (or whichever vendor
+    # is configured for reasoning) only degrades vision/selects/stories. Neither
+    # failure crashes the run.
+    transcription_provider = _resolve_transcription_provider()
+    reasoning_provider = _resolve_reasoning_provider()
+
     tmp_root = Path(tempfile.mkdtemp(prefix="ae-worker-"))
     try:
         total = len(files)
         for idx, path in enumerate(files):
             clip_id = f"clip-{idx + 1:03d}"
-            _analyze_one_clip(clip_id, path, tmp_root)
+            _analyze_one_clip(clip_id, path, tmp_root, transcription_provider, reasoning_provider)
             # Leave headroom (up to 70%) for the reasoning passes that follow.
             STORE.set_progress(int(((idx + 1) / total) * 70))
 
         STORE.set_progress(75)
-        _generate_selects()
+        _generate_selects(reasoning_provider)
         STORE.set_progress(88)
-        _generate_stories()
+        _generate_stories(reasoning_provider)
         STORE.complete()
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
-def _analyze_one_clip(clip_id: str, path: Path, tmp_root: Path):
+def _analyze_one_clip(
+    clip_id: str,
+    path: Path,
+    tmp_root: Path,
+    transcription_provider: TranscriptionProvider | None,
+    reasoning_provider: ReasoningProvider | None,
+):
     ext = path.suffix.lower()
     role = media.role_for_file(path.name, ext)
     speaker = media.speaker_for_file(path.name)
@@ -98,14 +137,16 @@ def _analyze_one_clip(clip_id: str, path: Path, tmp_root: Path):
             wav_path = clip_dir / "audio.wav"
             if media.extract_audio(path, wav_path):
                 technical_issues.extend(media.detect_hum(wav_path))
-                try:
-                    segments = ai_client.transcribe_audio(wav_path)
-                except ai_client.ConfigError as exc:
-                    segments = []
-                    log.warning("transcription skipped for %s: %s", path.name, exc)
-                except Exception as exc:  # noqa: BLE001
-                    segments = []
-                    log.warning("transcription failed for %s: %s", path.name, exc)
+                segments = []
+                if transcription_provider is None:
+                    log.warning("transcription skipped for %s: no transcription provider available", path.name)
+                else:
+                    try:
+                        segments = reasoning.transcribe_audio(transcription_provider, wav_path)
+                    except ProviderError as exc:
+                        log.warning("transcription skipped for %s: %s", path.name, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("transcription failed for %s: %s", path.name, exc)
                 speaker_label = speaker or "Unknown speaker"
                 for i, seg in enumerate(segments):
                     if not seg.get("text"):
@@ -126,14 +167,16 @@ def _analyze_one_clip(clip_id: str, path: Path, tmp_root: Path):
         if ext not in media.AUDIO_ONLY_EXTENSIONS:
             frames = media.extract_frames(path, clip_dir / "frames", FRAMES_PER_CLIP)
             if frames:
-                try:
-                    findings = ai_client.analyze_frames(frames)
-                except ai_client.ConfigError as exc:
-                    findings = []
-                    log.warning("visual analysis skipped for %s: %s", path.name, exc)
-                except Exception as exc:  # noqa: BLE001
-                    findings = []
-                    log.warning("visual analysis failed for %s: %s", path.name, exc)
+                findings = []
+                if reasoning_provider is None:
+                    log.warning("visual analysis skipped for %s: no reasoning provider available", path.name)
+                else:
+                    try:
+                        findings = reasoning.analyze_frames(reasoning_provider, frames)
+                    except ProviderError as exc:
+                        log.warning("visual analysis skipped for %s: %s", path.name, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("visual analysis failed for %s: %s", path.name, exc)
                 evidence_count = 0
                 for i, item in enumerate(findings):
                     frame_index = item.get("frameIndex")
@@ -179,7 +222,7 @@ def _clip_lookup() -> dict:
         return dict(STORE.clips)
 
 
-def _generate_selects():
+def _generate_selects(reasoning_provider: ReasoningProvider | None = None):
     clips = _clip_lookup()
     if not STORE.transcript:
         STORE.selects = []
@@ -197,14 +240,16 @@ def _generate_selects():
             lines.append(f"{v['clipId']} | {v['kind']} | {v['label']} | {v['atTc']}")
     summary = "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
-    try:
-        raw = ai_client.rank_selects(summary)
-    except ai_client.ConfigError as exc:
-        log.warning("select ranking skipped: %s", exc)
-        raw = []
-    except Exception as exc:  # noqa: BLE001
-        log.error("select ranking failed: %s", exc)
-        raw = []
+    raw = []
+    if reasoning_provider is None:
+        log.warning("select ranking skipped: no reasoning provider available")
+    else:
+        try:
+            raw = reasoning.rank_selects(reasoning_provider, summary)
+        except ProviderError as exc:
+            log.warning("select ranking skipped: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.error("select ranking failed: %s", exc)
 
     selects = []
     for i, item in enumerate(sorted(raw, key=lambda r: r.get("score", 0), reverse=True)):
@@ -242,7 +287,7 @@ def _generate_selects():
     STORE.selects = selects
 
 
-def _generate_stories():
+def _generate_stories(reasoning_provider: ReasoningProvider | None = None):
     if not STORE.selects:
         STORE.stories = []
         return
@@ -253,14 +298,16 @@ def _generate_stories():
         )
     summary = "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
-    try:
-        raw = ai_client.propose_stories(summary)
-    except ai_client.ConfigError as exc:
-        log.warning("story generation skipped: %s", exc)
-        raw = []
-    except Exception as exc:  # noqa: BLE001
-        log.error("story generation failed: %s", exc)
-        raw = []
+    raw = []
+    if reasoning_provider is None:
+        log.warning("story generation skipped: no reasoning provider available")
+    else:
+        try:
+            raw = reasoning.propose_stories(reasoning_provider, summary)
+        except ProviderError as exc:
+            log.warning("story generation skipped: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.error("story generation failed: %s", exc)
 
     valid_ids = {s["id"] for s in STORE.selects}
     stories = []
@@ -329,7 +376,16 @@ def _validate_decisions(decisions: list, clips: dict) -> tuple[list, list[str]]:
     return valid, warnings
 
 
-def build_timeline(project_id: str | None, story_id: str | None, target_seconds: float, command: str | None) -> dict:
+def build_timeline(
+    project_id: str | None,
+    story_id: str | None,
+    target_seconds: float,
+    command: str | None,
+    reasoning_provider: ReasoningProvider | None = None,
+) -> dict:
+    """reasoning_provider is optional and DI-friendly: production (server.py)
+    leaves it unset and this resolves one from the registry; tests pass a fake
+    directly (see worker/tests/fakes.py) with no API key or network involved."""
     story = next((s for s in STORE.stories if s["id"] == story_id), None) or (
         STORE.stories[0] if STORE.stories else None
     )
@@ -358,13 +414,17 @@ def build_timeline(project_id: str | None, story_id: str | None, target_seconds:
         )
     brief = "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
-    try:
-        result = ai_client.build_timeline(brief)
-    except ai_client.ConfigError:
-        result = None
-    except Exception as exc:  # noqa: BLE001
-        log.error("build failed: %s", exc)
-        result = None
+    if reasoning_provider is None:
+        reasoning_provider = _resolve_reasoning_provider()
+
+    result = None
+    if reasoning_provider is not None:
+        try:
+            result = reasoning.build_timeline(reasoning_provider, brief)
+        except ProviderError as exc:
+            log.warning("build skipped: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.error("build failed: %s", exc)
 
     clips = _clip_lookup()
     if result and isinstance(result.get("decisions"), list) and result["decisions"]:
