@@ -40,3 +40,4 @@ worker/.env
 # desktop build output
 release/
 dist-desktop/
+.env

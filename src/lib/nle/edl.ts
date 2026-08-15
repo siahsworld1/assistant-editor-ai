@@ -14,7 +14,12 @@
 // limitations".
 
 import type { Clip, UniversalTimeline } from "../ae/types";
-import { TC_RE, secondsToTc } from "./timecode";
+// Explicit ".ts" extension (allowImportingTsExtensions is on in tsconfig.json,
+// and Vite/Vitest resolve it fine either way): this is a real runtime import,
+// and scripts/export-timeline.ts runs these exporters directly under Node's
+// --experimental-strip-types with no bundler in front of it, which — unlike
+// Vite — never resolves extensionless relative specifiers.
+import { TC_RE, secondsToTc } from "./timecode.ts";
 
 export interface TimelineValidationResult {
   ok: boolean;

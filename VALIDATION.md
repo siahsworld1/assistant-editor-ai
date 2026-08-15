@@ -23,8 +23,11 @@ cp .env.example .env   # fill in your API keys
 brew install ffmpeg    # if you don't already have it
 ```
 
-Also, from the repo root, make sure the frontend's dependencies are installed —
-the export stage runs the real TypeScript exporters via `vitest`:
+The `export` stage runs `scripts/export-timeline.ts` directly under
+`node --experimental-strip-types` (Node >= 22.6) — it has no npm dependencies
+of its own, so `npm install` is not required just to run `validate_e2e.py`.
+You'll still want it for everything else (`npm test`, `npm run typecheck`,
+`npm run dev:desktop`):
 
 ```sh
 npm install
@@ -77,12 +80,27 @@ Useful flags:
 | `stories` | The reasoning model proposed at least one real story candidate. | Reasoning provider issue, or it returned nothing usable. |
 | `decisions` | `POST /build` (a real prompt) returned real, non-empty, server-validated edit decisions. | The reasoning model call failed and the deterministic fallback also had nothing to assemble (no selects). |
 | `preview` | For every decision, the exact file the app's `<video>` element would be given (proxy, falling back to the original) exists on disk and `ffprobe` can decode it. | A decision points at a clip with no resolvable/decodable media file. |
-| `export` | The real `buildCmx3600Edl`/`buildXmeml`/`buildFcpxml` functions ran against *this run's actual decisions* (via `npx vitest run tests/e2e-export.generated.test.ts`) and wrote real `.edl`/`.xml`/`.fcpxml` files. | Exporter threw, produced empty output, or `npm install` hasn't been run yet (reported as SKIP, not FAIL, in that specific case). |
+| `export` | The real `buildCmx3600Edl`/`buildXmeml`/`buildFcpxml` functions ran against *this run's actual decisions* (via `scripts/export-timeline.ts`, under plain `node --experimental-strip-types` — no npm dependency) and wrote real `.edl`/`.xml`/`.fcpxml` files. | Exporter threw or produced empty output. Reported as SKIP instead when Node is older than 22.6 (`--experimental-strip-types` isn't available) — install a newer Node and re-run. |
 
 A stage reports `SKIP` (not FAIL) when an earlier stage left it with nothing to
 check — e.g. `stories`/`decisions`/`preview`/`export` all SKIP if `selects` came
 back empty, since there's no story to build or timeline to export. Read SKIPs
 as "not exercised this run," not as "passed."
+
+### Re-running just the export step
+
+A full `validate_e2e.py` run writes the exact decisions it produced to
+`worker/validation-output/e2e-fixture.json`. Once that file exists, you can
+re-run only the export step — no worker, no API calls, no footage needed —
+directly against it:
+
+```sh
+node --experimental-strip-types scripts/export-timeline.ts worker/validation-output/e2e-fixture.json worker/validation-output
+```
+
+This is the fastest way to iterate on the exporters themselves, or to
+double-check the `.edl`/`.xml`/`.fcpxml` files are current before opening them
+in an NLE.
 
 ## 5. What this script cannot check — do these by hand
 

@@ -283,8 +283,10 @@ either format — see `VALIDATION.md`'s manual checklist.
 code the desktop app talks to) and drives it over real HTTP through every
 stage: import → analyze (proxies/transcription/visual analysis) → selects →
 stories → a real `/build` prompt → preview-source verification → export (runs
-the actual TypeScript exporters, via `npx vitest`, against *this run's real
-decisions*, writing real `.edl`/`.xml`/`.fcpxml` files). Each stage prints
+the actual TypeScript exporters directly, via `scripts/export-timeline.ts`
+under plain Node — see the fourth-pass section below for why this replaced an
+earlier `npx vitest` approach — against *this run's real decisions*, writing
+real `.edl`/`.xml`/`.fcpxml` files). Each stage prints
 PASS/FAIL/SKIP with the real reason, never a silent pass — see `VALIDATION.md`
 for what each stage checks and the handful of things (does playback actually
 scrub smoothly, does the file really import into a real NLE) no headless
@@ -327,3 +329,50 @@ itself is honest" and "this was validated against real footage with real keys"
 — which is exactly the state `validate_e2e.py` and `VALIDATION.md` exist to let
 the user close themselves, with a script that will tell them plainly if
 something's actually broken instead of asking them to trust that it works.
+
+## Export runner: replacing vitest-as-export-mechanism with a direct Node script (fourth pass)
+
+`validate_e2e.py`'s `export` stage originally worked by generating a fixture
+JSON of the run's real decisions, then shelling out to `npx vitest run` on a
+generated test file (`tests/e2e-export.generated.test.ts`) that read the
+fixture, called the real exporters, and wrote the output files. That worked,
+but used a test runner as a production export mechanism — it needed
+`node_modules` fully installed, depended on Vitest's CLI behaving the way a
+one-off script would, and mixed "this is a test" and "this produces a real
+deliverable file" in one file's purpose.
+
+Replaced with `scripts/export-timeline.ts`, a standalone script that imports
+`buildCmx3600Edl`/`buildXmeml`/`buildFcpxml`/`validateTimelineForExport` from
+`src/lib/nle/` directly — the exact same functions, zero reimplementation —
+and runs under plain `node --experimental-strip-types` (Node >= 22.6) with no
+npm dependency at all. The one source change this required: `edl.ts`,
+`xmeml.ts`, and `fcpxml.ts`'s relative runtime imports (`./timecode`,
+`./xml-utils`) now carry explicit `.ts` extensions. Plain Node ESM, unlike
+Vite/Vitest, never resolves extensionless relative specifiers — `tsconfig.json`
+already had `allowImportingTsExtensions: true` set, so this was already a
+sanctioned, typecheck-safe form, just not one anything in the codebase used
+yet. Type-only imports (`import type { Clip, UniversalTimeline } from
+"../ae/types"`) needed no change — they're erased entirely under
+`--experimental-strip-types` and were never resolved at runtime in the first
+place. `tests/e2e-export.generated.test.ts` was deleted (superseded, not kept
+alongside — one export-fixture-runner, not two divergent implementations of
+the same job); `worker/validate_e2e.py`'s `stage_export` now invokes
+`scripts/export-timeline.ts` instead, with a `--node-bin`/version preflight
+check (SKIP, not a confusing crash, on Node < 22.6) replacing the old
+`node_modules`-exists check.
+
+**Verified**: the runner was executed directly, repeatedly, in a sandbox with
+zero `node_modules` and no npm registry access — proving the "no npm
+dependency" claim rather than just asserting it — producing real, correct
+`.edl`/`.xml`/`.fcpxml`/`export-summary.json` output from a real fixture, and
+failing cleanly (clear stderr, nonzero exit, no partial output) on: missing
+fixture, malformed JSON, zero decisions, and zero decisions surviving export
+validation. `validate_e2e.py`'s updated `stage_export` was verified the same
+way it always has been — calling it directly with synthetic project/decision
+data and inspecting the resulting `Report` — confirming both the PASS path
+(via the real Node runner) and the SKIP path (an unresolvable `node` binary).
+The full worker suite (35/35, unchanged count — this fix touches the export
+stage's *mechanism*, not the harness tests that exercise the FAIL/SKIP
+cascade, which never reached the export stage without API keys) still passes.
+`npm run typecheck` and `npm test` were run on the user's own machine, where
+`node_modules` actually exists — this sandbox cannot run either.

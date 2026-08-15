@@ -34,8 +34,10 @@ real edit decisions -> preview edit -> export EDL + FCPXML/XML):
                         given for each decision is real, on-disk, and
                         ffprobe-decodable (see "What this can't check" below)
  10. export          - runs the real TypeScript EDL/XMEML/FCPXML exporters
-                        (via `npx vitest run`) against this run's ACTUAL
-                        decisions, and writes real .edl/.xml/.fcpxml files
+                        directly (scripts/export-timeline.ts, under plain
+                        `node --experimental-strip-types` — no npm deps, no
+                        vitest) against this run's ACTUAL decisions, and
+                        writes real .edl/.xml/.fcpxml files
 
 A later stage that has nothing to work with (e.g. decisions produced nothing)
 is reported SKIP, not FAIL — the script keeps going so you get a full report
@@ -484,21 +486,32 @@ def stage_preview(report: Report, project: dict, media_root: str, decisions: lis
         )
 
 
-def stage_export(
-    report: Report, project: dict, timeline_name: str, target_seconds: float, media_root: str, decisions: list, out_dir: Path, npx_bin: str,
-) -> None:
-    if not decisions:
-        report.add("export", "SKIP", "no edit decisions to export.")
-        return
+MIN_NODE_STRIP_TYPES_VERSION = (22, 6)
 
-    node_modules = REPO_ROOT / "node_modules"
-    if not node_modules.exists():
-        report.add(
-            "export", "SKIP",
-            f"{node_modules} not found — run `npm install` in {REPO_ROOT} first, then re-run this stage.",
-        )
-        return
 
+def _node_supports_strip_types(node_bin: str) -> tuple[bool, str]:
+    """--experimental-strip-types needs Node >=22.6. Checked explicitly so a
+    too-old Node fails this stage with a clear, actionable reason instead of a
+    confusing runtime error out of the export runner itself."""
+    try:
+        proc = subprocess.run([node_bin, "--version"], capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        return False, f"could not run `{node_bin} --version`: {exc}"
+    version = proc.stdout.strip().lstrip("v")
+    try:
+        major, minor = (int(p) for p in version.split(".")[:2])
+    except ValueError:
+        return False, f"could not parse Node version from {version!r}"
+    if (major, minor) < MIN_NODE_STRIP_TYPES_VERSION:
+        return False, f"Node {version} is too old (need >= {'.'.join(map(str, MIN_NODE_STRIP_TYPES_VERSION))} for --experimental-strip-types)"
+    return True, version
+
+
+def build_export_fixture(project: dict, timeline_name: str, target_seconds: float, media_root: str, decisions: list) -> dict:
+    """The exact { timeline, clips, mediaRoot } shape scripts/export-timeline.ts
+    expects — a real UniversalTimeline built from this run's actual decisions,
+    matching what the frontend's normalizeTimeline() would produce from the
+    same /build response."""
     fps = 24.0
     clips = project["clips"]
     clips_by_id = {c["id"]: c for c in clips}
@@ -506,7 +519,7 @@ def stage_export(
         fps = clips_by_id[decisions[0]["clipId"]].get("fps") or 24.0
     total_seconds = max((d.get("timelineStartSeconds", 0) + d.get("durationSeconds", 0)) for d in decisions)
 
-    fixture = {
+    return {
         "timeline": {
             "id": "tl-e2e-validate",
             "name": timeline_name,
@@ -519,40 +532,62 @@ def stage_export(
         "mediaRoot": media_root,
     }
 
+
+def stage_export(
+    report: Report, project: dict, timeline_name: str, target_seconds: float, media_root: str, decisions: list, out_dir: Path, node_bin: str,
+) -> None:
+    if not decisions:
+        report.add("export", "SKIP", "no edit decisions to export.")
+        return
+
+    runner = REPO_ROOT / "scripts" / "export-timeline.ts"
+    if not runner.exists():
+        report.add("export", "FAIL", f"export runner not found: {runner}")
+        return
+
+    node_ok, node_detail = _node_supports_strip_types(node_bin)
+    if not node_ok:
+        report.add("export", "SKIP", f"{node_detail} — install a newer Node.js, then re-run this stage.")
+        return
+
     out_dir.mkdir(parents=True, exist_ok=True)
+    fixture = build_export_fixture(project, timeline_name, target_seconds, media_root, decisions)
     fixture_path = out_dir / "e2e-fixture.json"
     fixture_path.write_text(json.dumps(fixture, indent=2), encoding="utf-8")
 
-    env = {**os.environ, "AE_E2E_FIXTURE": str(fixture_path), "AE_E2E_OUTDIR": str(out_dir)}
+    # A real Node/TypeScript process running the actual exporter functions
+    # (src/lib/nle/edl.ts, xmeml.ts, fcpxml.ts) directly — no vitest, no
+    # bundler, no npm dependency of any kind. See scripts/export-timeline.ts's
+    # own header comment for why this replaced the earlier `npx vitest run`
+    # approach.
     try:
         proc = subprocess.run(
-            [npx_bin, "vitest", "run", "tests/e2e-export.generated.test.ts"],
+            [node_bin, "--experimental-strip-types", str(runner), str(fixture_path), str(out_dir)],
             cwd=REPO_ROOT,
-            env=env,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=60,
         )
     except FileNotFoundError:
-        report.add("export", "SKIP", f"`{npx_bin}` not found — install Node.js/npm, then re-run this stage.")
+        report.add("export", "SKIP", f"`{node_bin}` not found on PATH.")
         return
     except subprocess.TimeoutExpired:
-        report.add("export", "FAIL", "`npx vitest run tests/e2e-export.generated.test.ts` timed out after 180s.")
+        report.add("export", "FAIL", "export-timeline.ts timed out after 60s.")
         return
 
     if proc.returncode != 0:
-        tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-25:])
-        report.add("export", "FAIL", f"vitest exit code {proc.returncode}. Last output:\n{tail}")
+        detail = (proc.stdout + proc.stderr).strip() or f"exit code {proc.returncode}, no output"
+        report.add("export", "FAIL", f"export-timeline.ts failed: {detail}")
         return
 
     summary_path = out_dir / "export-summary.json"
     if not summary_path.exists():
-        report.add("export", "FAIL", "vitest reported success but export-summary.json was not written — investigate.")
+        report.add("export", "FAIL", "export-timeline.ts exited 0 but export-summary.json was not written — investigate.")
         return
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     files_ok = all((out_dir / f).exists() and (out_dir / f).stat().st_size > 0 for f in summary.get("files", []))
     if not files_ok:
-        report.add("export", "FAIL", f"vitest reported success but expected output files are missing/empty in {out_dir}.")
+        report.add("export", "FAIL", f"export-timeline.ts exited 0 but expected output files are missing/empty in {out_dir}.")
         return
 
     warn_bits = []
@@ -588,7 +623,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=32145)
     parser.add_argument("--analyze-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--out-dir", default=str(WORKER_DIR / "validation-output"))
-    parser.add_argument("--npx-bin", default="npx", help="npx binary to use for the export stage.")
+    parser.add_argument("--node-bin", default="node", help="node binary to use for the export stage (needs Node >= 22.6).")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir).expanduser()
@@ -633,7 +668,7 @@ def main() -> int:
             story, decisions = stage_decisions(report, client, args.project_id, stories, args.target_seconds, args.command)
             stage_preview(report, project, args.media_root, decisions)
             timeline_name = f"E2E validate — {story['title']}" if story else "E2E validate"
-            stage_export(report, project, timeline_name, args.target_seconds, args.media_root, decisions, out_dir, args.npx_bin)
+            stage_export(report, project, timeline_name, args.target_seconds, args.media_root, decisions, out_dir, args.node_bin)
         else:
             for name in ("proxies", "transcription", "visual_analysis", "selects", "stories", "decisions", "preview", "export"):
                 report.add(name, "SKIP", "analyze_run did not complete.")

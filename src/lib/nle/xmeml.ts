@@ -17,8 +17,11 @@
 // run once footage is available.
 
 import type { Clip, EditDecisionLane, UniversalTimeline } from "../ae/types";
-import { fileUrlForClip, sanitizeXmlId, xmlEscape, type XmlExportResult } from "./xml-utils";
-import { framesForSeconds, tcToSeconds } from "./timecode";
+// Explicit ".ts" extensions — see the comment on the equivalent import in
+// edl.ts: these are real runtime imports and scripts/export-timeline.ts runs
+// this file directly under Node with no bundler in front of it.
+import { fileUrlForClip, sanitizeXmlId, xmlEscape, type XmlExportResult } from "./xml-utils.ts";
+import { framesForSeconds, tcToSeconds } from "./timecode.ts";
 
 export type { XmlExportResult };
 
