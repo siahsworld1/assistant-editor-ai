@@ -21,6 +21,7 @@ class ClipState:
     fps: float
     rel_path: str = ""
     proxy_rel_path: str = ""
+    thumbnail_rel_path: str = ""
     speakers: list[str] = field(default_factory=list)
     state: str = "pending"  # pending | analyzing | analyzed | error
     progress: int = 0
@@ -35,6 +36,7 @@ class ClipState:
             "filename": self.filename,
             "relPath": self.rel_path,
             "proxyRelPath": self.proxy_rel_path,
+            "thumbnailRelPath": self.thumbnail_rel_path,
             "role": self.role,
             "durationSeconds": self.duration_seconds,
             "camera": self.camera,

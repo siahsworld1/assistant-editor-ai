@@ -326,13 +326,15 @@ export function normalizeAnalyze(payload: unknown): AnalyzeResult {
   const acceptedField = pick(root, "accepted", "ok", "started", "queued");
   const stateStr = str(pick(root, "state", "status")).toLowerCase();
   const state: ProjectBrain["analysisState"] | null =
-    stateStr === "complete" || stateStr === "done" || stateStr === "finished"
-      ? "complete"
-      : stateStr === "running" || stateStr === "analyzing" || stateStr === "processing"
-        ? "running"
-        : stateStr === "idle"
-          ? "idle"
-          : null;
+    stateStr === "error" || stateStr === "failed"
+      ? "error"
+      : stateStr === "complete" || stateStr === "done" || stateStr === "finished"
+        ? "complete"
+        : stateStr === "running" || stateStr === "analyzing" || stateStr === "processing"
+          ? "running"
+          : stateStr === "idle"
+            ? "idle"
+            : null;
   const rawSummary = pick(root, "summary", "counts", "stats");
   const summary = isRec(rawSummary) ? normalizeSummary(rawSummary) : null;
   const jobId = str(pick(root, "jobId", "job_id", "id")) || null;
@@ -375,11 +377,13 @@ function normalizeClips(v: unknown): Clip[] {
     const note = str(pick(raw, "note", "comment"));
     const relPath = str(pick(raw, "relPath", "rel_path"));
     const proxyRelPath = str(pick(raw, "proxyRelPath", "proxy_rel_path"));
+    const thumbnailRelPath = str(pick(raw, "thumbnailRelPath", "thumbnail_rel_path"));
     return {
       id: str(pick(raw, "id", "clipId"), `clip-${i + 1}`),
       filename: str(pick(raw, "filename", "name", "file", "path"), `clip-${i + 1}`),
       ...(relPath ? { relPath } : {}),
       ...(proxyRelPath ? { proxyRelPath } : {}),
+      ...(thumbnailRelPath ? { thumbnailRelPath } : {}),
       role: (CLIP_ROLES as string[]).includes(role) ? (role as Clip["role"]) : "interview",
       durationSeconds: num(pick(raw, "durationSeconds", "duration"), 0),
       camera: str(pick(raw, "camera", "device"), "—"),
@@ -428,6 +432,29 @@ export function normalizeProjectPatch(payload: unknown): Partial<ProjectBrain> {
   }
   const progress = pick(root, "analysisProgress", "progress");
   if (progress !== undefined) patch.analysisProgress = num(progress);
+  // GET /project always reports the worker's real analysisState — this used to be
+  // dropped on the floor here, which is why the polling loop that reads this patch
+  // could only ever infer "done" from progress reaching 100 and had no way to learn
+  // a background analysis run had actually failed (worker/store.py::fail leaves
+  // progress wherever it was, not 100).
+  const stateStr = str(pick(root, "analysisState", "state", "status")).toLowerCase();
+  const state: ProjectBrain["analysisState"] | null =
+    stateStr === "error" || stateStr === "failed"
+      ? "error"
+      : stateStr === "complete" || stateStr === "done" || stateStr === "finished"
+        ? "complete"
+        : stateStr === "running" || stateStr === "analyzing" || stateStr === "processing"
+          ? "running"
+          : stateStr === "idle"
+            ? "idle"
+            : null;
+  if (state) patch.analysisState = state;
+  // Always set (never conditionally omitted) so a resolved error clears on the next
+  // successful poll instead of lingering in state after the user re-runs Analyze.
+  if ("error" in root || "analysisState" in root || "state" in root) {
+    const errText = str(pick(root, "error", "errorMessage", "message"));
+    patch.analysisError = errText || null;
+  }
   return patch;
 }
 

@@ -53,6 +53,11 @@ export interface Clip {
    * present, playback prefers this over `relPath` — Chromium can't decode every
    * camera-original format, but every proxy is guaranteed playable. */
   proxyRelPath?: string | undefined;
+  /** Path (relative to mediaRoot) of a generated JPEG thumbnail frame, if the
+   * engine has produced one for this clip (worker/media.py::generate_thumbnail).
+   * WATCH's media-bin Thumb() renders this when present, falling back to the
+   * gradient/play-icon placeholder for audio-only clips or a failed/missing image. */
+  thumbnailRelPath?: string | undefined;
   role: ClipRole;
   durationSeconds: number;
   camera: string;
@@ -163,8 +168,11 @@ export interface ProjectBrain {
   transcript: TranscriptSegment[];
   visualEvidence: VisualEvidence[];
   summary: AnalysisSummary;
-  analysisState: "idle" | "running" | "complete";
+  analysisState: "idle" | "running" | "complete" | "error";
   analysisProgress: number;
+  /** Real error message from the engine's last analysis run, if analysisState is
+   * "error". Null/undefined once a run has completed or none has failed yet. */
+  analysisError?: string | null | undefined;
 }
 
 export interface EngineHealth {

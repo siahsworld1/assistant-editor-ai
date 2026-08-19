@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { useAE } from "@/lib/ae/store";
-import { previewSrcForClip } from "@/lib/ae/media-url";
+import { previewSrcForClip, thumbSrcForClip } from "@/lib/ae/media-url";
 import type { Clip } from "@/lib/ae/types";
 
 export const Route = createFileRoute("/watch")({
@@ -55,14 +55,32 @@ function secs(n: number) {
 }
 
 function Thumb({ clip }: { clip: Clip }) {
+  // Real thumbnails only ever apply to video clips (worker/pipeline.py never
+  // generates one for audio-only files) — the gradient/play tile below remains
+  // the permanent look for audio, and the fallback for a missing or broken image.
+  const [failed, setFailed] = useState(false);
+  const src = clip.role !== "ambient" ? thumbSrcForClip(clip) : null;
+  const showImage = Boolean(src) && !failed;
+
   return (
     <div
       className="relative grid h-[52px] w-[92px] shrink-0 place-items-center overflow-hidden rounded border border-border"
-      style={{
-        background: `linear-gradient(140deg, oklch(0.30 0.05 ${clip.thumbHue}), oklch(0.17 0.02 ${clip.thumbHue}))`,
-      }}
+      style={
+        showImage
+          ? undefined
+          : {
+              background: `linear-gradient(140deg, oklch(0.30 0.05 ${clip.thumbHue}), oklch(0.17 0.02 ${clip.thumbHue}))`,
+            }
+      }
     >
-      {clip.role === "ambient" ? (
+      {showImage ? (
+        <img
+          src={src ?? undefined}
+          alt=""
+          className="absolute inset-0 h-full w-full object-cover"
+          onError={() => setFailed(true)}
+        />
+      ) : clip.role === "ambient" ? (
         <AudioLines className="size-4 text-foreground/60" />
       ) : (
         <Play className="size-4 text-foreground/60" />
@@ -197,7 +215,14 @@ function WatchPage() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <div className="text-sm font-medium">
-                Analysis {project?.analysisState === "complete" ? "complete" : running ? "in progress" : "idle"}
+                Analysis{" "}
+                {project?.analysisState === "complete"
+                  ? "complete"
+                  : project?.analysisState === "error"
+                    ? "failed"
+                    : running
+                      ? "in progress"
+                      : "idle"}
               </div>
               <div className="text-xs text-muted-foreground">
                 {connection === "demo"
@@ -210,6 +235,11 @@ function WatchPage() {
             </span>
           </div>
           <Progress value={project?.analysisProgress ?? 0} className="mt-3 h-1.5" />
+          {project?.analysisState === "error" && project.analysisError && (
+            <p className="mt-3 rounded border border-warning/40 bg-warning/[0.06] px-3 py-2 text-[11px] text-warning">
+              {project.analysisError}
+            </p>
+          )}
         </div>
 
         <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
@@ -289,6 +319,8 @@ function WatchPage() {
                         <span className="font-tc text-[11px] text-positive">ready</span>
                       ) : clip.state === "analyzing" ? (
                         <span className="font-tc text-[11px] text-warning">{clip.progress}%</span>
+                      ) : clip.state === "error" ? (
+                        <span className="font-tc text-[11px] text-warning">error</span>
                       ) : (
                         <span className="font-tc text-[11px] text-muted-foreground">queued</span>
                       )}

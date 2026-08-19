@@ -24,3 +24,15 @@ export function previewSrcForClip(clip: Clip | null | undefined): string | null 
   if (!rel) return null;
   return mediaUrl(rel);
 }
+
+/**
+ * The real JPEG thumbnail frame the engine generated for this clip
+ * (worker/media.py::generate_thumbnail), if any. Returns null — never a
+ * fabricated URL — when no thumbnail has been generated yet (not analyzed,
+ * analysis failed, or the clip is audio-only and never gets one); WATCH's
+ * Thumb() falls back to its gradient/play-icon placeholder in that case.
+ */
+export function thumbSrcForClip(clip: Clip | null | undefined): string | null {
+  if (!clip?.thumbnailRelPath) return null;
+  return mediaUrl(clip.thumbnailRelPath);
+}

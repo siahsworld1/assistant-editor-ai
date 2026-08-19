@@ -541,9 +541,14 @@ export function AEProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshEvidence = useCallback(async (client: EngineClient) => {
+    // Use the real active project's id — falling back to the placeholder constant
+    // only when no project is open yet (e.g. Demo Mode's brief live-engine probe).
+    // The worker itself is single-tenant and ignores this id today, but the UI
+    // should never send a fabricated id when a real one is available.
+    const projectId = activeRef.current.record?.id ?? PROJECT_ID;
     const [s, st] = await Promise.allSettled([
-      client.getSelects(PROJECT_ID),
-      client.getStories(PROJECT_ID),
+      client.getSelects(projectId),
+      client.getStories(projectId),
     ]);
     if (s.status === "fulfilled") setSelects(s.value);
     if (st.status === "fulfilled") {
@@ -678,9 +683,9 @@ export function AEProvider({ children }: { children: ReactNode }) {
 
   // Live progress polling while a real engine is running an analysis job.
   // A real engine's POST /analyze returns almost immediately and keeps working in the
-  // background (see worker/pipeline.py), so this is how progress/clip state and the
-  // eventual selects/stories actually reach the UI — analyze() itself only fires the
-  // job and does a single refreshEvidence() right after kicking it off.
+  // background (see worker/pipeline.py), so this is the ONLY place progress, clip
+  // state, transcripts, visual evidence and the eventual selects/stories reach the
+  // UI — analyze() itself only fires the job and records the accept response.
   useEffect(() => {
     if (connection !== "live" && connection !== "degraded") return;
     if (project?.analysisState !== "running") return;
@@ -691,10 +696,25 @@ export function AEProvider({ children }: { children: ReactNode }) {
       void (async () => {
         const patch = await client.getProjectPatch().catch(() => null);
         if (cancelled || !patch) return;
+        // GET /project's own analysisState is authoritative when the worker reports
+        // one (normalizeProjectPatch reads worker/store.py::project_json's real
+        // analysisState/error) — progress reaching 100 is only the fallback signal
+        // for a worker that doesn't report analysisState at all. Either way, a real
+        // "error" from the worker always wins: an analysis that failed partway
+        // through must never be reported as complete just because some earlier
+        // clip had already reached 100% before the failure.
         const progress = patch.analysisProgress ?? undefined;
-        const done = progress !== undefined && progress >= 100;
-        setProject((p) => (p ? { ...p, ...patch, analysisState: done ? "complete" : "running" } : p));
-        if (done) await refreshEvidence(client);
+        const doneByProgress = progress !== undefined && progress >= 100;
+        const resolvedState: ProjectBrain["analysisState"] =
+          patch.analysisState === "error"
+            ? "error"
+            : patch.analysisState === "complete" || doneByProgress
+              ? "complete"
+              : "running";
+        setProject((p) => (p ? { ...p, ...patch, analysisState: resolvedState } : p));
+        // Polling stops naturally next render since this effect's dependency
+        // (project.analysisState) will no longer be "running".
+        if (resolvedState === "complete") await refreshEvidence(client);
       })();
     }, ANALYSIS_POLL_MS);
     return () => {
@@ -705,30 +725,45 @@ export function AEProvider({ children }: { children: ReactNode }) {
 
   const analyze = useCallback(() => {
     const client = clientRef.current;
-    setProject((p) => (p ? { ...p, analysisState: "running", analysisProgress: 8 } : p));
+    setProject((p) =>
+      p ? { ...p, analysisState: "running", analysisProgress: 2, analysisError: null } : p,
+    );
     if (!client) return; // demo: simulated below
     void (async () => {
       try {
+        // POST /analyze only *starts* a background job on a real engine (see
+        // worker/pipeline.py::run_analysis, run on a daemon thread) — it does not
+        // wait for it to finish. The job's actual progress, clip states,
+        // transcripts, visual evidence and summary only ever reach the UI through
+        // the polling effect above, which watches analysisState === "running" and
+        // keeps refetching GET /project until the worker itself reports completion
+        // (or a real error). This handler's only job is to kick the job off and
+        // record whatever the accept response says right now — it must never mark
+        // the run "complete" itself, or it would stop that polling effect before
+        // any real work has actually happened.
         const res = await client.analyze({
           projectId: activeRef.current.record?.id ?? PROJECT_ID,
           mediaRoot: activeRef.current.record?.mediaRoot || undefined,
         });
         setProject((p) => {
           if (!p) return p;
+          const state = res.state === "error" ? "error" : (res.state ?? "running");
           return {
             ...p,
             analysisProgress: res.progress ?? p.analysisProgress,
-            analysisState: res.state ?? p.analysisState,
+            analysisState: state,
             ...(res.summary ? { summary: { ...p.summary, ...res.summary } } : {}),
           };
         });
-        await refreshEvidence(client);
-        setProject((p) => (p ? { ...p, analysisState: "complete", analysisProgress: 100 } : p));
-      } catch {
-        setProject((p) => (p ? { ...p, analysisState: "idle", analysisProgress: 0 } : p));
+      } catch (err) {
+        // A real failure to even start analysis (engine unreachable, 4xx/5xx on
+        // POST /analyze) — surface the actual reason instead of silently resetting
+        // clip/transcript/evidence state back to as if nothing had been tried.
+        const errorMessage = err instanceof Error ? err.message : "Analyze request failed.";
+        setProject((p) => (p ? { ...p, analysisState: "error", analysisError: errorMessage } : p));
       }
     })();
-  }, [refreshEvidence]);
+  }, []);
 
   // Demo-only analysis animation.
   useEffect(() => {

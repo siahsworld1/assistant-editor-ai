@@ -133,6 +133,24 @@ def _analyze_one_clip(
     clip_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        # Thumbnail generation runs first, before the (potentially much slower)
+        # proxy transcode below, so the WATCH page's media bin shows a real image
+        # for this clip almost immediately after Analyze starts rather than only
+        # once the whole clip finishes analyzing. Same authorized-mediaRoot
+        # boundary as proxies (media_root/.ae_thumbs/<clipId>.jpg) — no separate
+        # allowlist entry needed. Skipped for audio-only files (WATCH shows the
+        # waveform-style placeholder for those instead) and never fails the clip.
+        if ext not in media.AUDIO_ONLY_EXTENSIONS and STORE.media_root:
+            thumb_dir = Path(STORE.media_root) / media.THUMB_DIR_NAME
+            thumb_dest = thumb_dir / f"{clip_id}.jpg"
+            if media.thumbnail_is_current(path, thumb_dest):
+                clip.thumbnail_rel_path = f"{media.THUMB_DIR_NAME}/{clip_id}.jpg"
+            elif media.generate_thumbnail(path, thumb_dest, info["duration"]):
+                clip.thumbnail_rel_path = f"{media.THUMB_DIR_NAME}/{clip_id}.jpg"
+            else:
+                log.warning("thumbnail generation failed for %s — media bin will show the placeholder tile", path.name)
+            STORE.upsert_clip(clip)
+
         # Proxy generation: a scaled-down H.264/AAC MP4 that Chromium's <video>
         # element can actually decode and scrub, unlike many camera-original
         # formats (ProRes/MXF/HEVC variants). Lives under the media root itself

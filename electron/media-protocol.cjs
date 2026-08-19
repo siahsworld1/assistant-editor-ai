@@ -34,6 +34,11 @@ const CONTENT_TYPES = {
   ".aif": "audio/aiff",
   ".aiff": "audio/aiff",
   ".flac": "audio/flac",
+  // Real WATCH-page media-bin thumbnails (worker/media.py::generate_thumbnail)
+  // are served through this same protocol, under mediaRoot/.ae_thumbs/*.jpg.
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
 };
 
 /** Must run before `app.whenReady()` — Electron ignores privilege registration afterward. */

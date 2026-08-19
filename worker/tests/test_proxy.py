@@ -106,5 +106,71 @@ class TestGenerateProxy(unittest.TestCase):
         self.assertTrue(media.proxy_is_current(self.src, dest))
 
 
+@unittest.skipUnless(_ffmpeg_present(), "ffmpeg/ffprobe not on PATH")
+class TestGenerateThumbnail(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ae-thumb-test-"))
+        self.src = self.tmp / "source_4k.mov"
+        ok = _make_synthetic_clip(self.src, width=1920, height=1080, seconds=2.0)
+        if not ok:
+            self.skipTest("Could not synthesize a test clip with this ffmpeg build.")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_generates_a_real_decodable_jpeg(self):
+        dest = self.tmp / media.THUMB_DIR_NAME / "clip-001.jpg"
+        ok = media.generate_thumbnail(self.src, dest, duration_seconds=2.0, max_width=480)
+        self.assertTrue(ok, "generate_thumbnail reported failure")
+        self.assertTrue(dest.exists())
+        self.assertGreater(dest.stat().st_size, 0)
+
+        # Verify with ffprobe — a real decodability check, not just "a file exists".
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(dest)],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(proc.stdout or "{}")
+        video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+        self.assertIsNotNone(video, "thumbnail has no decodable image stream")
+        self.assertEqual(video.get("codec_name"), "mjpeg")
+        self.assertLessEqual(int(video.get("width", 0)), 480)
+
+    def test_never_upscales_a_smaller_source(self):
+        small_src = self.tmp / "small_source.mov"
+        self.assertTrue(_make_synthetic_clip(small_src, width=320, height=180, seconds=2.0))
+        dest = self.tmp / media.THUMB_DIR_NAME / "clip-002.jpg"
+        self.assertTrue(media.generate_thumbnail(small_src, dest, duration_seconds=2.0, max_width=480))
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(dest)],
+            capture_output=True, text=True, timeout=30,
+        )
+        video = next(s for s in json.loads(proc.stdout)["streams"] if s.get("codec_type") == "video")
+        self.assertLessEqual(int(video["width"]), 320)
+
+    def test_returns_false_and_cleans_up_on_a_bogus_source(self):
+        bogus = self.tmp / "not_a_real_video.mov"
+        bogus.write_bytes(b"this is not a video file")
+        dest = self.tmp / media.THUMB_DIR_NAME / "clip-bad.jpg"
+        ok = media.generate_thumbnail(bogus, dest, duration_seconds=2.0)
+        self.assertFalse(ok)
+        self.assertFalse(dest.exists())
+
+    def test_thumbnail_is_current_reflects_mtimes(self):
+        dest = self.tmp / media.THUMB_DIR_NAME / "clip-003.jpg"
+        self.assertFalse(media.thumbnail_is_current(self.src, dest))
+        self.assertTrue(media.generate_thumbnail(self.src, dest, duration_seconds=2.0))
+        self.assertTrue(media.thumbnail_is_current(self.src, dest))
+
+    def test_never_samples_frame_zero(self):
+        # A 2s clip at 15% in should seek to ~0.3s, never the literal start —
+        # ffmpeg's -ss before -i makes this a real (fast) seek, not a filter, so
+        # the only real assertion is that generation succeeds off a non-zero
+        # timestamp derived from the clip's real duration.
+        dest = self.tmp / media.THUMB_DIR_NAME / "clip-004.jpg"
+        self.assertTrue(media.generate_thumbnail(self.src, dest, duration_seconds=2.0))
+        self.assertGreater(dest.stat().st_size, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

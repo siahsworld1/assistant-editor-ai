@@ -259,6 +259,51 @@ def proxy_is_current(src: Path, dest: Path) -> bool:
         return False
 
 
+THUMB_DIR_NAME = ".ae_thumbs"
+THUMB_MAX_WIDTH = 480
+
+
+def generate_thumbnail(src: Path, dest: Path, duration_seconds: float, max_width: int = THUMB_MAX_WIDTH) -> bool:
+    """Extracts a single real JPEG frame ~15% into the clip (never frame 0, which
+    on real footage is disproportionately likely to be a lens cap, black, or a
+    slate) for use as a WATCH-page media-bin thumbnail.
+
+    Deliberately the cheapest real thing that could work: one frame, no AI call,
+    a few hundred KB, done in well under a second on typical footage — this runs
+    before the (potentially many-minute) proxy transcode so a real thumbnail shows
+    up in the UI almost immediately after Analyze starts, not just once the whole
+    clip has finished. Never raises; a failed thumbnail just means the UI shows its
+    placeholder tile, exactly like a failed proxy falls back to the original file.
+    """
+    if not ffmpeg_available():
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    ts = max(0.1, (duration_seconds or 0.0) * 0.15)
+    scale_filter = f"scale='min({max_width},iw)':-2"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(src),
+                "-frames:v", "1", "-vf", scale_filter, "-q:v", "4",
+                str(dest),
+            ],
+            capture_output=True, timeout=30, check=True,
+        )
+        return dest.exists() and dest.stat().st_size > 0
+    except (subprocess.SubprocessError, OSError):
+        dest.unlink(missing_ok=True)
+        return False
+
+
+def thumbnail_is_current(src: Path, dest: Path) -> bool:
+    """True if `dest` already exists and is newer than `src` — mirrors
+    proxy_is_current so repeat Analyze runs don't re-extract an unchanged frame."""
+    try:
+        return dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime
+    except OSError:
+        return False
+
+
 def frame_timecode(index: int, count: int, duration: float, fps: float = 24.0) -> str:
     step = duration / (count + 1)
     seconds = step * (index + 1)
