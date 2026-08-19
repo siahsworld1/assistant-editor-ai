@@ -6,12 +6,15 @@ extracting audio + sample frames, inferring role/speaker from filenames, and a r
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import subprocess
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger("assistant-editor-worker")
 
 MEDIA_EXTENSIONS = {
     ".mov", ".mp4", ".mxf", ".m4v", ".avi", ".mkv", ".braw", ".r3d", ".arri", ".ari",
@@ -21,6 +24,21 @@ AUDIO_ONLY_EXTENSIONS = {".wav", ".aif", ".aiff", ".mp3", ".flac", ".m4a"}
 
 MAX_FILES = 500
 MAX_DEPTH = 6
+
+# Single shared timeout for every ffprobe invocation in this module — production
+# camera-original footage (large 4K H.265/HEVC files in particular) can
+# genuinely need more than a token few seconds for ffprobe to read container +
+# stream metadata, especially over slower storage. One real, generous budget,
+# retried once on a genuine timeout (see FFPROBE_MAX_ATTEMPTS below) beats
+# guessing a "safe" number that's still too tight for some real footage.
+FFPROBE_TIMEOUT_SECONDS = 120
+# Total attempts for a single ffprobe_info() call, including the first. Only a
+# genuine timeout triggers a retry — a real failure (bad exit code, corrupt
+# file, no streams) is not retried, since running the same probe again against
+# the same unreadable bytes would not produce a different answer. This bounds
+# the worst case for one file at FFPROBE_MAX_ATTEMPTS * FFPROBE_TIMEOUT_SECONDS
+# — ffprobe can never hang indefinitely.
+FFPROBE_MAX_ATTEMPTS = 2
 
 
 def ffmpeg_available() -> bool:
@@ -116,31 +134,61 @@ def _ffprobe_failure(reason: str) -> dict:
     }
 
 
+def _run_ffprobe_once(path: Path, timeout: float) -> subprocess.CompletedProcess:
+    """One real ffprobe invocation. Raises subprocess.TimeoutExpired or OSError —
+    callers decide what to do with those, this just runs the process."""
+    return subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
 def ffprobe_info(path: Path) -> dict:
     """Returns duration/resolution/fps/has_audio/camera via ffprobe, plus
     `ok`/`probeError`. `ok` is False whenever ffprobe couldn't actually tell us
-    anything real about this file — missing binary, timeout, non-zero exit,
-    unparsable output, or a file with no video *and* no audio stream. Callers
-    must treat `ok: False` as "this clip could not be analyzed", not as "an
-    audio-only file with unknown duration" — the two used to be indistinguishable
-    (both produced this exact same defaults shape), which is how a genuinely
-    unreadable file could end up silently marked "ready" with 0:00 and no
-    metadata instead of a real, visible error."""
+    anything real about this file — missing binary, timeout (after one retry —
+    see below), non-zero exit, unparsable output, or a file with no video *and*
+    no audio stream. Callers must treat `ok: False` as "this clip could not be
+    analyzed", not as "an audio-only file with unknown duration" — the two used
+    to be indistinguishable (both produced this exact same defaults shape),
+    which is how a genuinely unreadable file could end up silently marked
+    "ready" with 0:00 and no metadata instead of a real, visible error.
+
+    Retries exactly once, and only on a genuine timeout: a real 4K H.265/HEVC
+    camera-original file can legitimately take longer than a short, fixed
+    budget to probe (slow external storage, a large/complex container), and a
+    single slow-but-fine run shouldn't be reported the same as truly unreadable
+    media. A non-timeout failure (bad exit code, corrupt bytes, no streams) is
+    never retried — running ffprobe again against the same bad bytes cannot
+    produce a different answer. The retry is bounded to one extra attempt at
+    the same FFPROBE_TIMEOUT_SECONDS budget, so ffprobe can never hang
+    indefinitely on a single clip: worst case is
+    FFPROBE_MAX_ATTEMPTS * FFPROBE_TIMEOUT_SECONDS, not unbounded.
+    """
     if not ffmpeg_available():
         return _ffprobe_failure("ffmpeg/ffprobe not found on PATH")
-    try:
-        proc = subprocess.run(
-            [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_format", "-show_streams", str(path),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return _ffprobe_failure("ffprobe timed out after 30s")
-    except OSError as exc:
-        return _ffprobe_failure(f"could not run ffprobe: {exc}")
 
+    proc: subprocess.CompletedProcess | None = None
+    for attempt in range(1, FFPROBE_MAX_ATTEMPTS + 1):
+        try:
+            proc = _run_ffprobe_once(path, FFPROBE_TIMEOUT_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            if attempt < FFPROBE_MAX_ATTEMPTS:
+                log.warning(
+                    "ffprobe timed out after %ss on %s (attempt %d/%d) — retrying once",
+                    FFPROBE_TIMEOUT_SECONDS, path.name, attempt, FFPROBE_MAX_ATTEMPTS,
+                )
+                continue
+            retries = FFPROBE_MAX_ATTEMPTS - 1
+            reason = f"ffprobe timed out after {FFPROBE_TIMEOUT_SECONDS}s"
+            if retries:
+                reason += f" ({retries} retry still timed out)"
+            return _ffprobe_failure(reason)
+        except OSError as exc:
+            return _ffprobe_failure(f"could not run ffprobe: {exc}")
+
+    assert proc is not None  # loop only exits via break (success) or an early return above
     if proc.returncode != 0:
         stderr_lines = (proc.stderr or "").strip().splitlines()
         reason = stderr_lines[-1] if stderr_lines else f"ffprobe exited with status {proc.returncode}"

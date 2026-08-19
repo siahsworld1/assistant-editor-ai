@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -217,6 +218,93 @@ class TestFfprobeInfoFailureReporting(unittest.TestCase):
         info = media.ffprobe_info(self.tmp / "does_not_exist.mp4")
         self.assertFalse(info["ok"])
         self.assertIsNotNone(info["probeError"])
+
+
+class TestFfprobeTimeoutRetry(unittest.TestCase):
+    """Mocked tests for the timeout/retry logic itself — these must run fast
+    (no real 120s+240s waits), so they patch media._run_ffprobe_once (and
+    media.ffmpeg_available, so this class needs no real ffmpeg/ffprobe on
+    PATH) directly rather than exercising a real slow probe. Real-file
+    behavior (a genuinely fast probe succeeding, a genuinely corrupt file
+    failing) is covered by TestFfprobeInfoFailureReporting above; this class
+    only proves the attempt-counting, retry-on-timeout-only, and
+    bounded-worst-case behavior that a real timeout would trigger."""
+
+    def _fake_success(self):
+        return subprocess.CompletedProcess(
+            args=["ffprobe"], returncode=0,
+            stdout=json.dumps({
+                "format": {"duration": "5.0"},
+                "streams": [{
+                    "codec_type": "video", "width": 1920, "height": 1080,
+                    "avg_frame_rate": "24/1", "codec_long_name": "H.264",
+                }],
+            }),
+            stderr="",
+        )
+
+    def test_pinned_constants(self):
+        # A future edit that quietly shrinks these back down (e.g. someone
+        # "cleaning up" the module) should fail a test, not just surprise a
+        # user again with a false-positive timeout on real camera footage.
+        self.assertGreaterEqual(media.FFPROBE_TIMEOUT_SECONDS, 120)
+        self.assertEqual(media.FFPROBE_MAX_ATTEMPTS, 2)
+
+    def test_recovers_from_a_single_timeout_then_succeeds(self):
+        calls = []
+
+        def fake_run_once(path, timeout):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(cmd="ffprobe", timeout=timeout)
+            return self._fake_success()
+
+        with patch("media.ffmpeg_available", return_value=True), \
+                patch("media._run_ffprobe_once", side_effect=fake_run_once):
+            info = media.ffprobe_info(Path("/fake/18C_0687.MP4"))
+
+        self.assertEqual(len(calls), 2, "should retry exactly once after a timeout")
+        self.assertEqual(calls, [media.FFPROBE_TIMEOUT_SECONDS, media.FFPROBE_TIMEOUT_SECONDS])
+        self.assertTrue(info["ok"], info.get("probeError"))
+        self.assertIsNone(info["probeError"])
+        self.assertEqual(info["duration"], 5.0)
+
+    def test_exhausting_retries_reports_a_clear_timeout_error(self):
+        calls = []
+
+        def always_times_out(path, timeout):
+            calls.append(timeout)
+            raise subprocess.TimeoutExpired(cmd="ffprobe", timeout=timeout)
+
+        with patch("media.ffmpeg_available", return_value=True), \
+                patch("media._run_ffprobe_once", side_effect=always_times_out):
+            info = media.ffprobe_info(Path("/fake/18C_0687.MP4"))
+
+        # Bounded: never more than FFPROBE_MAX_ATTEMPTS real invocations, so
+        # ffprobe can never hang indefinitely on a single clip.
+        self.assertEqual(len(calls), media.FFPROBE_MAX_ATTEMPTS)
+        self.assertFalse(info["ok"])
+        self.assertIn(str(media.FFPROBE_TIMEOUT_SECONDS), info["probeError"])
+        self.assertIn("retry", info["probeError"].lower())
+
+    def test_a_real_non_timeout_failure_is_never_retried(self):
+        calls = []
+
+        def fake_run_once(path, timeout):
+            calls.append(timeout)
+            return subprocess.CompletedProcess(
+                args=["ffprobe"], returncode=1, stdout="", stderr="Invalid data found\n"
+            )
+
+        with patch("media.ffmpeg_available", return_value=True), \
+                patch("media._run_ffprobe_once", side_effect=fake_run_once):
+            info = media.ffprobe_info(Path("/fake/corrupt.MP4"))
+
+        # Re-running ffprobe against the same corrupt bytes can't produce a
+        # different answer — only a genuine timeout is worth retrying.
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(info["ok"])
+        self.assertIn("Invalid data found", info["probeError"])
 
 
 if __name__ == "__main__":
