@@ -6,7 +6,9 @@ Run from worker/: `python3 -m unittest discover -s tests -v`
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -202,6 +204,40 @@ class TestBuildTimelineWithInjectedProvider(unittest.TestCase):
         result = pipeline.build_timeline("proj-1", "story-01", 60, None, reasoning_provider=fake)
         self.assertIn("fallback assembly", result["summary"])
         self.assertEqual(len(result["decisions"]), 1)
+
+
+class TestAnalyzeOneClipSurfacesFfprobeFailure(unittest.TestCase):
+    """Reproduces the real bug report: a clip (named after the actual file that
+    triggered it) that ffprobe can't read must end up visibly marked as an
+    error with a real reason — never silently "ready" with 0:00 and no
+    metadata — and must skip thumbnail/proxy/transcription/vision entirely
+    rather than waste time on a file we already know is unreadable."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ae-ffprobe-clip-test-"))
+        self.media_root = self.tmp / "footage"
+        self.media_root.mkdir()
+        STORE.reset()
+        STORE.media_root = str(self.media_root)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_unreadable_clip_is_marked_error_with_a_real_note(self):
+        bogus = self.media_root / "18C_0681.MP4"
+        bogus.write_bytes(b"not a real video file")
+        pipeline._analyze_one_clip("clip-001", bogus, self.tmp / "work", None, None)
+
+        clip = STORE.clips["clip-001"]
+        self.assertEqual(clip.state, "error")
+        self.assertTrue(clip.note, "a real, non-empty error reason must be recorded")
+        self.assertEqual(clip.duration_seconds, 0.0)
+        self.assertEqual(clip.resolution, "—")
+        # Nothing downstream should have been attempted against an unreadable file.
+        self.assertEqual(clip.proxy_rel_path, "")
+        self.assertEqual(clip.thumbnail_rel_path, "")
+        self.assertFalse(clip.has_transcript)
+        self.assertEqual(clip.visual_evidence_count, 0)
 
 
 if __name__ == "__main__":

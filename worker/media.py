@@ -105,11 +105,29 @@ def speaker_for_file(filename: str) -> str | None:
     return None
 
 
+def _ffprobe_failure(reason: str) -> dict:
+    """The shared 'we learned nothing real about this file' shape. `ok: False` is
+    the only reliable signal a caller can use to tell this apart from a
+    legitimately quiet file — every other field here is just a safe default, not
+    a real measurement, and must never be presented to the user as one."""
+    return {
+        "duration": 0.0, "resolution": "—", "fps": 24.0, "has_audio": False, "camera": "—",
+        "ok": False, "probeError": reason[:300],
+    }
+
+
 def ffprobe_info(path: Path) -> dict:
-    """Returns duration/resolution/fps/has_audio/camera via ffprobe. Safe to call even
-    if ffprobe is missing (returns defaults)."""
+    """Returns duration/resolution/fps/has_audio/camera via ffprobe, plus
+    `ok`/`probeError`. `ok` is False whenever ffprobe couldn't actually tell us
+    anything real about this file — missing binary, timeout, non-zero exit,
+    unparsable output, or a file with no video *and* no audio stream. Callers
+    must treat `ok: False` as "this clip could not be analyzed", not as "an
+    audio-only file with unknown duration" — the two used to be indistinguishable
+    (both produced this exact same defaults shape), which is how a genuinely
+    unreadable file could end up silently marked "ready" with 0:00 and no
+    metadata instead of a real, visible error."""
     if not ffmpeg_available():
-        return {"duration": 0.0, "resolution": "—", "fps": 24.0, "has_audio": False, "camera": "—"}
+        return _ffprobe_failure("ffmpeg/ffprobe not found on PATH")
     try:
         proc = subprocess.run(
             [
@@ -118,14 +136,28 @@ def ffprobe_info(path: Path) -> dict:
             ],
             capture_output=True, text=True, timeout=30,
         )
+    except subprocess.TimeoutExpired:
+        return _ffprobe_failure("ffprobe timed out after 30s")
+    except OSError as exc:
+        return _ffprobe_failure(f"could not run ffprobe: {exc}")
+
+    if proc.returncode != 0:
+        stderr_lines = (proc.stderr or "").strip().splitlines()
+        reason = stderr_lines[-1] if stderr_lines else f"ffprobe exited with status {proc.returncode}"
+        return _ffprobe_failure(reason)
+
+    try:
         data = json.loads(proc.stdout or "{}")
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        return {"duration": 0.0, "resolution": "—", "fps": 24.0, "has_audio": False, "camera": "—"}
+    except json.JSONDecodeError as exc:
+        return _ffprobe_failure(f"ffprobe returned unparsable output: {exc}")
 
     fmt = data.get("format", {}) or {}
     streams = data.get("streams", []) or []
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    if video is None and audio is None:
+        return _ffprobe_failure("ffprobe found no video or audio streams in this file")
 
     duration = float(fmt.get("duration") or (video or {}).get("duration") or 0.0)
     resolution = "—"
@@ -155,6 +187,8 @@ def ffprobe_info(path: Path) -> dict:
         "fps": fps,
         "has_audio": audio is not None,
         "camera": camera,
+        "ok": True,
+        "probeError": None,
     }
 
 
@@ -263,36 +297,57 @@ THUMB_DIR_NAME = ".ae_thumbs"
 THUMB_MAX_WIDTH = 480
 
 
-def generate_thumbnail(src: Path, dest: Path, duration_seconds: float, max_width: int = THUMB_MAX_WIDTH) -> bool:
+def generate_thumbnail(
+    src: Path, dest: Path, duration_seconds: float, max_width: int = THUMB_MAX_WIDTH,
+) -> tuple[bool, str | None]:
     """Extracts a single real JPEG frame ~15% into the clip (never frame 0, which
     on real footage is disproportionately likely to be a lens cap, black, or a
     slate) for use as a WATCH-page media-bin thumbnail.
 
-    Deliberately the cheapest real thing that could work: one frame, no AI call,
-    a few hundred KB, done in well under a second on typical footage — this runs
-    before the (potentially many-minute) proxy transcode so a real thumbnail shows
-    up in the UI almost immediately after Analyze starts, not just once the whole
-    clip has finished. Never raises; a failed thumbnail just means the UI shows its
-    placeholder tile, exactly like a failed proxy falls back to the original file.
+    Deliberately the cheapest real thing that could work: one frame, no AI call —
+    this runs before the (potentially many-minute) proxy transcode so a real
+    thumbnail shows up in the UI almost immediately after Analyze starts, not
+    just once the whole clip has finished. Never raises; a failed thumbnail just
+    means the UI shows its placeholder tile, exactly like a failed proxy falls
+    back to the original file — but unlike the old bool-only return, the caller
+    now gets the real ffmpeg failure reason to log/surface instead of a silent
+    "didn't work, don't know why".
+
+    Timeout is 90s, not the 30s originally used: a real single-frame seek+decode
+    is normally sub-second, but `-ss` before `-i` still has to decode forward
+    from the nearest keyframe, and on a long-GOP camera-original file that can
+    take meaningfully longer than a synthetic test clip does — 90s stays far
+    short of the proxy transcode's own 1800s budget while giving real footage
+    real headroom instead of failing on a slow-but-fine seek.
     """
     if not ffmpeg_available():
-        return False
+        return False, "ffmpeg/ffprobe not found on PATH"
     dest.parent.mkdir(parents=True, exist_ok=True)
     ts = max(0.1, (duration_seconds or 0.0) * 0.15)
     scale_filter = f"scale='min({max_width},iw)':-2"
     try:
-        subprocess.run(
+        proc = subprocess.run(
             [
                 "ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(src),
                 "-frames:v", "1", "-vf", scale_filter, "-q:v", "4",
                 str(dest),
             ],
-            capture_output=True, timeout=30, check=True,
+            capture_output=True, timeout=90,
         )
-        return dest.exists() and dest.stat().st_size > 0
-    except (subprocess.SubprocessError, OSError):
+    except subprocess.TimeoutExpired:
         dest.unlink(missing_ok=True)
-        return False
+        return False, "ffmpeg timed out after 90s"
+    except OSError as exc:
+        dest.unlink(missing_ok=True)
+        return False, f"could not run ffmpeg: {exc}"
+
+    if proc.returncode != 0 or not (dest.exists() and dest.stat().st_size > 0):
+        dest.unlink(missing_ok=True)
+        stderr_lines = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        reason = stderr_lines[-1] if stderr_lines else f"ffmpeg exited with status {proc.returncode}"
+        return False, reason[:300]
+
+    return True, None
 
 
 def thumbnail_is_current(src: Path, dest: Path) -> bool:

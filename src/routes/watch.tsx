@@ -359,6 +359,15 @@ function WatchPage() {
                   )
                 ) : null}
 
+                {active.state === "error" && active.note && (
+                  <div className="rounded border border-warning/30 bg-warning/5 p-2.5">
+                    <div className="mb-1 flex items-center gap-1.5 text-[11px] text-warning">
+                      <AlertTriangle className="size-3" /> Analysis could not read this file
+                    </div>
+                    <p className="text-xs text-foreground/85">{active.note}</p>
+                  </div>
+                )}
+
                 <dl className="grid grid-cols-2 gap-y-2 text-xs">
                   <dt className="text-muted-foreground">Duration</dt>
                   <dd className="font-tc">{secs(active.durationSeconds)}</dd>

@@ -128,6 +128,20 @@ def _analyze_one_clip(
     )
     STORE.upsert_clip(clip)
 
+    if not info.get("ok", True):
+        # ffprobe genuinely couldn't read this file — every downstream step
+        # (thumbnail, proxy, transcription, visual analysis) needs real
+        # duration/stream info to do anything meaningful, so there is nothing
+        # honest left to attempt. Surface the real reason and stop, instead of
+        # silently leaving this clip at 0:00/no metadata but marked "ready" —
+        # which used to be indistinguishable from a genuinely quiet clip because
+        # ffprobe_info() returned the exact same defaults for both cases.
+        clip.state = "error"
+        clip.note = (info.get("probeError") or "ffprobe could not read this file.")[:200]
+        STORE.upsert_clip(clip)
+        log.warning("ffprobe could not read %s: %s — marking clip as error, skipping analysis", path.name, clip.note)
+        return
+
     technical_issues: list[str] = []
     clip_dir = tmp_root / clip_id
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -139,16 +153,22 @@ def _analyze_one_clip(
         # once the whole clip finishes analyzing. Same authorized-mediaRoot
         # boundary as proxies (media_root/.ae_thumbs/<clipId>.jpg) — no separate
         # allowlist entry needed. Skipped for audio-only files (WATCH shows the
-        # waveform-style placeholder for those instead) and never fails the clip.
+        # waveform-style placeholder for those instead) and never fails the clip
+        # — but a real failure IS surfaced in technicalIssues now, instead of
+        # only a server-side log line nobody looking at the app would ever see.
         if ext not in media.AUDIO_ONLY_EXTENSIONS and STORE.media_root:
             thumb_dir = Path(STORE.media_root) / media.THUMB_DIR_NAME
             thumb_dest = thumb_dir / f"{clip_id}.jpg"
             if media.thumbnail_is_current(path, thumb_dest):
                 clip.thumbnail_rel_path = f"{media.THUMB_DIR_NAME}/{clip_id}.jpg"
-            elif media.generate_thumbnail(path, thumb_dest, info["duration"]):
-                clip.thumbnail_rel_path = f"{media.THUMB_DIR_NAME}/{clip_id}.jpg"
             else:
-                log.warning("thumbnail generation failed for %s — media bin will show the placeholder tile", path.name)
+                thumb_ok, thumb_error = media.generate_thumbnail(path, thumb_dest, info["duration"])
+                if thumb_ok:
+                    clip.thumbnail_rel_path = f"{media.THUMB_DIR_NAME}/{clip_id}.jpg"
+                else:
+                    reason = thumb_error or "unknown ffmpeg failure"
+                    log.warning("thumbnail generation failed for %s: %s — media bin will show the placeholder tile", path.name, reason)
+                    technical_issues.append(f"Thumbnail generation failed: {reason}"[:200])
             STORE.upsert_clip(clip)
 
         # Proxy generation: a scaled-down H.264/AAC MP4 that Chromium's <video>
