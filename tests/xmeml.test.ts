@@ -595,6 +595,98 @@ describe("buildXmeml", () => {
       expect(seqDuration).not.toBeNull();
       expect(seqDuration![1]).toBe("240");
     });
+
+    // Sixth real Premiere import test, after 2e59af3 (Matrix errors fully
+    // gone): V1 imported and played correctly, A1 clipitems appeared on the
+    // timeline with correct timing/links, but there was no usable/playable
+    // audio — despite the real source clips (18C_0681.MP4, 18C_0687.MP4)
+    // definitely carrying real embedded audio (this app's own WATCH stage
+    // transcribed it). Root cause: no clipitem this exporter built ever
+    // carried a <sourcetrack> — the element Apple's XMEML Elements Catalog
+    // describes as encoding "details of the media connected with a clip,"
+    // needed when the referenced <file>'s media "can be a specific piece of
+    // media or a nested sequence with multiple types of media" (exactly an
+    // interview clip's <file>, which always has both <video> and <audio>).
+    // Fixed via sourceTrackXml() — every clipitem now carries a <sourcetrack>
+    // matching its own track's media type (video for V1/V2, audio for
+    // A1/A2), placed after <file> and before any <link>, matching a real
+    // Premiere-generated XML example found for this exact pattern (an audio
+    // clipitem with a bare <file id="..."/> reference immediately followed
+    // by <sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex>
+    // </sourcetrack>).
+    it("gives V1 a video sourcetrack and A1 an audio sourcetrack for a 23.976 A/V source in a 24fps sequence, without regressing Matrix/rate fixes", () => {
+      const clip976 = makeClip("clip-976", "18C_0687.MP4", "18C_0687.MP4", 23.976);
+      const tl = makeTimeline([
+        {
+          id: "e1",
+          lane: "interview",
+          clipId: "clip-976",
+          label: "e1",
+          sourceInTc: "00:01:04:00",
+          sourceOutTc: "00:01:19:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 15,
+        },
+      ]);
+      const { usable } = validateTimelineForExport(tl, [clip976]);
+      const { xml, warnings } = buildXmeml(tl, usable, [clip976], MEDIA_ROOT);
+      expect(warnings).toEqual([]);
+
+      const clipitemBlocks = [...xml.matchAll(/<clipitem id="[^"]+">[\s\S]*?<\/clipitem>/g)].map((m) => m[0]);
+      expect(clipitemBlocks.length).toBe(2); // 1. V1 references the source video; A1 is its own separate clipitem.
+      const v1Block = clipitemBlocks.find((b) => b.includes('id="v1-'));
+      const a1Block = clipitemBlocks.find((b) => b.includes('id="a1-'));
+      expect(v1Block).toBeDefined();
+      expect(a1Block).toBeDefined();
+
+      // 1. V1 references the source video — a video sourcetrack, and the
+      // real <file id> (the full definition lands on whichever clipitem is
+      // built first, which is V1).
+      expect(v1Block).toMatch(/<sourcetrack>\s*<mediatype>video<\/mediatype>\s*<trackindex>1<\/trackindex>\s*<\/sourcetrack>/);
+      expect(v1Block).toMatch(/<file id="file-clip-976">/);
+
+      // 2. A1 references that SAME source's real audio — an audio
+      // sourcetrack, and a bare reference to the identical deduplicated
+      // <file id> V1 defined (never a second, conflicting definition — see
+      // the 2d7ef23 file-id-dedup fix this must not regress).
+      expect(a1Block).toMatch(/<sourcetrack>\s*<mediatype>audio<\/mediatype>\s*<trackindex>1<\/trackindex>\s*<\/sourcetrack>/);
+      expect(a1Block).toMatch(/<file id="file-clip-976"\/>/);
+      expect([...xml.matchAll(/<file id="file-clip-976">/g)].length).toBe(1); // exactly one real definition
+
+      // sourcetrack sits after <file> and before any <link>, matching the
+      // real Premiere-XML precedent this was checked against.
+      const fileIdx = a1Block!.indexOf("<file");
+      const sourcetrackIdx = a1Block!.indexOf("<sourcetrack>");
+      const linkIdx = a1Block!.indexOf("<link>");
+      expect(sourcetrackIdx).toBeGreaterThan(fileIdx);
+      expect(sourcetrackIdx).toBeLessThan(linkIdx);
+
+      // 3. V1/A1 remain linked to each other.
+      const linkRefs = [...xml.matchAll(/<linkclipref>([^<]+)<\/linkclipref>/g)].map((m) => m[1]);
+      expect(linkRefs).toContain("v1-e1");
+      expect(linkRefs).toContain("a1-e1");
+
+      // 4. Source rate remains 23.976, represented correctly (timebase 24,
+      // ntsc TRUE) — both the file-level <rate> and the nested
+      // samplecharacteristics <rate> — this must not regress 2e59af3.
+      const fileBlock = xml.match(/<file id="file-clip-976">[\s\S]*?<\/file>/)![0];
+      const fileRates = [...fileBlock.matchAll(/<rate>\s*<timebase>(\d+)<\/timebase>\s*<ntsc>(TRUE|FALSE)<\/ntsc>\s*<\/rate>/g)];
+      expect(fileRates.length).toBe(2);
+      for (const [, timebase, ntsc] of fileRates) {
+        expect(timebase).toBe("24");
+        expect(ntsc).toBe("TRUE");
+      }
+
+      // 5. Sequence remains 24fps.
+      const sequenceSection = xml.slice(0, xml.indexOf("<track>"));
+      expect(sequenceSection).toMatch(/<rate>\s*<timebase>24<\/timebase>\s*<ntsc>FALSE<\/ntsc>/);
+
+      // 6. The previous Matrix fix remains intact: <sequence> still has a
+      // real id, and there's still exactly one <colordepth> in the whole
+      // document (the once-per-sequence format block only — see acaab01).
+      expect(xml).toMatch(/<sequence id="[^"]+">/);
+      expect([...xml.matchAll(/<colordepth>/g)].length).toBe(1);
+    });
   });
 });
 

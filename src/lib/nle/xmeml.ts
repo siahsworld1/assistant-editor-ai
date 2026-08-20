@@ -66,6 +66,16 @@
 // clipitem's own <rate>/<duration> and the sequence's own <duration> stay in
 // the timeline's rate throughout. See the real-test-#5 comment on
 // toFrameRanges() below for the full Apple-docs citation.
+// (6) With the Matrix errors fully gone: V1 imports and plays, A1 clipitems
+// appear on the timeline with correct timing/links, but there's no
+// usable/playable audio, despite the real source clips having real embedded
+// audio. Root cause: no clipitem this exporter builds ever carried a
+// <sourcetrack> — the element that tells Premiere which of a referenced
+// <file>'s media kinds (here, always both <video> and <audio>, since an
+// interview clip is referenced by both its V1 and A1 clipitem) a given
+// clipitem actually draws from. Fixed via sourceTrackXml()/clipItemXml()
+// below — see the real-test-#6 comment on sourceTrackXml() for the DTD
+// citation and the real Premiere-XML precedent this was checked against.
 
 import type { Clip, EditDecisionLane, UniversalTimeline } from "../ae/types";
 // Explicit ".ts" extensions — see the comment on the equivalent import in
@@ -260,6 +270,45 @@ function audioSamplecharacteristics(indent: string): string {
   ].join("\n");
 }
 
+// Real Premiere test #6 (on top of 2e59af3, Matrix errors now fully gone):
+// V1 imports and plays correctly, and A1 clipitems appear on the timeline
+// with correct timing/links — but there's no usable/playable audio, even
+// though the source clips (18C_0681.MP4, 18C_0687.MP4) definitely have real
+// embedded audio (this app's own WATCH transcription used it).
+//
+// The gap: every clipitem this exporter builds has <file id="..."> (a full
+// definition the first time, a bare reference every time after — see
+// fileBlockXml above) but NEVER a <sourcetrack>. Per Apple's own XMEML
+// Elements Catalog, <sourcetrack> (parents: clip, clipitem, generatoritem;
+// children: mediatype, trackindex) "encodes details of the media connected
+// with a clip," and "the designated media can be a specific piece of media
+// or a nested sequence with multiple types of media" — exactly our case: one
+// <file> whose <media> has BOTH a <video> and an <audio> block (an
+// interview clip is always both), referenced by TWO different clipitems (one
+// on V1, one on A1). Without <sourcetrack>, a clipitem sitting on an audio
+// track that references a file carrying both video and audio media has no
+// explicit instruction telling Premiere "play this file's AUDIO," which is
+// consistent with V1 (video) working while A1 (audio) silently doesn't.
+//
+// This matches real Premiere-generated XML: a real-world example (an actual
+// Premiere XML export, audio clipitem referencing a bare `<file id="..."/>`)
+// shows exactly `<file id="..."/>` immediately followed by
+// `<sourcetrack><mediatype>audio</mediatype><trackindex>1</trackindex>
+// </sourcetrack>` — no other new fields. trackindex identifies which
+// channel/stream of that media type to use; this exporter only ever models
+// one video stream and one audio stream per source file (no multi-channel
+// audio), so trackindex is always 1. Added uniformly to every clipitem this
+// exporter builds (V1/V2 get a video sourcetrack, A1/A2 get an audio one) —
+// not just A1 — since the same ambiguity (a clipitem on one track type
+// referencing a <file> that also carries the other type) exists for V1 too
+// whenever a source clip has embedded audio; it just happened not to
+// manifest as a symptom yet.
+function sourceTrackXml(mediaType: "video" | "audio", indent: string): string {
+  return [`${indent}<sourcetrack>`, `${indent}  <mediatype>${mediaType}</mediatype>`, `${indent}  <trackindex>1</trackindex>`, `${indent}</sourcetrack>`].join(
+    "\n",
+  );
+}
+
 /** A clipitem's <link> pairing to its synced counterpart on another track —
  * DTD: <!ELEMENT link (mediatype | trackindex | clipindex | groupindex |
  * linkclipref)*>. Both the video and the audio clipitem of a synced pair each
@@ -376,6 +425,12 @@ function clipItemXml(range: FrameRange, index: number, trackPrefix: string, time
   const { decision, clip, inFrame, outFrame, startFrame, timelineDurationFrames } = range;
   const itemId = sanitizeXmlId(`${trackPrefix}-${decision.id}`, `${trackPrefix}-clip-${index + 1}`);
   const name = xmlEscape(clip?.filename ?? decision.label ?? decision.clipId);
+  // trackPrefix is always "v1"/"v2" (video tracks) or "a1"/"a2" (audio
+  // tracks) — see the call sites in buildXmeml() below — so its first
+  // character alone tells us which of the referenced file's media kinds
+  // (always present, per clipKinds in buildXmeml()) this clipitem draws
+  // from. See the real-test-#6 comment on sourceTrackXml() above.
+  const sourceMediaType: "video" | "audio" = trackPrefix.startsWith("v") ? "video" : "audio";
 
   return [
     `      <clipitem id="${itemId}">`,
@@ -387,6 +442,7 @@ function clipItemXml(range: FrameRange, index: number, trackPrefix: string, time
     `        <in>${inFrame}</in>`,
     `        <out>${outFrame}</out>`,
     fileBlock,
+    sourceTrackXml(sourceMediaType, "        "),
     ...(link ? [linkBlockXml(link, "        ")] : []),
     `      </clipitem>`,
   ].join("\n");
