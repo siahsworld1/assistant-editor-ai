@@ -371,6 +371,39 @@ describe("buildXmeml", () => {
       expect(fileBlock).toContain("<width>");
       expect(fileBlock).toContain("<depth>16</depth>");
     });
+
+    // Third real Premiere import test, after the file-id dedup fix above:
+    // import succeeded (sequence created, V1/A1/dedup all correct), but
+    // Premiere's Events window still reported exactly ONE "Matrix cannot be
+    // inverted" — down from six, but not zero. Inspecting the real exported
+    // XML byte-for-byte showed width/height/anamorphic/pixelaspectratio/
+    // fielddominance/rate all present and IDENTICAL between the sequence-level
+    // <video><format><samplecharacteristics> block and every per-file block —
+    // ruling out a mismatch, and pointing at something emitted once per
+    // sequence rather than once per clip. Per Apple's own XMEML reference, the
+    // canonical FULL example of a sequence-format samplecharacteristics block
+    // includes <colordepth> (this exporter never emitted it anywhere); real
+    // Premiere-generated sequences also always give <sequence> an id
+    // attribute, even though the DTD marks it optional.
+    it("gives the sequence a real id attribute and every video samplecharacteristics block a real colordepth", () => {
+      const { usable } = validateTimelineForExport(timeline, clips);
+      const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
+
+      expect(xml).toMatch(/<sequence id="[^"]+">/);
+
+      const colordepths = [...xml.matchAll(/<colordepth>(\d+)<\/colordepth>/g)].map((m) => Number(m[1]));
+      // One colordepth per video samplecharacteristics block: sequence format
+      // + interview file + b-roll file = 3, same count as width/height.
+      expect(colordepths.length).toBe(3);
+      for (const d of colordepths) expect(d).toBeGreaterThan(0);
+
+      // Specifically the once-per-sequence format block — the one that kept
+      // erroring even after every per-file block was already correct —
+      // carries its own colordepth, appearing before the first <track>.
+      const firstTrack = xml.indexOf("<track>");
+      const sequenceFormatSection = xml.slice(0, firstTrack);
+      expect(sequenceFormatSection).toContain("<colordepth>");
+    });
   });
 });
 

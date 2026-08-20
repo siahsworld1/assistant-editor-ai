@@ -32,7 +32,18 @@
 // above, once real per-clip repeat usage (the same interview clip selected
 // more than once) combined with the new linked-audio clipitems to produce
 // conflicting same-id definitions that the first fix's test fixture (every
-// clip used only once) never happened to exercise.
+// clip used only once) never happened to exercise. (3) After THAT fix, a
+// third real test: clean import, correct V1/A1/dedup, but Events window still
+// reported exactly ONE "Matrix cannot be inverted" (down from six) — with
+// width/height/anamorphic/pixelaspectratio/fielddominance/rate all present
+// and byte-identical between the sequence-level format block and every
+// per-file block, ruling out a mismatch. Fixed via <colordepth> (see
+// VIDEO_COLOR_DEPTH_BITS/videoSamplecharacteristics() below) — the one field
+// Apple's own canonical sequence-format example includes that this exporter
+// never emitted anywhere — plus a real `id` attribute on <sequence> (real
+// Premiere exports always have one; the DTD's #IMPLIED just means Premiere's
+// own *exporter* isn't required to include it, not that its *importer* is
+// happy without it).
 
 import type { Clip, EditDecisionLane, UniversalTimeline } from "../ae/types";
 // Explicit ".ts" extensions — see the comment on the equivalent import in
@@ -108,6 +119,30 @@ function frameDimensions(clip: Clip | undefined): { width: number; height: numbe
   return { width: FALLBACK_FRAME_WIDTH, height: FALLBACK_FRAME_HEIGHT };
 }
 
+// Real Premiere test #3 (after 2d7ef23): import succeeded — sequence created,
+// V1/A1 events and dedup all correct — but Premiere's Events window still
+// reported exactly ONE "Matrix cannot be inverted", down from six. The real
+// exported XML (inspected byte-for-byte, not regenerated) showed width/height/
+// anamorphic/pixelaspectratio/fielddominance/rate all present and IDENTICAL
+// between the sequence-level <video><format><samplecharacteristics> block and
+// both per-file <file><media><video><samplecharacteristics> blocks — ruling
+// out a value mismatch. Per Apple's own XMEML reference (DTD: samplecharacteristics
+// allows width|height|anamorphic|pixelaspectratio|fielddominance|colordepth|
+// codec|depth|samplerate|rate, all optional/unordered), the FULL canonical
+// example of a sequence-format samplecharacteristics block (Final Cut Pro XML
+// Interchange Format, "Basics of Encoding") includes <colordepth> — which this
+// exporter has never emitted anywhere. A real-world precedent (a third-party
+// XML exporter hitting the same "Premiere doesn't respect sequence format info"
+// class of bug importing into Premiere) also called out adding codec/format
+// metadata as part of the fix. <colordepth> is a plain scalar (no fabricated
+// codec name to get wrong, unlike <codec>, which was deliberately left out —
+// inventing a codec that doesn't match the real source footage risks trading
+// this error for a new "unsupported codec" one), so it's added uniformly here
+// wherever a video samplecharacteristics block is built — both the once-per-
+// sequence <format> block and each per-file block, since real Premiere-
+// generated XML includes it in both.
+const VIDEO_COLOR_DEPTH_BITS = 24;
+
 function videoSamplecharacteristics(width: number, height: number, fps: number, indent: string): string {
   return [
     `${indent}<samplecharacteristics>`,
@@ -117,6 +152,7 @@ function videoSamplecharacteristics(width: number, height: number, fps: number, 
     `${indent}  <pixelaspectratio>square</pixelaspectratio>`,
     `${indent}  <fielddominance>none</fielddominance>`,
     rateBlock(fps, `${indent}  `),
+    `${indent}  <colordepth>${VIDEO_COLOR_DEPTH_BITS}</colordepth>`,
     `${indent}</samplecharacteristics>`,
   ].join("\n");
 }
@@ -382,7 +418,12 @@ export function buildXmeml(
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<!DOCTYPE xmeml>`,
     `<xmeml version="5">`,
-    `  <sequence>`,
+    // Real Premiere-generated XMEML always gives <sequence> an id attribute
+    // (DTD marks it #IMPLIED/optional, but every real export has one). Adding
+    // it costs nothing and matches what a real Premiere export looks like —
+    // included alongside the colordepth fix above as cheap, zero-risk
+    // insurance for the same once-per-sequence surface the user pointed at.
+    `  <sequence id="sequence-1">`,
     `    <name>${xmlEscape(timeline.name)}</name>`,
     `    <duration>${totalFrames}</duration>`,
     rateBlock(fps, "    "),
