@@ -8,18 +8,31 @@
 // lands on its own V2 track here — the way an editor opening this in Premiere
 // would expect a rough assembly to look.
 //
-// Scope/honesty note: multiple clip references to the same source file each get
-// their own <file> block (same id, repeated) rather than a single de-duplicated
-// definition referenced by id — both are valid per the XMEML DTD, but the
-// de-duplicated form is what a hand-built Premiere project would produce.
+// Every distinct source file gets exactly ONE real <file id="..."> definition
+// in the whole document — the first clipitem that references it — and every
+// later clipitem referencing that same file (a repeated selection from the
+// same interview clip, or that clip's own linked audio on A1) gets a bare,
+// self-closing <file id="..."/> reference instead. This isn't just a size
+// optimization: a real Premiere Pro XML import test failed outright ("File
+// Import Failure", no further detail) the first time this exporter emitted
+// the SAME file id more than once with CONFLICTING content — a video-only
+// <media> block from one clipitem, an audio-only one from another. Premiere's
+// importer treats <file id="..."> as a real cross-reference key; redefining
+// it with contradictory content breaks the import. See the definedFileIds
+// Set and fileBlockXml() in buildXmeml() below.
 //
-// Verified against a real Premiere Pro XML import (first real end-to-end test,
-// real H.265 footage): Premiere's Events window reported six "Matrix cannot be
-// inverted" errors on import (3 video events × 2 — once for the sequence
-// format, once per clip's file media), and the imported sequence had video on
-// V1 with no corresponding audio on A1. Both are fixed below — see
-// frameDimensions()/videoFormatSamplecharacteristics() for the matrix bug, and
-// the interview-audio-linking block in buildXmeml() for the missing A1 audio.
+// Verified against two real Premiere Pro XML import tests (first real
+// end-to-end runs, real H.265 footage): (1) Premiere's Events window reported
+// six "Matrix cannot be inverted" errors on import (3 video events × 2 — once
+// for the sequence format, once per clip's file media), and the imported
+// sequence had video on V1 with no corresponding audio on A1 — fixed via
+// frameDimensions()/videoSamplecharacteristics() and the interview-audio-
+// linking block in buildXmeml(). (2) After that fix, a full "File Import
+// Failure" on the very next real test — fixed via the file-id dedup described
+// above, once real per-clip repeat usage (the same interview clip selected
+// more than once) combined with the new linked-audio clipitems to produce
+// conflicting same-id definitions that the first fix's test fixture (every
+// clip used only once) never happened to exercise.
 
 import type { Clip, EditDecisionLane, UniversalTimeline } from "../ae/types";
 // Explicit ".ts" extensions — see the comment on the equivalent import in
@@ -159,36 +172,68 @@ function linkBlockXml(link: LinkPartner, indent: string): string {
   ].join("\n");
 }
 
-function clipItemXml(
-  range: FrameRange,
-  index: number,
-  trackPrefix: string,
-  fps: number,
+/**
+ * Builds the real <file id="..."> definition for a source clip exactly once —
+ * covering every media kind (`kinds`) it's used as anywhere in this timeline,
+ * e.g. an interview clip that's both a V1 video event and its own linked A1
+ * audio gets one <file> with both a <video> and an <audio> block. Every later
+ * call for the same fileId (tracked via `definedFileIds`, shared across the
+ * whole buildXmeml() call) returns a bare, self-closing reference instead —
+ * see the top-of-file comment for why redefining the same id with different
+ * content broke a real Premiere import.
+ */
+function fileBlockXml(
+  fileId: string,
+  clip: Clip | undefined,
+  name: string,
   mediaRoot: string,
-  mediaType: "video" | "audio",
+  fps: number,
+  kinds: ReadonlySet<"video" | "audio">,
+  fallbackDurationFrames: number,
   warnings: string[],
-  link?: LinkPartner,
+  definedFileIds: Set<string>,
+  indent: string,
 ): string {
-  const { decision, clip, inFrame, outFrame, startFrame } = range;
-  const duration = outFrame - inFrame;
-  const itemId = sanitizeXmlId(`${trackPrefix}-${decision.id}`, `${trackPrefix}-clip-${index + 1}`);
-  const fileId = sanitizeXmlId(`file-${decision.clipId}`, `file-${index + 1}`);
-  const name = xmlEscape(clip?.filename ?? decision.label ?? decision.clipId);
+  if (definedFileIds.has(fileId)) {
+    return `${indent}<file id="${fileId}"/>`;
+  }
+  definedFileIds.add(fileId);
+
   const { url, resolved } = fileUrlForClip(clip, mediaRoot);
   if (!resolved) {
     warnings.push(`Could not resolve an absolute path for "${name}" — you'll need to relink media after import.`);
   }
   const sourceDurationFrames = clip?.durationSeconds
     ? framesForSeconds(clip.durationSeconds, fps)
-    : outFrame + 1;
+    : fallbackDurationFrames;
 
-  const mediaBlock =
-    mediaType === "video"
-      ? (() => {
-          const { width, height } = frameDimensions(clip);
-          return `        <media>\n          <video>\n${videoSamplecharacteristics(width, height, fps, "            ")}\n          </video>\n        </media>`;
-        })()
-      : `        <media>\n          <audio>\n${audioSamplecharacteristics("            ")}\n          </audio>\n        </media>`;
+  const mediaParts: string[] = [];
+  if (kinds.has("video")) {
+    const { width, height } = frameDimensions(clip);
+    mediaParts.push(`${indent}    <video>\n${videoSamplecharacteristics(width, height, fps, `${indent}      `)}\n${indent}    </video>`);
+  }
+  if (kinds.has("audio")) {
+    mediaParts.push(`${indent}    <audio>\n${audioSamplecharacteristics(`${indent}      `)}\n${indent}    </audio>`);
+  }
+
+  return [
+    `${indent}<file id="${fileId}">`,
+    `${indent}  <name>${name}</name>`,
+    `${indent}  <pathurl>${xmlEscape(url)}</pathurl>`,
+    rateBlock(fps, `${indent}  `),
+    `${indent}  <duration>${sourceDurationFrames}</duration>`,
+    `${indent}  <media>`,
+    ...mediaParts,
+    `${indent}  </media>`,
+    `${indent}</file>`,
+  ].join("\n");
+}
+
+function clipItemXml(range: FrameRange, index: number, trackPrefix: string, fps: number, fileBlock: string, link?: LinkPartner): string {
+  const { decision, clip, inFrame, outFrame, startFrame } = range;
+  const duration = outFrame - inFrame;
+  const itemId = sanitizeXmlId(`${trackPrefix}-${decision.id}`, `${trackPrefix}-clip-${index + 1}`);
+  const name = xmlEscape(clip?.filename ?? decision.label ?? decision.clipId);
 
   return [
     `      <clipitem id="${itemId}">`,
@@ -199,13 +244,7 @@ function clipItemXml(
     `        <end>${startFrame + duration}</end>`,
     `        <in>${inFrame}</in>`,
     `        <out>${outFrame}</out>`,
-    `        <file id="${fileId}">`,
-    `          <name>${name}</name>`,
-    `          <pathurl>${xmlEscape(url)}</pathurl>`,
-    rateBlock(fps, "          "),
-    `          <duration>${sourceDurationFrames}</duration>`,
-    mediaBlock,
-    `        </file>`,
+    fileBlock,
     ...(link ? [linkBlockXml(link, "        ")] : []),
     `      </clipitem>`,
   ].join("\n");
@@ -244,6 +283,42 @@ export function buildXmeml(
   const sequenceClip = [...interview, ...broll].map((r) => r.clip).find((c) => c?.resolution);
   const { width: seqWidth, height: seqHeight } = frameDimensions(sequenceClip);
 
+  // Every media kind a given source clip is actually used as anywhere in this
+  // timeline — an interview clip is always both "video" (its own V1 event)
+  // and "audio" (its linked A1 counterpart); b-roll is video-only; a
+  // standalone "audio"-lane clip is audio-only. Drives fileBlockXml()'s
+  // single-real-definition-per-file behavior below.
+  const clipKinds = new Map<string, Set<"video" | "audio">>();
+  const addKind = (clipId: string, kind: "video" | "audio") => {
+    if (!clipKinds.has(clipId)) clipKinds.set(clipId, new Set());
+    clipKinds.get(clipId)!.add(kind);
+  };
+  for (const r of interview) {
+    addKind(r.decision.clipId, "video");
+    addKind(r.decision.clipId, "audio");
+  }
+  for (const r of broll) addKind(r.decision.clipId, "video");
+  for (const r of standaloneAudio) addKind(r.decision.clipId, "audio");
+
+  // Fallback source-file duration (in frames) when a clip has no known real
+  // durationSeconds — the widest out-point actually used against that clip
+  // anywhere in the timeline, so the file's declared duration is never
+  // shorter than a real event trimmed from it.
+  const clipFallbackFrames = new Map<string, number>();
+  for (const r of [...interview, ...broll, ...standaloneAudio]) {
+    const prev = clipFallbackFrames.get(r.decision.clipId) ?? 0;
+    clipFallbackFrames.set(r.decision.clipId, Math.max(prev, r.outFrame + 1));
+  }
+
+  const definedFileIds = new Set<string>();
+  const fileBlockFor = (range: FrameRange, index: number, indent: string): string => {
+    const fileId = sanitizeXmlId(`file-${range.decision.clipId}`, `file-${index + 1}`);
+    const name = xmlEscape(range.clip?.filename ?? range.decision.label ?? range.decision.clipId);
+    const kinds = clipKinds.get(range.decision.clipId) ?? new Set<"video" | "audio">();
+    const fallback = clipFallbackFrames.get(range.decision.clipId) ?? 1;
+    return fileBlockXml(fileId, range.clip, name, mediaRoot, fps, kinds, fallback, warnings, definedFileIds, indent);
+  };
+
   const interviewLink = (i: number): LinkPartner => ({
     selfId: sanitizeXmlId(`v1-${interview[i].decision.id}`, `v1-clip-${i + 1}`),
     selfMediaType: "video",
@@ -268,11 +343,13 @@ export function buildXmeml(
   const videoTracks = [
     interview.length > 0
       ? `    <track>\n${interview
-          .map((r, i) => clipItemXml(r, i, "v1", fps, mediaRoot, "video", warnings, interviewLink(i)))
+          .map((r, i) => clipItemXml(r, i, "v1", fps, fileBlockFor(r, i, "        "), interviewLink(i)))
           .join("\n")}\n    </track>`
       : null,
     broll.length > 0
-      ? `    <track>\n${broll.map((r, i) => clipItemXml(r, i, "v2", fps, mediaRoot, "video", warnings)).join("\n")}\n    </track>`
+      ? `    <track>\n${broll
+          .map((r, i) => clipItemXml(r, i, "v2", fps, fileBlockFor(r, i, "        ")))
+          .join("\n")}\n    </track>`
       : null,
   ].filter((t): t is string => t !== null);
 
@@ -289,14 +366,14 @@ export function buildXmeml(
   if (interview.length > 0) {
     audioTracks.push(
       `    <track>\n${interview
-        .map((r, i) => clipItemXml(r, i, "a1", fps, mediaRoot, "audio", warnings, interviewAudioLink(i)))
+        .map((r, i) => clipItemXml(r, i, "a1", fps, fileBlockFor(r, i, "        "), interviewAudioLink(i)))
         .join("\n")}\n    </track>`,
     );
   }
   if (standaloneAudio.length > 0) {
     audioTracks.push(
       `    <track>\n${standaloneAudio
-        .map((r, i) => clipItemXml(r, i, "a2", fps, mediaRoot, "audio", warnings))
+        .map((r, i) => clipItemXml(r, i, "a2", fps, fileBlockFor(r, i, "        ")))
         .join("\n")}\n    </track>`,
     );
   }

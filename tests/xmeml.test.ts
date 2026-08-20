@@ -229,7 +229,7 @@ describe("buildXmeml", () => {
       expect(xml).toContain("<audio>");
       // Exactly one audio track (A1) — this timeline has no standalone
       // "audio"-lane decisions, only interview-synced audio.
-      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      const audioSection = topLevelAudioSection(xml);
       expect((audioSection.match(/<track>/g) ?? []).length).toBe(1);
       // The audio clipitem carries the same source clip name as its video
       // counterpart — it's the same file's own audio, not a separate asset.
@@ -252,7 +252,7 @@ describe("buildXmeml", () => {
     it("does not add synced audio for b-roll, and never links a b-roll clipitem", () => {
       const { usable } = validateTimelineForExport(timeline, clips);
       const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
-      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      const audioSection = topLevelAudioSection(xml);
       expect(audioSection).not.toContain("B101_BROLL_GARDEN.mov");
       expect(linksReferencing(xml, "v2-e2")).toBe(0);
     });
@@ -283,7 +283,7 @@ describe("buildXmeml", () => {
       ]);
       const { usable } = validateTimelineForExport(tl, [...clips, audioClip]);
       const { xml } = buildXmeml(tl, usable, [...clips, audioClip], MEDIA_ROOT);
-      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      const audioSection = topLevelAudioSection(xml);
       // Both the interview's synced A1 audio and the standalone A2 narration
       // are present, on two distinct tracks.
       expect((audioSection.match(/<track>/g) ?? []).length).toBe(2);
@@ -295,15 +295,110 @@ describe("buildXmeml", () => {
     it("gives every audio samplecharacteristics block a real depth and sample rate", () => {
       const { usable } = validateTimelineForExport(timeline, clips);
       const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
-      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      const audioSection = topLevelAudioSection(xml);
       expect(audioSection).toContain("<depth>16</depth>");
       expect(audioSection).toContain("<samplerate>48000</samplerate>");
+    });
+
+    // Second real Premiere import test, immediately after the fixes above:
+    // Premiere returned a hard "File Import Failure" (blank error message,
+    // zero clips imported) on a real 3-event interview timeline where one
+    // clip (18C_0687.MP4) was selected twice. Root cause: the same <file
+    // id="..."> was defined three times with CONFLICTING content — a
+    // video-only <media> block from each of its two V1 clipitems, an
+    // audio-only one from its A1 clipitem — because file blocks were built
+    // independently per clipitem with no shared, cross-clipitem definition
+    // tracking. Premiere treats <file id="..."> as a real cross-reference
+    // key; redefining it with contradictory content is what broke the import
+    // outright, worse than the earlier "Matrix cannot be inverted" warnings.
+    it("defines a repeated clip's <file> exactly once, covering all its media kinds, everywhere else a bare reference", () => {
+      const repeatedClip = makeClip("clip-002", "18C_0687.MP4", "18C_0687.MP4");
+      const otherClip = makeClip("clip-001", "18C_0681.MP4", "18C_0681.MP4");
+      const tl = makeTimeline([
+        {
+          id: "event-1",
+          lane: "interview",
+          clipId: "clip-002",
+          label: "e1",
+          sourceInTc: "00:00:27:00",
+          sourceOutTc: "00:00:39:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 12,
+        },
+        {
+          id: "event-2",
+          lane: "interview",
+          clipId: "clip-001",
+          label: "e2",
+          sourceInTc: "00:00:23:00",
+          sourceOutTc: "00:00:32:00",
+          timelineStartSeconds: 12,
+          durationSeconds: 9,
+        },
+        {
+          id: "event-3",
+          lane: "interview",
+          clipId: "clip-002",
+          label: "e3",
+          sourceInTc: "00:01:04:00",
+          sourceOutTc: "00:01:13:00",
+          timelineStartSeconds: 21,
+          durationSeconds: 9,
+        },
+      ]);
+      const { usable } = validateTimelineForExport(tl, [repeatedClip, otherClip]);
+      const { xml } = buildXmeml(tl, usable, [repeatedClip, otherClip], MEDIA_ROOT);
+
+      // clip-002 is used 4 times total (V1 × 2 + its linked A1 × 2) — exactly
+      // one real <file id="file-clip-002"> definition, three bare references.
+      const fullDefs = [...xml.matchAll(/<file id="([^"]+)">/g)].map((m) => m[1]);
+      const bareRefs = [...xml.matchAll(/<file id="([^"]+)"\/>/g)].map((m) => m[1]);
+      expect(fullDefs.filter((id) => id === "file-clip-002").length).toBe(1);
+      expect(bareRefs.filter((id) => id === "file-clip-002").length).toBe(3);
+      // No id is ever fully defined more than once, for any clip.
+      const defCounts = new Map<string, number>();
+      for (const id of fullDefs) defCounts.set(id, (defCounts.get(id) ?? 0) + 1);
+      for (const count of defCounts.values()) expect(count).toBe(1);
+
+      // The one real definition covers BOTH media kinds that clip is used
+      // as — a single <media> block with both <video> and <audio> children —
+      // rather than two separate, conflicting single-kind definitions.
+      const fileBlockMatch = xml.match(/<file id="file-clip-002">[\s\S]*?<\/file>/);
+      expect(fileBlockMatch).not.toBeNull();
+      const fileBlock = fileBlockMatch![0];
+      expect(fileBlock).toContain("<video>");
+      expect(fileBlock).toContain("<audio>");
+      expect(fileBlock).toContain("<width>");
+      expect(fileBlock).toContain("<depth>16</depth>");
     });
   });
 });
 
 function linksReferencing(xml: string, id: string): number {
   return [...xml.matchAll(/<linkclipref>([^<]+)<\/linkclipref>/g)].filter((m) => m[1] === id).length;
+}
+
+// The sequence's own top-level <audio> section (containing A1/A2 tracks) is
+// always the LAST literal "<audio>" tag in the document: nested per-file
+// <media><audio> samplecharacteristics blocks (see fileBlockXml in xmeml.ts)
+// are only ever emitted while building V1/V2's clipitems, which happens
+// strictly before the top-level <audio> section is written — so a plain
+// indexOf("<audio>") is ambiguous once a clip's own file definition embeds
+// its audio characteristics, but lastIndexOf is not.
+function topLevelAudioSection(xml: string): string {
+  // A clip used as both video and audio (interview) or audio-only
+  // (standalone "audio" lane, or A2's own file definition) can embed a
+  // nested <media><audio> samplecharacteristics block anywhere a full <file>
+  // definition happens to land — including inside the A2 track itself, after
+  // the top-level <audio> tag. So neither indexOf nor lastIndexOf("<audio>")
+  // is reliably the sequence-level tag. The one structural landmark that IS
+  // unique: the sequence-level <audio> section always immediately follows
+  // the sequence-level </video> close, both at the same (6-space) indent —
+  // nested closes never appear at that indent.
+  const marker = "      </video>\n      <audio>";
+  const idx = xml.indexOf(marker);
+  const start = idx + "      </video>\n".length;
+  return xml.slice(start, xml.indexOf("</audio>", start));
 }
 
 describe("xmemlFilename", () => {
