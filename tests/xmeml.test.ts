@@ -76,8 +76,9 @@ describe("buildXmeml", () => {
     // <track> only ever appears for a top-level V1/V2/A1 track — never inside a
     // clipitem's own nested <file><media><video> block — so a document-wide
     // count is unambiguous (no need to slice out a "video section" first, which
-    // would break on the first nested </video> closing tag).
-    expect((xml.match(/<track>/g) ?? []).length).toBe(2);
+    // would break on the first nested </video> closing tag). V1 (interview),
+    // V2 (b-roll), A1 (interview's own synced audio) = 3.
+    expect((xml.match(/<track>/g) ?? []).length).toBe(3);
     expect(xml).toContain("A001_INT_MARISOL_01.mov");
     expect(xml).toContain("B101_BROLL_GARDEN.mov");
     expect(xml).toContain(`file:///Users/editor/Footage/community-doc/A001_INT_MARISOL_01.mov`);
@@ -125,7 +126,34 @@ describe("buildXmeml", () => {
     expect(warnings.some((w) => w.includes("Could not resolve an absolute path"))).toBe(true);
   });
 
-  it("omits an empty audio track when there are no audio-lane decisions", () => {
+  it("omits an empty audio track when there is nothing that needs one (b-roll only)", () => {
+    // No interview lane (which now always carries its own synced audio — see
+    // below) and no standalone "audio"-lane decisions: b-roll alone still
+    // produces a picture-only sequence, so <audio> must stay absent rather
+    // than emitting an empty/meaningless section.
+    const timeline = makeTimeline([
+      {
+        id: "e1",
+        lane: "b-roll",
+        clipId: "clip-004",
+        label: "garden sunrise",
+        sourceInTc: "00:00:14:00",
+        sourceOutTc: "00:00:22:00",
+        timelineStartSeconds: 0,
+        durationSeconds: 8,
+      },
+    ]);
+    const { usable } = validateTimelineForExport(timeline, clips);
+    const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
+    expect(xml).not.toContain("<audio>");
+  });
+
+  // Real Premiere Pro import test (first real end-to-end run, real H.265
+  // footage): Premiere reported six "Matrix cannot be inverted" errors (3
+  // video events × 2 — sequence format + per-clip file media) and the
+  // imported sequence had video on V1 with no matching audio on A1. Both
+  // reproduced and fixed below.
+  describe("real Premiere import fixes", () => {
     const timeline = makeTimeline([
       {
         id: "e1",
@@ -137,12 +165,146 @@ describe("buildXmeml", () => {
         timelineStartSeconds: 0,
         durationSeconds: 4,
       },
+      {
+        id: "e2",
+        lane: "b-roll",
+        clipId: "clip-004",
+        label: "garden sunrise",
+        sourceInTc: "00:00:14:00",
+        sourceOutTc: "00:00:22:00",
+        timelineStartSeconds: 4,
+        durationSeconds: 8,
+      },
     ]);
-    const { usable } = validateTimelineForExport(timeline, clips);
-    const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
-    expect(xml).not.toContain("<audio>");
+
+    it("gives every video samplecharacteristics block a real, non-zero width and height", () => {
+      // clip-001 is "4K" (a label, not literal pixel dimensions) and
+      // clip-004 has no resolution set at all — both must still get a real,
+      // parseable, non-zero frame geometry so Premiere's frame-to-sequence
+      // transform matrix is never singular. This is the root cause of the
+      // real "Matrix cannot be inverted" report: these fields were entirely
+      // absent before this fix, for every video samplecharacteristics block
+      // (sequence format + each clip's file media).
+      const { usable } = validateTimelineForExport(timeline, clips);
+      const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
+
+      const widths = [...xml.matchAll(/<width>(\d+)<\/width>/g)].map((m) => Number(m[1]));
+      const heights = [...xml.matchAll(/<height>(\d+)<\/height>/g)].map((m) => Number(m[1]));
+      // One <width>/<height> pair for the sequence format, one per video clip
+      // (interview + b-roll) = 3 each.
+      expect(widths.length).toBe(3);
+      expect(heights.length).toBe(3);
+      for (const w of widths) expect(w).toBeGreaterThan(0);
+      for (const h of heights) expect(h).toBeGreaterThan(0);
+      // A real, parseable resolution is used as-is: e.g. a real 3840x2160
+      // clip would produce those exact values, never a silently-substituted
+      // fallback — verified separately below.
+    });
+
+    it("uses a clip's real parsed resolution, not just the fallback, when it's available", () => {
+      const realResClip = makeClip("clip-009", "A009_INT_REAL_4K.mov", "A009_INT_REAL_4K.mov");
+      realResClip.resolution = "3840x2160";
+      const tl = makeTimeline([
+        {
+          id: "e9",
+          lane: "interview",
+          clipId: "clip-009",
+          label: "real 4k",
+          sourceInTc: "00:00:01:00",
+          sourceOutTc: "00:00:05:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 4,
+        },
+      ]);
+      const { usable } = validateTimelineForExport(tl, [realResClip]);
+      const { xml } = buildXmeml(tl, usable, [realResClip], MEDIA_ROOT);
+      expect(xml).toContain("<width>3840</width>");
+      expect(xml).toContain("<height>2160</height>");
+    });
+
+    it("exports the interview lane's own production audio onto A1, linked to its V1 video", () => {
+      const { usable } = validateTimelineForExport(timeline, clips);
+      const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
+
+      expect(xml).toContain("<audio>");
+      // Exactly one audio track (A1) — this timeline has no standalone
+      // "audio"-lane decisions, only interview-synced audio.
+      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      expect((audioSection.match(/<track>/g) ?? []).length).toBe(1);
+      // The audio clipitem carries the same source clip name as its video
+      // counterpart — it's the same file's own audio, not a separate asset.
+      expect(audioSection).toContain("A001_INT_MARISOL_01.mov");
+      // Real in/out/start, matching the video event exactly (same source
+      // range, same timeline position) — not just present, but correct.
+      expect(audioSection).toContain("<in>24</in>");
+      expect(audioSection).toContain("<out>120</out>");
+      expect(audioSection).toContain("<start>0</start>");
+
+      // Linked: both the video and the audio clipitem reference each other's
+      // real ids via <linkclipref>, so an NLE moves/trims them as one unit.
+      const linkRefs = [...xml.matchAll(/<linkclipref>([^<]+)<\/linkclipref>/g)].map((m) => m[1]);
+      expect(linkRefs).toContain("v1-e1");
+      expect(linkRefs).toContain("a1-e1");
+      // 2 clipitems (video + audio) × 2 <link> blocks each (self + partner).
+      expect((xml.match(/<link>/g) ?? []).length).toBe(4);
+    });
+
+    it("does not add synced audio for b-roll, and never links a b-roll clipitem", () => {
+      const { usable } = validateTimelineForExport(timeline, clips);
+      const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
+      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      expect(audioSection).not.toContain("B101_BROLL_GARDEN.mov");
+      expect(linksReferencing(xml, "v2-e2")).toBe(0);
+    });
+
+    it("keeps a standalone audio-lane decision on its own A2 track, unlinked", () => {
+      const audioClip = makeClip("clip-010", "narration.wav", "narration.wav");
+      const tl = makeTimeline([
+        {
+          id: "e1",
+          lane: "interview",
+          clipId: "clip-001",
+          label: "cold open",
+          sourceInTc: "00:00:01:00",
+          sourceOutTc: "00:00:05:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 4,
+        },
+        {
+          id: "e3",
+          lane: "audio",
+          clipId: "clip-010",
+          label: "narration",
+          sourceInTc: "00:00:00:00",
+          sourceOutTc: "00:00:04:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 4,
+        },
+      ]);
+      const { usable } = validateTimelineForExport(tl, [...clips, audioClip]);
+      const { xml } = buildXmeml(tl, usable, [...clips, audioClip], MEDIA_ROOT);
+      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      // Both the interview's synced A1 audio and the standalone A2 narration
+      // are present, on two distinct tracks.
+      expect((audioSection.match(/<track>/g) ?? []).length).toBe(2);
+      expect(audioSection).toContain("narration.wav");
+      // The standalone audio-lane clipitem is never linked to anything.
+      expect(linksReferencing(xml, "a2-e3")).toBe(0);
+    });
+
+    it("gives every audio samplecharacteristics block a real depth and sample rate", () => {
+      const { usable } = validateTimelineForExport(timeline, clips);
+      const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
+      const audioSection = xml.slice(xml.indexOf("<audio>"), xml.indexOf("</audio>"));
+      expect(audioSection).toContain("<depth>16</depth>");
+      expect(audioSection).toContain("<samplerate>48000</samplerate>");
+    });
   });
 });
+
+function linksReferencing(xml: string, id: string): number {
+  return [...xml.matchAll(/<linkclipref>([^<]+)<\/linkclipref>/g)].filter((m) => m[1] === id).length;
+}
 
 describe("xmemlFilename", () => {
   it("slugifies the timeline name and appends .xml", () => {
