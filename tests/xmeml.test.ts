@@ -6,7 +6,7 @@ import { buildXmeml, xmemlFilename } from "@/lib/nle/xmeml";
 import { validateTimelineForExport } from "@/lib/nle/edl";
 import type { Clip, UniversalTimeline } from "@/lib/ae/types";
 
-function makeClip(id: string, filename: string, relPath?: string): Clip {
+function makeClip(id: string, filename: string, relPath?: string, fps = 24): Clip {
   return {
     id,
     filename,
@@ -15,7 +15,7 @@ function makeClip(id: string, filename: string, relPath?: string): Clip {
     durationSeconds: 60,
     camera: "FX6",
     resolution: "4K",
-    fps: 24,
+    fps,
     speakers: [],
     state: "analyzed",
     progress: 100,
@@ -476,6 +476,124 @@ describe("buildXmeml", () => {
         // Sanity: it still has real geometry — just not colordepth.
         expect(fileBlock).toContain("<width>");
       }
+    });
+
+    // Fifth real Premiere import test, after acaab01: import succeeded and
+    // the two colordepth-driven errors were gone, but Premiere's Events
+    // window still reported one "Matrix cannot be inverted" — traced this
+    // time to a rate-model bug, not geometry. Real source clips were shot at
+    // 23.976fps but cut into a 24fps sequence; every <file><rate> (and the
+    // nested samplecharacteristics <rate>) was still emitted at the
+    // sequence's 24fps/NTSC-FALSE, because a single `fps` — the timeline's —
+    // was being used for both the clip's source-frame math AND the timeline
+    // position math. Per Apple's own XMEML "Timing Values" reference, <in>/
+    // <out> are interpreted via the source media's own rate while <start>/
+    // <end> are interpreted via the sequence's — and this app's own backend
+    // (worker/pipeline.py::_validate_decisions) already treats
+    // sourceInTc/sourceOutTc as clip-native (`fps = clip.fps or 24.0`).
+    it("emits each source clip's own real fps for 23.976 footage cut into a 24fps sequence, keeping sequence timing in the sequence's fps", () => {
+      const clip976 = makeClip("clip-976", "18C_0687.MP4", "18C_0687.MP4", 23.976);
+      const tl = makeTimeline([
+        {
+          id: "e1",
+          lane: "interview",
+          clipId: "clip-976",
+          label: "e1",
+          sourceInTc: "00:01:04:00",
+          sourceOutTc: "00:01:19:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 15,
+        },
+      ]);
+      // Sanity: the timeline itself is a real 24fps sequence, distinct from
+      // the clip's 23.976fps — this is the whole point of the fixture.
+      expect(tl.fps).toBe(24);
+
+      const { usable } = validateTimelineForExport(tl, [clip976]);
+      const { xml, warnings } = buildXmeml(tl, usable, [clip976], MEDIA_ROOT);
+      expect(warnings).toEqual([]);
+
+      // The sequence's own rate must stay 24/FALSE — never silently
+      // converted toward the clip's rate.
+      const sequenceSection = xml.slice(0, xml.indexOf("<track>"));
+      expect(sequenceSection).toMatch(/<rate>\s*<timebase>24<\/timebase>\s*<ntsc>FALSE<\/ntsc>/);
+
+      // The file's own <rate> AND its nested samplecharacteristics <rate>
+      // must both be 24/TRUE (Premiere/FCP7's encoding for 23.976fps) — not
+      // 24/FALSE, which is what the pre-fix bug emitted for every clip
+      // regardless of its real measured rate.
+      const fileBlock = xml.match(/<file id="[^"]+">[\s\S]*?<\/file>/)![0];
+      const fileRates = [...fileBlock.matchAll(/<rate>\s*<timebase>(\d+)<\/timebase>\s*<ntsc>(TRUE|FALSE)<\/ntsc>\s*<\/rate>/g)];
+      expect(fileRates.length).toBe(2); // file-level + samplecharacteristics-level
+      for (const [, timebase, ntsc] of fileRates) {
+        expect(timebase).toBe("24");
+        expect(ntsc).toBe("TRUE");
+      }
+
+      // <in>/<out> are source-frame positions computed at the CLIP's real
+      // 23.976fps, not the sequence's 24fps: 00:01:04:00 -> 64s * 23.976 =
+      // 1534.464 -> 1534 (24fps would wrongly give 1536); 00:01:19:00 -> 79s
+      // * 23.976 = 1894.104 -> 1894 (24fps would wrongly give 1896).
+      expect(xml).toContain("<in>1534</in>");
+      expect(xml).toContain("<out>1894</out>");
+
+      // The clipitem's own placement on the timeline — <start>/<end>/its own
+      // <duration> — stays entirely in the SEQUENCE's 24fps: 15s * 24fps =
+      // 360 frames, regardless of the clip's real rate.
+      expect(xml).toContain("<start>0</start>");
+      expect(xml).toContain("<end>360</end>");
+      const clipitemSection = xml.slice(xml.indexOf("<clipitem"));
+      expect(clipitemSection).toMatch(/<duration>360<\/duration>/);
+
+      // The sequence's own total <duration> is likewise purely timeline-fps:
+      // 15s * 24fps = 360, not distorted by the clip's different rate.
+      const seqDuration = xml.match(/<sequence id="[^"]+">\s*<name>[^<]*<\/name>\s*<duration>(\d+)<\/duration>/);
+      expect(seqDuration).not.toBeNull();
+      expect(seqDuration![1]).toBe("360");
+    });
+
+    it("handles a mixed-rate timeline — 23.976 and 24fps clips in the same 24fps sequence — without drifting sequence duration", () => {
+      const clip976 = makeClip("clip-976b", "23976clip.MP4", "23976clip.MP4", 23.976);
+      const clip24 = makeClip("clip-24", "24clip.MP4", "24clip.MP4", 24);
+      const tl = makeTimeline([
+        {
+          id: "e1",
+          lane: "interview",
+          clipId: "clip-976b",
+          label: "e1",
+          sourceInTc: "00:00:10:00",
+          sourceOutTc: "00:00:15:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 5,
+        },
+        {
+          id: "e2",
+          lane: "interview",
+          clipId: "clip-24",
+          label: "e2",
+          sourceInTc: "00:00:20:00",
+          sourceOutTc: "00:00:25:00",
+          timelineStartSeconds: 5,
+          durationSeconds: 5,
+        },
+      ]);
+      const { usable } = validateTimelineForExport(tl, [clip976, clip24]);
+      const { xml, warnings } = buildXmeml(tl, usable, [clip976, clip24], MEDIA_ROOT);
+      expect(warnings).toEqual([]);
+
+      const rates = [...xml.matchAll(/<timebase>(\d+)<\/timebase>\s*<ntsc>(TRUE|FALSE)<\/ntsc>/g)];
+      // Exactly 2 NTSC-TRUE rate blocks — the 23.976 clip's file-level and
+      // samplecharacteristics-level <rate> — everything else (sequence,
+      // every clipitem's own rate, and the 24fps clip's file blocks) is
+      // NTSC-FALSE.
+      expect(rates.filter((m) => m[2] === "TRUE").length).toBe(2);
+      expect(rates.filter((m) => m[2] === "FALSE").length).toBeGreaterThan(0);
+
+      // Sequence duration stays purely timeline-based (10s * 24fps = 240),
+      // unaffected by mixing a 23.976 clip in.
+      const seqDuration = xml.match(/<sequence id="[^"]+">\s*<name>[^<]*<\/name>\s*<duration>(\d+)<\/duration>/);
+      expect(seqDuration).not.toBeNull();
+      expect(seqDuration![1]).toBe("240");
     });
   });
 });

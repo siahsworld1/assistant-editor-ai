@@ -53,6 +53,19 @@
 // original single error going away. <colordepth> is now scoped to the
 // once-per-sequence, <format>-wrapped block only — see the real-test-#3/#4
 // comment on videoSamplecharacteristics() below for the full evidence.
+// (5) Inspecting a real test5 export byte-for-byte: the sequence was
+// correctly 24fps/NTSC-FALSE, but both real source clips were actually
+// 23.976fps and their <file><rate> blocks were STILL emitted as 24fps/
+// NTSC-FALSE — a rate-model bug, not a geometry one. Root cause: a single
+// `fps` (the timeline's) was threaded into both the timeline-position math
+// AND the source-frame math, so fileBlockXml() always described the file in
+// the sequence's rate instead of the clip's own. Fixed by giving every
+// per-decision FrameRange its own `clipFps` (clip.fps, falling back to the
+// timeline's) and using it for everything that describes the SOURCE media —
+// <in>/<out>, the file's own <rate>/<duration> — while <start>/<end>/the
+// clipitem's own <rate>/<duration> and the sequence's own <duration> stay in
+// the timeline's rate throughout. See the real-test-#5 comment on
+// toFrameRanges() below for the full Apple-docs citation.
 
 import type { Clip, EditDecisionLane, UniversalTimeline } from "../ae/types";
 // Explicit ".ts" extensions — see the comment on the equivalent import in
@@ -66,15 +79,50 @@ export type { XmlExportResult };
 interface FrameRange {
   decision: UniversalTimeline["decisions"][number];
   clip: Clip | undefined;
+  /** Source-media frame position — in the CLIP's own native rate (clipFps
+   * below), never the sequence's. See the real-test-#5 comment below. */
   inFrame: number;
   outFrame: number;
+  /** Timeline position — in the SEQUENCE's rate. */
   startFrame: number;
+  /** The sequence-frame span this decision occupies on the timeline — NOT
+   * outFrame - inFrame once clip and sequence rates differ (see below). Used
+   * for the clipitem's own <duration> and <end>. */
+  timelineDurationFrames: number;
+  /** The fps actually used for inFrame/outFrame — clip.fps, falling back to
+   * the sequence fps and then 24 only when a clip has no measured rate. */
+  clipFps: number;
 }
 
+// Real Premiere test #5 (on top of acaab01): the remaining single "Matrix
+// cannot be inverted" traced to a rate-model bug, not geometry. Real source
+// clips shot at 23.976fps were cut into a 24fps sequence, but every
+// <file><rate> (and the nested <media><video><samplecharacteristics><rate>)
+// was emitted at the SEQUENCE's 24fps/NTSC-FALSE instead of the clip's real
+// 23.976fps/NTSC-TRUE — because a single `fps` (the timeline's) was being
+// threaded into both the timeline-position math AND the source-frame math.
+//
+// Per Apple's own XMEML reference ("XMEML Topics" > "Timing Values"): <in>
+// and <out> "specify the media content associated with a clip or clipitem"
+// and convert to timecode "using the starting timecode in the media" — i.e.
+// the file's own native rate — while <start> and <end> "encode the ... start
+// and end of a clipitem in an enclosing sequence" and convert "using the
+// timecode in the containing sequence" — the sequence's rate. The same
+// section explicitly notes a clipitem's <duration> "may not match the
+// duration value of the corresponding media, even when ... perfectly
+// aligned" once framerate is involved — exactly this scenario. This app's own
+// backend already treats sourceInTc/sourceOutTc as clip-native:
+// worker/pipeline.py::_validate_decisions computes `fps = clip.fps or 24.0`
+// before parsing them — confirming the timecodes were always meant to be
+// interpreted at the clip's real measured rate, not the timeline's.
+//
+// So: <in>/<out> (and the file's own <rate>/<duration>) now use the clip's
+// real fps; <start>/<end>/the sequence's own <duration>, and the clipitem's
+// own <rate>, stay in the sequence's fps, unchanged.
 function toFrameRanges(
   decisions: UniversalTimeline["decisions"],
   clips: Clip[],
-  fps: number,
+  timelineFps: number,
   warnings: string[],
 ): FrameRange[] {
   const byId = new Map(clips.map((c) => [c.id, c]));
@@ -82,16 +130,19 @@ function toFrameRanges(
     .sort((a, b) => a.timelineStartSeconds - b.timelineStartSeconds)
     .map((d) => {
       const clip = byId.get(d.clipId);
-      const inSeconds = tcToSeconds(d.sourceInTc, fps);
-      const outSeconds = tcToSeconds(d.sourceOutTc, fps);
-      let inFrame = inSeconds !== null ? framesForSeconds(inSeconds, fps) : 0;
-      let outFrame = outSeconds !== null ? framesForSeconds(outSeconds, fps) : inFrame + framesForSeconds(d.durationSeconds, fps);
+      const clipFps = clip?.fps || timelineFps || 24;
+      const inSeconds = tcToSeconds(d.sourceInTc, clipFps);
+      const outSeconds = tcToSeconds(d.sourceOutTc, clipFps);
+      let inFrame = inSeconds !== null ? framesForSeconds(inSeconds, clipFps) : 0;
+      let outFrame =
+        outSeconds !== null ? framesForSeconds(outSeconds, clipFps) : inFrame + framesForSeconds(d.durationSeconds, clipFps);
       if (outFrame <= inFrame) {
         warnings.push(`"${d.label}" had a non-positive source duration after frame rounding — padded to 1 frame.`);
         outFrame = inFrame + 1;
       }
-      const startFrame = framesForSeconds(d.timelineStartSeconds, fps);
-      return { decision: d, clip, inFrame, outFrame, startFrame };
+      const startFrame = framesForSeconds(d.timelineStartSeconds, timelineFps);
+      const timelineDurationFrames = Math.max(1, framesForSeconds(d.durationSeconds, timelineFps));
+      return { decision: d, clip, inFrame, outFrame, startFrame, timelineDurationFrames, clipFps };
     });
 }
 
@@ -252,13 +303,19 @@ function linkBlockXml(link: LinkPartner, indent: string): string {
  * whole buildXmeml() call) returns a bare, self-closing reference instead —
  * see the top-of-file comment for why redefining the same id with different
  * content broke a real Premiere import.
+ *
+ * `clipFps` is the SOURCE clip's own real rate (see the real-test-#5 comment
+ * on toFrameRanges() above) — never the timeline's — because everything built
+ * here (the file's own <rate>, its total <duration>, and the nested
+ * samplecharacteristics <rate>) describes the real source media, not the
+ * sequence it's cut into.
  */
 function fileBlockXml(
   fileId: string,
   clip: Clip | undefined,
   name: string,
   mediaRoot: string,
-  fps: number,
+  clipFps: number,
   kinds: ReadonlySet<"video" | "audio">,
   fallbackDurationFrames: number,
   warnings: string[],
@@ -275,7 +332,7 @@ function fileBlockXml(
     warnings.push(`Could not resolve an absolute path for "${name}" — you'll need to relink media after import.`);
   }
   const sourceDurationFrames = clip?.durationSeconds
-    ? framesForSeconds(clip.durationSeconds, fps)
+    ? framesForSeconds(clip.durationSeconds, clipFps)
     : fallbackDurationFrames;
 
   const mediaParts: string[] = [];
@@ -286,7 +343,7 @@ function fileBlockXml(
     // wrapper, and colordepth in that bare context is what caused the two
     // new "Matrix cannot be inverted" errors in commit 2b84d1f.
     mediaParts.push(
-      `${indent}    <video>\n${videoSamplecharacteristics(width, height, fps, `${indent}      `, false)}\n${indent}    </video>`,
+      `${indent}    <video>\n${videoSamplecharacteristics(width, height, clipFps, `${indent}      `, false)}\n${indent}    </video>`,
     );
   }
   if (kinds.has("audio")) {
@@ -297,7 +354,7 @@ function fileBlockXml(
     `${indent}<file id="${fileId}">`,
     `${indent}  <name>${name}</name>`,
     `${indent}  <pathurl>${xmlEscape(url)}</pathurl>`,
-    rateBlock(fps, `${indent}  `),
+    rateBlock(clipFps, `${indent}  `),
     `${indent}  <duration>${sourceDurationFrames}</duration>`,
     `${indent}  <media>`,
     ...mediaParts,
@@ -306,19 +363,27 @@ function fileBlockXml(
   ].join("\n");
 }
 
-function clipItemXml(range: FrameRange, index: number, trackPrefix: string, fps: number, fileBlock: string, link?: LinkPartner): string {
-  const { decision, clip, inFrame, outFrame, startFrame } = range;
-  const duration = outFrame - inFrame;
+// timelineFps here is the SEQUENCE's rate — it governs the clipitem's own
+// <rate> and its <start>/<end>/<duration> (its placement on the timeline).
+// <in>/<out> are deliberately NOT derived from timelineFps/duration — they're
+// range.inFrame/outFrame, already computed in the clip's own real rate by
+// toFrameRanges() (see the real-test-#5 comment there). When a clip's native
+// rate differs from the sequence's, out-in (source frames) and end-start
+// (sequence frames) are legitimately different numbers for the same real-time
+// span — Apple's own XMEML docs call this out explicitly for clipitem
+// <duration> once framerate is involved.
+function clipItemXml(range: FrameRange, index: number, trackPrefix: string, timelineFps: number, fileBlock: string, link?: LinkPartner): string {
+  const { decision, clip, inFrame, outFrame, startFrame, timelineDurationFrames } = range;
   const itemId = sanitizeXmlId(`${trackPrefix}-${decision.id}`, `${trackPrefix}-clip-${index + 1}`);
   const name = xmlEscape(clip?.filename ?? decision.label ?? decision.clipId);
 
   return [
     `      <clipitem id="${itemId}">`,
     `        <name>${name}</name>`,
-    `        <duration>${duration}</duration>`,
-    rateBlock(fps, "        "),
+    `        <duration>${timelineDurationFrames}</duration>`,
+    rateBlock(timelineFps, "        "),
     `        <start>${startFrame}</start>`,
-    `        <end>${startFrame + duration}</end>`,
+    `        <end>${startFrame + timelineDurationFrames}</end>`,
     `        <in>${inFrame}</in>`,
     `        <out>${outFrame}</out>`,
     fileBlock,
@@ -348,9 +413,15 @@ export function buildXmeml(
   const broll = toFrameRanges(byLane("b-roll"), clips, fps, warnings);
   const standaloneAudio = toFrameRanges(byLane("audio"), clips, fps, warnings);
 
+  // Real-test-#5: r.outFrame - r.inFrame is now a SOURCE-frame span (the
+  // clip's own rate — see toFrameRanges() above), not a timeline-frame one,
+  // so it can no longer be added to the timeline-frame r.startFrame here.
+  // r.timelineDurationFrames is the correct sequence-frame span to use — the
+  // whole point of this sequence-duration computation is staying in the
+  // sequence's own fps end to end.
   const totalFrames = Math.max(
     framesForSeconds(timeline.totalSeconds, fps),
-    ...[...interview, ...broll, ...standaloneAudio].map((r) => r.startFrame + (r.outFrame - r.inFrame)),
+    ...[...interview, ...broll, ...standaloneAudio].map((r) => r.startFrame + r.timelineDurationFrames),
     0,
   );
 
@@ -393,7 +464,11 @@ export function buildXmeml(
     const name = xmlEscape(range.clip?.filename ?? range.decision.label ?? range.decision.clipId);
     const kinds = clipKinds.get(range.decision.clipId) ?? new Set<"video" | "audio">();
     const fallback = clipFallbackFrames.get(range.decision.clipId) ?? 1;
-    return fileBlockXml(fileId, range.clip, name, mediaRoot, fps, kinds, fallback, warnings, definedFileIds, indent);
+    // range.clipFps — the source clip's own real rate, NOT the timeline's
+    // `fps` — see the real-test-#5 comment on toFrameRanges() above. This was
+    // the actual bug: every <file><rate> was previously emitted at the
+    // sequence's rate regardless of what the real source clip was shot at.
+    return fileBlockXml(fileId, range.clip, name, mediaRoot, range.clipFps, kinds, fallback, warnings, definedFileIds, indent);
   };
 
   const interviewLink = (i: number): LinkPartner => ({
