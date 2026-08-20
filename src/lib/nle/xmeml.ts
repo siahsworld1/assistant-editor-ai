@@ -43,7 +43,16 @@
 // never emitted anywhere — plus a real `id` attribute on <sequence> (real
 // Premiere exports always have one; the DTD's #IMPLIED just means Premiere's
 // own *exporter* isn't required to include it, not that its *importer* is
-// happy without it).
+// happy without it). (4) That fix (colordepth added to EVERY video
+// samplecharacteristics block, sequence and per-file alike) imported cleanly
+// but Events reported exactly TWO new "Matrix cannot be inverted" — matching
+// this timeline's exactly two distinct <file id> definitions. Adding
+// colordepth to the per-file blocks (which sit directly under <video>, with
+// no <format> wrapper — unlike the sequence block, which does) is what
+// regressed; the sequence-level addition alone still accounts for the
+// original single error going away. <colordepth> is now scoped to the
+// once-per-sequence, <format>-wrapped block only — see the real-test-#3/#4
+// comment on videoSamplecharacteristics() below for the full evidence.
 
 import type { Clip, EditDecisionLane, UniversalTimeline } from "../ae/types";
 // Explicit ".ts" extensions — see the comment on the equivalent import in
@@ -131,19 +140,45 @@ function frameDimensions(clip: Clip | undefined): { width: number; height: numbe
 // codec|depth|samplerate|rate, all optional/unordered), the FULL canonical
 // example of a sequence-format samplecharacteristics block (Final Cut Pro XML
 // Interchange Format, "Basics of Encoding") includes <colordepth> — which this
-// exporter has never emitted anywhere. A real-world precedent (a third-party
-// XML exporter hitting the same "Premiere doesn't respect sequence format info"
-// class of bug importing into Premiere) also called out adding codec/format
-// metadata as part of the fix. <colordepth> is a plain scalar (no fabricated
-// codec name to get wrong, unlike <codec>, which was deliberately left out —
-// inventing a codec that doesn't match the real source footage risks trading
-// this error for a new "unsupported codec" one), so it's added uniformly here
-// wherever a video samplecharacteristics block is built — both the once-per-
-// sequence <format> block and each per-file block, since real Premiere-
-// generated XML includes it in both.
+// exporter had never emitted anywhere.
+//
+// Real Premiere test #4 (commit 2b84d1f, which added <colordepth> to EVERY
+// video samplecharacteristics block, sequence and per-file alike, plus a real
+// `id` attribute on <sequence>): the real exported XML (test4.xml, inspected
+// byte-for-byte) now imports cleanly, V1/A1 still correct — but the Events
+// window reported exactly TWO new "Matrix cannot be inverted" errors, not
+// zero. This timeline has exactly two distinct <file id="..."> definitions
+// (file-clip-002, file-clip-001 — the same file-id dedup from 2d7ef23, so
+// each real source file still gets exactly one full <file> definition). Two
+// unique files, two new errors: the count lines up exactly with "one per
+// per-file video samplecharacteristics block", not with the sequence (there's
+// only one of those) or anything else in the document. The math also fits the
+// PREVIOUS test cleanly — 1 sequence-level error + 0 per-file errors before
+// this change vs. 0 sequence-level + 2 per-file errors after it — meaning the
+// sequence-level <colordepth> addition really did fix the original error, and
+// it was ONLY adding it to the per-file blocks that regressed.
+//
+// The one structural difference between the two contexts: the sequence-level
+// block sits inside <video><format><samplecharacteristics>, matching Apple's
+// own <colordepth> example exactly (Listing 3-11 always wraps in <format>).
+// The per-file blocks sit directly under <video><samplecharacteristics>, with
+// NO <format> wrapper (matching Apple's minimal Listing 3-5, which never
+// carries <colordepth> either) — this asymmetry already existed pre-2b84d1f
+// and was harmless as long as neither block had colordepth; it's only once
+// colordepth entered the picture that the un-wrapped, file-level context
+// started producing a singular matrix. So <colordepth> stays scoped to the
+// <format>-wrapped, once-per-sequence block only — the per-file blocks go
+// back to exactly their proven-good 2d7ef23 shape (width/height/anamorphic/
+// pixelaspectratio/fielddominance/rate, nothing more).
 const VIDEO_COLOR_DEPTH_BITS = 24;
 
-function videoSamplecharacteristics(width: number, height: number, fps: number, indent: string): string {
+function videoSamplecharacteristics(
+  width: number,
+  height: number,
+  fps: number,
+  indent: string,
+  includeColordepth: boolean,
+): string {
   return [
     `${indent}<samplecharacteristics>`,
     `${indent}  <width>${width}</width>`,
@@ -152,7 +187,7 @@ function videoSamplecharacteristics(width: number, height: number, fps: number, 
     `${indent}  <pixelaspectratio>square</pixelaspectratio>`,
     `${indent}  <fielddominance>none</fielddominance>`,
     rateBlock(fps, `${indent}  `),
-    `${indent}  <colordepth>${VIDEO_COLOR_DEPTH_BITS}</colordepth>`,
+    ...(includeColordepth ? [`${indent}  <colordepth>${VIDEO_COLOR_DEPTH_BITS}</colordepth>`] : []),
     `${indent}</samplecharacteristics>`,
   ].join("\n");
 }
@@ -246,7 +281,13 @@ function fileBlockXml(
   const mediaParts: string[] = [];
   if (kinds.has("video")) {
     const { width, height } = frameDimensions(clip);
-    mediaParts.push(`${indent}    <video>\n${videoSamplecharacteristics(width, height, fps, `${indent}      `)}\n${indent}    </video>`);
+    // includeColordepth: false — see the real-test-#4 comment above
+    // videoSamplecharacteristics(): this per-file block has no <format>
+    // wrapper, and colordepth in that bare context is what caused the two
+    // new "Matrix cannot be inverted" errors in commit 2b84d1f.
+    mediaParts.push(
+      `${indent}    <video>\n${videoSamplecharacteristics(width, height, fps, `${indent}      `, false)}\n${indent}    </video>`,
+    );
   }
   if (kinds.has("audio")) {
     mediaParts.push(`${indent}    <audio>\n${audioSamplecharacteristics(`${indent}      `)}\n${indent}    </audio>`);
@@ -430,7 +471,11 @@ export function buildXmeml(
     `    <media>`,
     `      <video>`,
     `        <format>`,
-    videoSamplecharacteristics(seqWidth, seqHeight, fps, "          "),
+    // includeColordepth: true — this is the once-per-sequence, <format>-
+    // wrapped block; see the real-test-#3/#4 comment above
+    // videoSamplecharacteristics() for why colordepth stays here but not in
+    // the per-file blocks below.
+    videoSamplecharacteristics(seqWidth, seqHeight, fps, "          ", true),
     `        </format>`,
     ...videoTracks,
     `      </video>`,

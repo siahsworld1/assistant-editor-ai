@@ -385,24 +385,97 @@ describe("buildXmeml", () => {
     // includes <colordepth> (this exporter never emitted it anywhere); real
     // Premiere-generated sequences also always give <sequence> an id
     // attribute, even though the DTD marks it optional.
-    it("gives the sequence a real id attribute and every video samplecharacteristics block a real colordepth", () => {
+    //
+    // Fourth real Premiere import test, after adding <colordepth> to EVERY
+    // video samplecharacteristics block (sequence AND per-file alike, commit
+    // 2b84d1f): import still succeeded, but Events reported exactly TWO new
+    // "Matrix cannot be inverted" — matching this timeline's exactly two
+    // distinct <file id> definitions. The math against test #3 lines up
+    // cleanly (1 sequence error + 0 file errors -> 0 sequence errors + 2 file
+    // errors), so the sequence-level colordepth addition really did fix the
+    // original error; only adding it to the per-file blocks (which have no
+    // <format> wrapper, unlike the sequence block) regressed. <colordepth> is
+    // now scoped to the once-per-sequence, <format>-wrapped block only.
+    it("gives the sequence a real id attribute and the once-per-sequence format block a real colordepth", () => {
       const { usable } = validateTimelineForExport(timeline, clips);
       const { xml } = buildXmeml(timeline, usable, clips, MEDIA_ROOT);
 
       expect(xml).toMatch(/<sequence id="[^"]+">/);
 
-      const colordepths = [...xml.matchAll(/<colordepth>(\d+)<\/colordepth>/g)].map((m) => Number(m[1]));
-      // One colordepth per video samplecharacteristics block: sequence format
-      // + interview file + b-roll file = 3, same count as width/height.
-      expect(colordepths.length).toBe(3);
-      for (const d of colordepths) expect(d).toBeGreaterThan(0);
+      // Exactly ONE colordepth in the whole document — the once-per-sequence
+      // <format> block — never inside a per-file <video> block (see the
+      // real-test-#4 regression this guards against).
+      const colordepths = [...xml.matchAll(/<colordepth>(\d+)<\/colordepth>/g)];
+      expect(colordepths.length).toBe(1);
+      expect(Number(colordepths[0][1])).toBeGreaterThan(0);
 
-      // Specifically the once-per-sequence format block — the one that kept
-      // erroring even after every per-file block was already correct —
-      // carries its own colordepth, appearing before the first <track>.
       const firstTrack = xml.indexOf("<track>");
       const sequenceFormatSection = xml.slice(0, firstTrack);
       expect(sequenceFormatSection).toContain("<colordepth>");
+    });
+
+    it("never puts colordepth in a per-file video samplecharacteristics block, even with multiple distinct files", () => {
+      // Reuses the exact repeated-clip / two-distinct-file shape that
+      // produced the real test-#4 regression (two unique <file id>
+      // definitions, file-clip-002 and file-clip-001) — the fresh export that
+      // reproduced it (test4.xml) had exactly two new Matrix errors, one per
+      // file-level colordepth.
+      const repeatedClip = makeClip("clip-002", "18C_0687.MP4", "18C_0687.MP4");
+      const otherClip = makeClip("clip-001", "18C_0681.MP4", "18C_0681.MP4");
+      const tl = makeTimeline([
+        {
+          id: "event-1",
+          lane: "interview",
+          clipId: "clip-002",
+          label: "e1",
+          sourceInTc: "00:01:04:00",
+          sourceOutTc: "00:01:19:00",
+          timelineStartSeconds: 0,
+          durationSeconds: 15,
+        },
+        {
+          id: "event-2",
+          lane: "interview",
+          clipId: "clip-001",
+          label: "e2",
+          sourceInTc: "00:00:23:00",
+          sourceOutTc: "00:00:32:00",
+          timelineStartSeconds: 15,
+          durationSeconds: 9,
+        },
+        {
+          id: "event-3",
+          lane: "interview",
+          clipId: "clip-002",
+          label: "e3",
+          sourceInTc: "00:01:26:00",
+          sourceOutTc: "00:01:32:00",
+          timelineStartSeconds: 24,
+          durationSeconds: 6,
+        },
+      ]);
+      const { usable } = validateTimelineForExport(tl, [repeatedClip, otherClip]);
+      const { xml } = buildXmeml(tl, usable, [repeatedClip, otherClip], MEDIA_ROOT);
+
+      // Two distinct real <file> definitions, exactly as in the real
+      // regression fixture.
+      const fullDefs = [...xml.matchAll(/<file id="([^"]+)">/g)].map((m) => m[1]);
+      expect(new Set(fullDefs).size).toBe(2);
+
+      // Still exactly one colordepth total (the sequence format block) — not
+      // one per file, which is what actually broke import.
+      const colordepths = [...xml.matchAll(/<colordepth>/g)];
+      expect(colordepths.length).toBe(1);
+
+      // Each real <file id="..."> block's own <video><samplecharacteristics>
+      // must not contain colordepth at all.
+      for (const fileId of new Set(fullDefs)) {
+        const re = new RegExp(`<file id="${fileId}">[\\s\\S]*?<\\/file>`);
+        const fileBlock = xml.match(re)![0];
+        expect(fileBlock).not.toContain("<colordepth>");
+        // Sanity: it still has real geometry — just not colordepth.
+        expect(fileBlock).toContain("<width>");
+      }
     });
   });
 });
