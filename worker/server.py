@@ -11,11 +11,18 @@ Run: `python server.py` (see README.md for setup).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# ASSISTANT_EDITOR_SKIP_DOTENV=1 is set by the automated test suite (see
+# worker/tests/_no_real_credentials.py). Without it, load_dotenv() searches up
+# from worker/ and finds the repo-root .env, silently restoring real API keys a
+# test had deliberately removed — which is how "no API keys" tests ended up
+# making real, paid provider calls.
+if os.environ.get("ASSISTANT_EDITOR_SKIP_DOTENV") != "1":
+    load_dotenv()
 
 from flask import Flask, jsonify, request  # noqa: E402 - load_dotenv must run first
 

@@ -14,6 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import tests._no_real_credentials  # noqa: E402,F401 - must run before anything else
+
 import reasoning  # noqa: E402
 from providers.base import ProviderError, TextBlock  # noqa: E402
 from tests.fakes import FakeReasoningProvider, FakeTranscriptionProvider  # noqa: E402

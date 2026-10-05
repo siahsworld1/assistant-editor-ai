@@ -26,6 +26,9 @@ import unittest
 from pathlib import Path
 
 WORKER_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(WORKER_DIR))
+
+import tests._no_real_credentials  # noqa: E402,F401 - must run before anything else
 
 
 def _ffmpeg_present() -> bool:
@@ -59,6 +62,9 @@ def _run_validator(media_root: str, out_dir: Path, port: int, extra_args: list[s
     env = dict(os.environ)
     env.pop("OPENAI_API_KEY", None)
     env.pop("ANTHROPIC_API_KEY", None)
+    # Popping the keys alone isn't enough: the validator imports server.py,
+    # whose load_dotenv() would restore them from the repo-root .env.
+    env["ASSISTANT_EDITOR_SKIP_DOTENV"] = "1"
     args = [
         sys.executable, "validate_e2e.py",
         "--media-root", media_root,

@@ -527,21 +527,21 @@ export function buildXmeml(
     return fileBlockXml(fileId, range.clip, name, mediaRoot, range.clipFps, kinds, fallback, warnings, definedFileIds, indent);
   };
 
-  const interviewLink = (i: number): LinkPartner => ({
-    selfId: sanitizeXmlId(`v1-${interview[i].decision.id}`, `v1-clip-${i + 1}`),
+  const interviewLink = (r: FrameRange, i: number): LinkPartner => ({
+    selfId: sanitizeXmlId(`v1-${r.decision.id}`, `v1-clip-${i + 1}`),
     selfMediaType: "video",
     selfTrackIndex: 1,
-    partnerId: sanitizeXmlId(`a1-${interview[i].decision.id}`, `a1-clip-${i + 1}`),
+    partnerId: sanitizeXmlId(`a1-${r.decision.id}`, `a1-clip-${i + 1}`),
     partnerMediaType: "audio",
     partnerTrackIndex: 1,
     clipIndex: i + 1,
     groupIndex: i + 1,
   });
-  const interviewAudioLink = (i: number): LinkPartner => ({
-    selfId: sanitizeXmlId(`a1-${interview[i].decision.id}`, `a1-clip-${i + 1}`),
+  const interviewAudioLink = (r: FrameRange, i: number): LinkPartner => ({
+    selfId: sanitizeXmlId(`a1-${r.decision.id}`, `a1-clip-${i + 1}`),
     selfMediaType: "audio",
     selfTrackIndex: 1,
-    partnerId: sanitizeXmlId(`v1-${interview[i].decision.id}`, `v1-clip-${i + 1}`),
+    partnerId: sanitizeXmlId(`v1-${r.decision.id}`, `v1-clip-${i + 1}`),
     partnerMediaType: "video",
     partnerTrackIndex: 1,
     clipIndex: i + 1,
@@ -551,7 +551,7 @@ export function buildXmeml(
   const videoTracks = [
     interview.length > 0
       ? `    <track>\n${interview
-          .map((r, i) => clipItemXml(r, i, "v1", fps, fileBlockFor(r, i, "        "), interviewLink(i)))
+          .map((r, i) => clipItemXml(r, i, "v1", fps, fileBlockFor(r, i, "        "), interviewLink(r, i)))
           .join("\n")}\n    </track>`
       : null,
     broll.length > 0
@@ -574,7 +574,7 @@ export function buildXmeml(
   if (interview.length > 0) {
     audioTracks.push(
       `    <track>\n${interview
-        .map((r, i) => clipItemXml(r, i, "a1", fps, fileBlockFor(r, i, "        "), interviewAudioLink(i)))
+        .map((r, i) => clipItemXml(r, i, "a1", fps, fileBlockFor(r, i, "        "), interviewAudioLink(r, i)))
         .join("\n")}\n    </track>`,
     );
   }

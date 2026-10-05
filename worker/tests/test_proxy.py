@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import tests._no_real_credentials  # noqa: E402,F401 - must run before anything else
+
 import media  # noqa: E402
 
 
