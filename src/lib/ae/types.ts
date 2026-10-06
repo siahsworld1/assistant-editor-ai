@@ -39,6 +39,24 @@ export interface VisualEvidence {
   confidence: number;
 }
 
+/** One AI step of an analysis, as the engine reports it (worker/ai_status.py).
+ * Never contains a key, header or provider payload — only safe fields. */
+export interface AiTaskStatus {
+  task: "transcription" | "visual-analysis" | "selects" | "stories" | string;
+  status: "succeeded" | "failed" | "not-applicable";
+  provider?: string | undefined;
+  category?: string | undefined;
+  /** Follows the task name: "couldn't connect to OpenAI". */
+  message?: string | undefined;
+  retryable?: boolean | undefined;
+  httpStatus?: number | undefined;
+  clipId?: string | undefined;
+  filename?: string | undefined;
+}
+
+/** Whether the AI steps of a completed analysis all worked. */
+export type AnalysisOutcome = "succeeded" | "partial" | "failed";
+
 export type ClipRole = "interview" | "b-roll" | "ambient";
 export type ClipAnalysisState = "pending" | "analyzing" | "analyzed" | "error";
 
@@ -74,6 +92,11 @@ export interface Clip {
   hasTranscript: boolean;
   visualEvidenceCount: number;
   technicalIssues: string[];
+  /** Per-step AI status (transcription, visual analysis). Absent for an
+   * analysis saved before the engine reported it. */
+  ai?: Record<string, AiTaskStatus> | undefined;
+  /** This clip's AI result. `state` only says the clip itself was processed. */
+  aiStatus?: AnalysisOutcome | undefined;
   thumbHue: number;
   note?: string | undefined;
 }
@@ -181,6 +204,14 @@ export interface ProjectBrain {
   /** Identifies one completed engine analysis (worker/store.py). Saved edit
    * state is only restored against the analysis it was built from. */
   analysisId?: string | null | undefined;
+  /** Set once an analysis completes: did its AI steps all work? Null while
+   * running, or for an analysis saved before the engine reported it. */
+  analysisOutcome?: AnalysisOutcome | null | undefined;
+  /** The AI steps that failed — safe, structured fields only. */
+  aiIssues?: AiTaskStatus[] | undefined;
+  /** One sentence for the user, e.g. "AI analysis incomplete — transcription
+   * couldn't connect to OpenAI." Null when nothing failed. */
+  analysisMessage?: string | null | undefined;
 }
 
 export interface EngineHealth {

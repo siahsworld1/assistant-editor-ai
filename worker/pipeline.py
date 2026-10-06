@@ -23,11 +23,19 @@ import tempfile
 import traceback
 from pathlib import Path
 
+import ai_status
 import media
 import persistence
 import reasoning
 from providers.base import ProviderError, ReasoningProvider, TranscriptionProvider
-from providers.registry import get_reasoning_provider, get_transcription_provider
+from providers.registry import (
+    DEFAULT_REASONING_PROVIDER,
+    DEFAULT_TRANSCRIPTION_PROVIDER,
+    REASONING_PROVIDER_ENV,
+    TRANSCRIPTION_PROVIDER_ENV,
+    get_reasoning_provider,
+    get_transcription_provider,
+)
 from store import STORE, ClipState
 
 log = logging.getLogger("assistant-editor-worker")
@@ -58,6 +66,98 @@ def _resolve_reasoning_provider() -> ReasoningProvider | None:
     except ProviderError as exc:
         log.warning("reasoning provider unavailable: %s", exc)
         return None
+
+
+def retry_failed_ai():
+    """Re-runs ONLY the AI steps that failed in the loaded analysis — per clip
+    (transcription, visual analysis) — then selects and stories if their input
+    changed or they failed themselves. Metadata, proxies, thumbnails, clip ids,
+    every successful result and the analysis id are kept, so saved cuts (built
+    on those clips) stay valid."""
+    try:
+        _retry_failed_ai()
+    except Exception as exc:  # noqa: BLE001 - top-level background job guard
+        log.error("AI retry failed: %s\n%s", exc, traceback.format_exc())
+        STORE.fail(str(exc))
+
+
+def failed_ai_steps() -> list[tuple[str, str]]:
+    """(clipId, task) for every failed per-clip AI step of the loaded analysis."""
+    with STORE._lock:  # noqa: SLF001
+        return [
+            (clip.id, task)
+            for clip in STORE.clips.values()
+            for task, entry in clip.ai.items()
+            if entry.get("status") == "failed"
+        ]
+
+
+def _retry_failed_ai():
+    STORE.begin_retry()
+    steps = failed_ai_steps()
+    project_failed = {t for t, e in STORE.ai_tasks.items() if e.get("status") == "failed"}
+    transcription_provider = _resolve_transcription_provider() if any(t == "transcription" for _, t in steps) else None
+    reasoning_provider = _resolve_reasoning_provider()
+    tmp_root = Path(tempfile.mkdtemp(prefix="ae-worker-retry-"))
+    try:
+        recovered = False
+        for idx, (clip_id, task) in enumerate(steps):
+            clip = STORE.clips[clip_id]
+            path = Path(STORE.media_root or "") / clip.rel_path
+            work_dir = tmp_root / f"{clip_id}-{task}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            issues = list(clip.technical_issues)
+            if task == "transcription":
+                speaker = clip.speakers[0] if clip.speakers else None
+                _transcribe_clip(clip, path, work_dir, speaker, transcription_provider, issues, detect_hum=False)
+            else:
+                _analyze_clip_frames(clip, path, work_dir, clip.duration_seconds, reasoning_provider, issues)
+            clip.technical_issues = list(dict.fromkeys(issues))
+            recovered = recovered or clip.ai[task]["status"] == "succeeded"
+            STORE.upsert_clip(clip)
+            STORE.set_progress(5 + int(((idx + 1) / max(1, len(steps))) * 65))
+        if recovered or "selects" in project_failed or "stories" in project_failed:
+            STORE.set_progress(75)
+            _generate_selects(reasoning_provider)
+            STORE.set_progress(88)
+            _generate_stories(reasoning_provider)
+        STORE.complete(keep_analysis_id=True)
+        persistence.save_snapshot(STORE)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _provider_label(provider, kind: str) -> str:
+    """User-facing vendor name for a provider instance — or, when none could be
+    resolved, for the one the environment selects."""
+    if provider is not None:
+        return ai_status.provider_label(getattr(provider, "name", None))
+    import os
+
+    env, default = (
+        (TRANSCRIPTION_PROVIDER_ENV, DEFAULT_TRANSCRIPTION_PROVIDER)
+        if kind == "transcription"
+        else (REASONING_PROVIDER_ENV, DEFAULT_REASONING_PROVIDER)
+    )
+    return ai_status.provider_label(os.environ.get(env, default).strip().lower())
+
+
+def _call_ai(task: str, provider, kind: str, fn):
+    """Runs one AI operation. Returns (result, status entry) — a failure is
+    recorded as a structured entry (ai_status.failed), never raised and never
+    reported as success. The log gets the category only, not the exception
+    text (which can echo a provider's response)."""
+    label = _provider_label(provider, kind)
+    if provider is None:
+        entry = ai_status.failed(task, label, ProviderError("provider unavailable"))
+        log.warning(ai_status.log_line(entry))
+        return None, entry
+    try:
+        return fn(), ai_status.succeeded(task, label)
+    except Exception as exc:  # noqa: BLE001 - every provider failure becomes a status
+        entry = ai_status.failed(task, label, exc)
+        log.warning("%s [%s]", ai_status.log_line(entry), type(exc).__name__)
+        return None, entry
 
 
 def _run_analysis(project_id: str | None, media_root: str | None):
@@ -190,76 +290,14 @@ def _analyze_one_clip(
             STORE.upsert_clip(clip)
 
         if info["has_audio"]:
-            wav_path = clip_dir / "audio.wav"
-            if media.extract_audio(path, wav_path):
-                technical_issues.extend(media.detect_hum(wav_path))
-                segments = []
-                if transcription_provider is None:
-                    log.warning("transcription skipped for %s: no transcription provider available", path.name)
-                else:
-                    try:
-                        segments = reasoning.transcribe_audio(transcription_provider, wav_path)
-                    except ProviderError as exc:
-                        log.warning("transcription skipped for %s: %s", path.name, exc)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("transcription failed for %s: %s", path.name, exc)
-                speaker_label = speaker or "Unknown speaker"
-                for i, seg in enumerate(segments):
-                    if not seg.get("text"):
-                        continue
-                    STORE.transcript.append(
-                        {
-                            "id": f"{clip_id}-t{i + 1}",
-                            "clipId": clip_id,
-                            "speaker": speaker_label,
-                            "startTc": media.seconds_to_tc(seg["startSeconds"], clip.fps),
-                            "endTc": media.seconds_to_tc(seg["endSeconds"], clip.fps),
-                            "text": seg["text"],
-                            "confidence": seg.get("confidence", 0.7),
-                        }
-                    )
-                clip.has_transcript = any(t["clipId"] == clip_id for t in STORE.transcript)
+            _transcribe_clip(clip, path, clip_dir, speaker, transcription_provider, technical_issues, detect_hum=True)
+        else:
+            clip.ai["transcription"] = ai_status.not_applicable("transcription", "no-audio")
 
         if ext not in media.AUDIO_ONLY_EXTENSIONS:
-            frames = media.extract_frames(path, clip_dir / "frames", FRAMES_PER_CLIP)
-            if frames:
-                findings = []
-                if reasoning_provider is None:
-                    log.warning("visual analysis skipped for %s: no reasoning provider available", path.name)
-                else:
-                    try:
-                        findings = reasoning.analyze_frames(reasoning_provider, frames)
-                    except ProviderError as exc:
-                        log.warning("visual analysis skipped for %s: %s", path.name, exc)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("visual analysis failed for %s: %s", path.name, exc)
-                evidence_count = 0
-                for i, item in enumerate(findings):
-                    frame_index = item.get("frameIndex")
-                    if not isinstance(frame_index, int):
-                        frame_index = i + 1
-                    at_tc = media.frame_timecode(frame_index - 1, len(frames), info["duration"], clip.fps)
-                    kind = item.get("kind") if item.get("kind") in {
-                        "face", "motion", "scene", "b-roll", "graphic", "technical",
-                    } else "scene"
-                    label = str(item.get("label", "")).strip()
-                    if not label:
-                        continue
-                    if kind == "technical":
-                        technical_issues.append(label)
-                        continue
-                    evidence_count += 1
-                    STORE.visual_evidence.append(
-                        {
-                            "id": f"{clip_id}-v{i + 1}",
-                            "clipId": clip_id,
-                            "kind": kind,
-                            "label": label,
-                            "atTc": at_tc,
-                            "confidence": float(item.get("confidence", 0.6)),
-                        }
-                    )
-                clip.visual_evidence_count = evidence_count
+            _analyze_clip_frames(clip, path, clip_dir, info["duration"], reasoning_provider, technical_issues)
+        else:
+            clip.ai["visual-analysis"] = ai_status.not_applicable("visual-analysis", "audio-only")
 
         clip.technical_issues = list(dict.fromkeys(technical_issues))
         clip.state = "analyzed"
@@ -271,6 +309,101 @@ def _analyze_one_clip(
     finally:
         STORE.upsert_clip(clip)
         shutil.rmtree(clip_dir, ignore_errors=True)
+
+
+def _transcribe_clip(
+    clip: ClipState,
+    path: Path,
+    work_dir: Path,
+    speaker: str | None,
+    provider: TranscriptionProvider | None,
+    technical_issues: list[str],
+    detect_hum: bool,
+) -> None:
+    """Extracts the audio and transcribes it, recording clip.ai['transcription'].
+    Replaces any earlier transcript of this clip only when transcription succeeds."""
+    wav_path = work_dir / "audio.wav"
+    if not media.extract_audio(path, wav_path):
+        technical_issues.append("Audio track could not be extracted for transcription")
+        clip.ai["transcription"] = ai_status.not_applicable("transcription", "audio-extraction-failed")
+        return
+    if detect_hum:
+        technical_issues.extend(media.detect_hum(wav_path))
+    segments, entry = _call_ai(
+        "transcription", provider, "transcription", lambda: reasoning.transcribe_audio(provider, wav_path)
+    )
+    clip.ai["transcription"] = entry
+    if entry["status"] != "succeeded":
+        return
+    speaker_label = speaker or (clip.speakers[0] if clip.speakers else "Unknown speaker")
+    with STORE._lock:  # noqa: SLF001
+        STORE.transcript = [t for t in STORE.transcript if t["clipId"] != clip.id]
+        for i, seg in enumerate(segments or []):
+            if not seg.get("text"):
+                continue
+            STORE.transcript.append(
+                {
+                    "id": f"{clip.id}-t{i + 1}",
+                    "clipId": clip.id,
+                    "speaker": speaker_label,
+                    "startTc": media.seconds_to_tc(seg["startSeconds"], clip.fps),
+                    "endTc": media.seconds_to_tc(seg["endSeconds"], clip.fps),
+                    "text": seg["text"],
+                    "confidence": seg.get("confidence", 0.7),
+                }
+            )
+        clip.has_transcript = any(t["clipId"] == clip.id for t in STORE.transcript)
+
+
+def _analyze_clip_frames(
+    clip: ClipState,
+    path: Path,
+    work_dir: Path,
+    duration: float,
+    provider: ReasoningProvider | None,
+    technical_issues: list[str],
+) -> None:
+    """Samples frames and describes them, recording clip.ai['visual-analysis'].
+    Replaces any earlier visual evidence of this clip only on success."""
+    frames = media.extract_frames(path, work_dir / "frames", FRAMES_PER_CLIP)
+    if not frames:
+        technical_issues.append("Frames could not be extracted for visual analysis")
+        clip.ai["visual-analysis"] = ai_status.not_applicable("visual-analysis", "frame-extraction-failed")
+        return
+    findings, entry = _call_ai(
+        "visual-analysis", provider, "reasoning", lambda: reasoning.analyze_frames(provider, frames)
+    )
+    clip.ai["visual-analysis"] = entry
+    if entry["status"] != "succeeded":
+        return
+    evidence = []
+    for i, item in enumerate(findings or []):
+        frame_index = item.get("frameIndex")
+        if not isinstance(frame_index, int):
+            frame_index = i + 1
+        at_tc = media.frame_timecode(frame_index - 1, len(frames), duration, clip.fps)
+        kind = item.get("kind") if item.get("kind") in {
+            "face", "motion", "scene", "b-roll", "graphic", "technical",
+        } else "scene"
+        label = str(item.get("label", "")).strip()
+        if not label:
+            continue
+        if kind == "technical":
+            technical_issues.append(label)
+            continue
+        evidence.append(
+            {
+                "id": f"{clip.id}-v{i + 1}",
+                "clipId": clip.id,
+                "kind": kind,
+                "label": label,
+                "atTc": at_tc,
+                "confidence": float(item.get("confidence", 0.6)),
+            }
+        )
+    with STORE._lock:  # noqa: SLF001
+        STORE.visual_evidence = [v for v in STORE.visual_evidence if v["clipId"] != clip.id] + evidence
+    clip.visual_evidence_count = len(evidence)
 
 
 def _cached_thumbnail(path: Path, cache_key: str | None, duration: float) -> tuple[str | None, str | None]:
@@ -309,6 +442,7 @@ def _generate_selects(reasoning_provider: ReasoningProvider | None = None):
     clips = _clip_lookup()
     if not STORE.transcript:
         STORE.selects = []
+        STORE.ai_tasks["selects"] = ai_status.not_applicable("selects", "no-transcript")
         return
     lines = ["CLIPS:"]
     for c in clips.values():
@@ -323,16 +457,11 @@ def _generate_selects(reasoning_provider: ReasoningProvider | None = None):
             lines.append(f"{v['clipId']} | {v['kind']} | {v['label']} | {v['atTc']}")
     summary = "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
-    raw = []
-    if reasoning_provider is None:
-        log.warning("select ranking skipped: no reasoning provider available")
-    else:
-        try:
-            raw = reasoning.rank_selects(reasoning_provider, summary)
-        except ProviderError as exc:
-            log.warning("select ranking skipped: %s", exc)
-        except Exception as exc:  # noqa: BLE001
-            log.error("select ranking failed: %s", exc)
+    raw, entry = _call_ai(
+        "selects", reasoning_provider, "reasoning", lambda: reasoning.rank_selects(reasoning_provider, summary)
+    )
+    STORE.ai_tasks["selects"] = entry
+    raw = raw or []
 
     selects = []
     for i, item in enumerate(sorted(raw, key=lambda r: r.get("score", 0), reverse=True)):
@@ -373,6 +502,7 @@ def _generate_selects(reasoning_provider: ReasoningProvider | None = None):
 def _generate_stories(reasoning_provider: ReasoningProvider | None = None):
     if not STORE.selects:
         STORE.stories = []
+        STORE.ai_tasks["stories"] = ai_status.not_applicable("stories", "no-selects")
         return
     lines = ["SELECTS:"]
     for s in STORE.selects:
@@ -381,16 +511,11 @@ def _generate_stories(reasoning_provider: ReasoningProvider | None = None):
         )
     summary = "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
-    raw = []
-    if reasoning_provider is None:
-        log.warning("story generation skipped: no reasoning provider available")
-    else:
-        try:
-            raw = reasoning.propose_stories(reasoning_provider, summary)
-        except ProviderError as exc:
-            log.warning("story generation skipped: %s", exc)
-        except Exception as exc:  # noqa: BLE001
-            log.error("story generation failed: %s", exc)
+    raw, entry = _call_ai(
+        "stories", reasoning_provider, "reasoning", lambda: reasoning.propose_stories(reasoning_provider, summary)
+    )
+    STORE.ai_tasks["stories"] = entry
+    raw = raw or []
 
     valid_ids = {s["id"] for s in STORE.selects}
     stories = []
@@ -587,6 +712,28 @@ def _clip_material_lines() -> list[str]:
     return lines
 
 
+def analysis_readiness() -> dict:
+    """Where the analysis stands, for the Director:
+    status: 'not-run' | 'running' | 'failed' | 'partial' | 'succeeded' — and a
+    user-facing message for every state that can't (fully) build."""
+    with STORE._lock:  # noqa: SLF001
+        state, progress, error = STORE.analysis_state, STORE.analysis_progress, STORE.error
+    if state == "running":
+        return {"status": "running", "message": f"Analysis is still running ({progress}%) — the Director can build once it finishes."}
+    if state == "error":
+        return {"status": "failed", "message": f"Analysis failed — {error or 'see WATCH for details'}."}
+    if state != "complete" or not STORE.clips:
+        return {"status": "not-run", "message": "No footage has been analyzed yet — import media and run Analyze in WATCH first."}
+    outcome = STORE.analysis_outcome() or "succeeded"
+    if outcome == "succeeded":
+        return {"status": "succeeded", "message": None}
+    headline = ai_status.headline(outcome, STORE.ai_issues())
+    return {
+        "status": outcome,
+        "message": f"{headline} Fix the cause, then use Retry AI Analysis in WATCH.",
+    }
+
+
 def build_timeline(
     project_id: str | None,
     story_id: str | None,
@@ -602,9 +749,17 @@ def build_timeline(
     )
     selects_by_id = {s["id"]: s for s in STORE.selects}
 
+    readiness = analysis_readiness()
     if not story or not STORE.selects:
+        # Nothing to build from. Say why: never "run Analyze first" when an
+        # analysis did run but its AI steps failed.
+        message = readiness["message"] or (
+            "The analysis found no usable dialogue selects to build from — check the transcripts in WATCH."
+        )
         return {
-            "summary": "No analyzed selects are available yet — run Analyze first.",
+            "status": "blocked",
+            "analysis": readiness,
+            "summary": message,
             "changes": [],
             "decisions": [],
         }
@@ -636,21 +791,20 @@ def build_timeline(
     if reasoning_provider is None:
         reasoning_provider = _resolve_reasoning_provider()
 
-    result = None
-    if reasoning_provider is not None:
-        try:
-            result = reasoning.build_timeline(reasoning_provider, brief)
-        except ProviderError as exc:
-            log.warning("build skipped: %s", exc)
-        except Exception as exc:  # noqa: BLE001
-            log.error("build failed: %s", exc)
+    result, director = _call_ai(
+        "director", reasoning_provider, "reasoning", lambda: reasoning.build_timeline(reasoning_provider, brief)
+    )
+    # An incomplete analysis still builds from what succeeded — but says so.
+    caveat = [readiness["message"]] if readiness["status"] == "partial" and readiness["message"] else []
 
     clips = _clip_lookup()
     if result and isinstance(result.get("decisions"), list) and result["decisions"]:
         validated, warnings = _validate_decisions(result["decisions"], clips)
         if validated:
-            changes = [str(c) for c in result.get("changes", [])] + warnings
+            changes = caveat + [str(c) for c in result.get("changes", [])] + warnings
             return {
+                "status": "built",
+                "analysis": readiness,
                 "summary": str(result.get("summary", "Engine returned a new assembly.")),
                 "changes": changes,
                 "decisions": validated,
@@ -681,9 +835,17 @@ def build_timeline(
             }
         )
     validated, warnings = _validate_decisions(decisions, clips)
+    why = (
+        f"the Director {director['message']}"
+        if director["status"] == "failed"
+        else "the reasoning model returned nothing valid"
+    )
     return {
-        "summary": f"Assembled '{story['title']}' from {len(validated)} selects (fallback assembly — the reasoning model was unavailable or returned nothing valid).",
-        "changes": ["Concatenated story selects in beat order", *warnings],
+        "status": "fallback",
+        "analysis": readiness,
+        **({"aiFailure": director} if director["status"] == "failed" else {}),
+        "summary": f"Assembled '{story['title']}' from {len(validated)} selects (fallback assembly — {why}).",
+        "changes": [*caveat, "Concatenated story selects in beat order", *warnings],
         "decisions": validated,
         # The target this cut was actually built against (a length named in
         # the Director note overrides the request) — so the app can scale and

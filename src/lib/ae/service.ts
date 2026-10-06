@@ -12,6 +12,7 @@ import {
   type HostContext,
 } from "./transport";
 import {
+  extractBuildStatus,
   extractBuildSummary,
   normalizeAnalyze,
   normalizeCapabilities,
@@ -22,6 +23,7 @@ import {
   normalizeStories,
   normalizeTimeline,
   type AnalyzeResult,
+  type BuildStatus,
 } from "./normalize";
 import type {
   EngineCapabilities,
@@ -76,6 +78,14 @@ export interface BuildResult {
   timeline: UniversalTimeline;
   summary: string;
   changes: string[];
+  /** Absent for Demo Mode / engines that don't report it. */
+  status?: BuildStatus | undefined;
+}
+
+export interface RetryAiResult {
+  accepted: boolean;
+  /** Why nothing started: "nothing-to-retry", "analysis-running", … */
+  reason: string | null;
 }
 
 export type DiagnosticReporter = (
@@ -198,7 +208,23 @@ export class EngineClient {
       // give that materially more room than the original mock's 30s budget.
       timeoutMs: 90000,
     });
-    return { timeline: normalizeTimeline(raw, req.targetSeconds), ...extractBuildSummary(raw) };
+    return {
+      timeline: normalizeTimeline(raw, req.targetSeconds),
+      ...extractBuildSummary(raw),
+      status: extractBuildStatus(raw),
+    };
+  }
+
+  /** Re-runs only the AI steps that failed in the loaded analysis
+   * (worker/server.py POST /analyze/retry-ai). Progress is then reported by
+   * GET /project exactly like a normal analysis. */
+  async retryAi(): Promise<RetryAiResult> {
+    const raw = await this.call("analyze", "/analyze/retry-ai", { method: "POST", body: {}, timeoutMs: 15000 });
+    const root = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    return {
+      accepted: root["accepted"] === true,
+      reason: typeof root["reason"] === "string" ? root["reason"] : null,
+    };
   }
 
   /**

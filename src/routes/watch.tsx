@@ -8,6 +8,7 @@ import {
   FolderPlus,
   Loader2,
   Play,
+  RotateCcw,
   ScanEye,
 } from "lucide-react";
 import { MediaPlayer } from "@/components/ae/MediaPlayer";
@@ -18,6 +19,7 @@ import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { useAE } from "@/lib/ae/store";
 import { previewSrcForClip, thumbSrcForClip } from "@/lib/ae/media-url";
+import { canRetryAi, groupAiIssues, outcomeHeading, taskLabel } from "@/lib/ae/ai-status";
 import type { Clip } from "@/lib/ae/types";
 
 export const Route = createFileRoute("/watch")({
@@ -107,6 +109,7 @@ function WatchPage() {
   const {
     project,
     analyze,
+    retryAiAnalysis,
     loading,
     connection,
     activeProject,
@@ -240,6 +243,47 @@ function WatchPage() {
               {project.analysisError}
             </p>
           )}
+          {project?.analysisState === "complete" &&
+            (outcomeHeading(project.analysisOutcome) || project.analysisError) && (
+              <div
+                role="alert"
+                data-testid="ai-analysis-notice"
+                className="mt-3 rounded border border-warning/40 bg-warning/[0.06] px-3 py-2 text-[11px] text-warning"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <p className="font-medium">
+                    {project.analysisMessage ?? outcomeHeading(project.analysisOutcome) ?? project.analysisError}
+                  </p>
+                  {canRetryAi(project) && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 border-warning/50 px-2 text-[11px] text-warning"
+                      onClick={retryAiAnalysis}
+                      disabled={connection !== "live"}
+                    >
+                      <RotateCcw className="size-3" /> Retry AI Analysis
+                    </Button>
+                  )}
+                </div>
+                {groupAiIssues(project.aiIssues ?? []).length > 0 && (
+                  <ul className="mt-1.5 space-y-0.5 text-foreground/80">
+                    {groupAiIssues(project.aiIssues ?? []).map((g) => (
+                      <li key={g.text}>
+                        {g.text}
+                        {g.clips > 0 ? ` (${g.clips} clip${g.clips === 1 ? "" : "s"})` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {project.analysisError && project.analysisMessage && (
+                  <p className="mt-1.5">{project.analysisError}</p>
+                )}
+                <p className="mt-1.5 text-muted-foreground">
+                  Metadata, proxies and thumbnails are ready; only the AI evidence is missing.
+                </p>
+              </div>
+            )}
         </div>
 
         <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
@@ -311,6 +355,11 @@ function WatchPage() {
                       {clip.technicalIssues.length > 0 && (
                         <span className="flex items-center gap-1 rounded border border-warning/40 px-1.5 py-0.5 text-[10px] text-warning">
                           <AlertTriangle className="size-3" /> {clip.technicalIssues.length}
+                        </span>
+                      )}
+                      {(clip.aiStatus === "failed" || clip.aiStatus === "partial") && (
+                        <span className="flex items-center gap-1 rounded border border-warning/40 px-1.5 py-0.5 text-[10px] text-warning">
+                          <AlertTriangle className="size-3" /> AI {clip.aiStatus === "failed" ? "failed" : "incomplete"}
                         </span>
                       )}
                     </div>
@@ -418,6 +467,23 @@ function WatchPage() {
                     )}
                   </ul>
                 </div>
+
+                {Object.values(active.ai ?? {}).some((t) => t.status === "failed") && (
+                  <div className="rounded border border-warning/30 bg-warning/5 p-2.5">
+                    <div className="mb-1 flex items-center gap-1.5 text-[11px] text-warning">
+                      <AlertTriangle className="size-3" /> AI analysis incomplete
+                    </div>
+                    <ul className="space-y-0.5 text-xs text-foreground/85">
+                      {Object.values(active.ai ?? {})
+                        .filter((t) => t.status === "failed")
+                        .map((t) => (
+                          <li key={t.task}>
+                            {taskLabel(t.task)} {t.message ?? "failed"}
+                          </li>
+                        ))}
+                    </ul>
+                  </div>
+                )}
 
                 {active.technicalIssues.length > 0 && (
                   <div className="rounded border border-warning/30 bg-warning/5 p-2.5">

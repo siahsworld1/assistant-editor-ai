@@ -1,16 +1,81 @@
-// CUT playback across edit points (P0 Step 8). Renders the real
-// useTimelinePlayback hook with a fake player handle: consecutive events cut
-// from the SAME source clip share one <video> src, so moving between them must
-// seek the player explicitly — found playing a real cut that used 18C_0687
-// twice in a row, where playback ran on past the first event's out-point.
-import { act, createElement, type ReactNode } from "react";
-import { createRoot } from "react-dom/client";
-import { describe, expect, it, vi } from "vitest";
-import { useTimelinePlayback, type TimelinePlayback } from "@/lib/ae/timeline-playback";
-import type { Clip, UniversalTimeline } from "@/lib/ae/types";
+// CUT preview playback across edit points (Release Step 4C, FIX 2).
+//
+// The packaged validation showed brief black frames between edits in the CUT
+// preview (never in the cut itself: V1 and the exported XML are gap-free and
+// Premiere played clean). Cause: ONE <video> had its src swapped at each
+// cross-source edit, which drops the current frame until the next file loads,
+// seeks and decodes. SequenceBuffer double-buffers instead; these tests drive
+// it with fake media elements and check, frame by frame, that the visible
+// element ALWAYS has a decoded frame.
+import { describe, expect, it } from "vitest";
+import { SequenceBuffer, type MediaLike, type SequenceState } from "@/lib/ae/sequence-buffer";
+import { buildPlaybackPlan } from "@/lib/ae/timeline-playback";
+import type { Clip, EditDecision, UniversalTimeline } from "@/lib/ae/types";
 
-(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const NTSC = 23.976;
+
+class FakeMedia implements MediaLike {
+  private _src = "";
+  private _time = 0;
+  paused = true;
+  seeking = false;
+  readyState = 0;
+  muted = false;
+  /** auto: load + seek complete instantly (fast disk); manual: call finish*(). */
+  constructor(public auto = true) {}
+  private listeners = new Map<string, Set<() => void>>();
+  addEventListener(type: string, fn: () => void) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type)!.add(fn);
+  }
+  removeEventListener(type: string, fn: () => void) {
+    this.listeners.get(type)?.delete(fn);
+  }
+  private fire(type: string) {
+    for (const fn of [...(this.listeners.get(type) ?? [])]) fn();
+  }
+  get src() {
+    return this._src;
+  }
+  set src(v: string) {
+    this._src = v;
+    this.readyState = 0; // a new src drops the current frame
+    this._time = 0;
+    this.paused = true;
+    if (this.auto) this.finishLoad();
+  }
+  get currentTime() {
+    return this._time;
+  }
+  set currentTime(t: number) {
+    this._time = t;
+    this.seeking = true;
+    if (this.auto) this.finishSeek();
+  }
+  finishLoad() {
+    this.readyState = 1;
+    this.fire("loadedmetadata");
+  }
+  finishSeek() {
+    this.seeking = false;
+    this.readyState = 4;
+    this.fire("seeked");
+  }
+  play() {
+    this.paused = false;
+  }
+  pause() {
+    this.paused = true;
+  }
+  /** What a viewer sees from this element right now. */
+  hasFrame() {
+    return this.readyState >= 2 && !!this._src;
+  }
+  advance(dt: number) {
+    if (!this.paused && this.readyState >= 2 && !this.seeking) this._time += dt;
+  }
+}
+
 const clip = (id: string): Clip => ({
   id,
   filename: `${id}.MP4`,
@@ -29,85 +94,185 @@ const clip = (id: string): Clip => ({
   technicalIssues: [],
   thumbHue: 0,
 });
+
+function ev(
+  id: string,
+  clipId: string,
+  inTc: string,
+  outTc: string,
+  start: number,
+  dur: number,
+  lane: EditDecision["lane"] = "interview",
+): EditDecision {
+  return {
+    id,
+    lane,
+    clipId,
+    label: id,
+    sourceInTc: inTc,
+    sourceOutTc: outTc,
+    timelineStartSeconds: start,
+    durationSeconds: dur,
+  };
+}
+
+// Shape of the validated Director cut: 0687, 0687, 0687, 0681, 0687 on V1 —
+// three same-source edits, then cross-source edits both ways — plus V2.
 const timeline: UniversalTimeline = {
   id: "t",
   name: "t",
   fps: 24,
   targetSeconds: 30,
-  totalSeconds: 12,
+  totalSeconds: 33,
   decisions: [
-    {
-      id: "a",
-      lane: "interview",
-      clipId: "c87",
-      label: "a",
-      sourceInTc: "00:01:04:12",
-      sourceOutTc: "00:01:11:18",
-      timelineStartSeconds: 0,
-      durationSeconds: 7.25,
-    },
-    {
-      id: "b",
-      lane: "interview",
-      clipId: "c87",
-      label: "b",
-      sourceInTc: "00:01:26:12",
-      sourceOutTc: "00:01:31:02",
-      timelineStartSeconds: 7.25,
-      durationSeconds: 4.583,
-    },
+    ev("e1", "c87", "00:01:02:00", "00:01:12:00", 0, 10),
+    ev("e2", "c87", "00:00:25:00", "00:00:32:00", 10, 7),
+    ev("e3", "c87", "00:00:43:00", "00:00:49:00", 17, 6),
+    ev("b1", "c91", "00:00:06:23", "00:00:11:15", 17.5, 4.67, "b-roll"),
+    ev("e5", "c81", "00:00:22:00", "00:00:28:00", 23, 6),
+    ev("e6", "c87", "00:01:28:00", "00:01:32:00", 29, 4),
+    ev("b2", "c92", "00:00:04:20", "00:00:08:00", 29.5, 3.17, "b-roll"),
   ],
 };
+const plan = buildPlaybackPlan(timeline, ["c87", "c81", "c91", "c92"].map(clip));
 
-async function mountPlayback() {
-  let pb: TimelinePlayback | null = null;
-  function Probe(): ReactNode {
-    pb = useTimelinePlayback(timeline, [clip("c87")]);
-    return null;
-  }
-  const root = createRoot(document.createElement("div"));
-  await act(async () => root.render(createElement(Probe)));
-  const player = {
-    play: vi.fn(),
-    pause: vi.fn(),
-    seek: vi.fn(),
-    getCurrentTime: () => 0,
-    getDuration: () => 120,
-  };
-  pb!.playerRef.current = player;
-  return { get: () => pb!, player, root };
+function setup(auto = true) {
+  const states: SequenceState[] = [];
+  const buffer = new SequenceBuffer((s) => states.push({ ...s }));
+  const media = [new FakeMedia(auto), new FakeMedia(auto)] as const;
+  buffer.attach(0, media[0]);
+  buffer.attach(1, media[1]);
+  buffer.setSequence(plan.sequence, timeline.totalSeconds);
+  const last = () => states[states.length - 1]!;
+  const front = () => media[last().frontSlot];
+  return { buffer, media, states, last, front };
 }
 
-describe("CUT playback across edit points", () => {
-  it("seeks to the next event's in-point when both events share one source clip", async () => {
-    const { get, player, root } = await mountPlayback();
-    await act(async () => get().play()); // loads event a
-    expect(get().activeSegment?.decision.id).toBe("a");
-    const aOut = get().segments[0]!.sourceOutSeconds;
-    await act(async () => get().handleTimeUpdate(aOut)); // reaches a's out-point
-    expect(get().activeSegment?.decision.id).toBe("b");
-    const bIn = 86 + 12 / NTSC; // 00:01:26:12 at the clip's 23.976
-    expect(player.seek).toHaveBeenCalledWith(bIn);
-    await act(async () => root.unmount());
+/** Plays at ~60 fps for `seconds`, asserting no black frame on the way. */
+function run(env: ReturnType<typeof setup>, seconds: number, onFrame?: () => void) {
+  const dt = 1 / 60;
+  for (let t = 0; t < seconds; t += dt) {
+    env.front().advance(dt);
+    env.buffer.tick();
+    onFrame?.();
+    if (env.last().activeIndex !== null) {
+      expect(
+        env.front().hasFrame(),
+        `black frame at playhead ${env.last().playheadSeconds.toFixed(2)}s`,
+      ).toBe(true);
+    }
+  }
+}
+
+describe("CUT preview: double-buffered playback", () => {
+  it("plays V1 only, with V2 as overlays (sequence shape)", () => {
+    expect(plan.sequence.map((s) => s.decision.id)).toEqual(["e1", "e2", "e3", "e5", "e6"]);
+    expect(plan.overlays.map((s) => s.decision.id)).toEqual(["b1", "b2"]);
   });
 
-  it("stops at the end of the cut instead of playing on past the last out-point", async () => {
-    const { get, player, root } = await mountPlayback();
-    await act(async () => get().play());
-    await act(async () => get().handleTimeUpdate(get().segments[0]!.sourceOutSeconds)); // → b
-    player.pause.mockClear();
-    await act(async () => get().handleTimeUpdate(get().segments[1]!.sourceOutSeconds)); // b's out-point
-    expect(player.pause).toHaveBeenCalled();
-    expect(get().playheadSeconds).toBe(timeline.totalSeconds);
-    await act(async () => root.unmount());
+  it("pre-rolls the next edit in the hidden element before the cut", () => {
+    const env = setup();
+    env.buffer.play();
+    expect(env.last().activeIndex).toBe(0);
+    const back = env.media[env.last().frontSlot === 0 ? 1 : 0];
+    expect(back.src).toBe(plan.sequence[1]!.src); // same-source next edit…
+    expect(back.currentTime).toBeCloseTo(25, 6); // …already parked at its in-point
+    expect(back.hasFrame()).toBe(true);
+    expect(back.paused && back.muted).toBe(true);
   });
 
-  it("seeking across an edit boundary lands at the right source position", async () => {
-    const { get, player, root } = await mountPlayback();
-    await act(async () => get().play());
-    await act(async () => get().seek(8.25)); // 1s into event b
-    expect(get().activeSegment?.decision.id).toBe("b");
-    expect(player.seek).toHaveBeenLastCalledWith(expect.closeTo(86 + 12 / NTSC + 1, 6));
-    await act(async () => root.unmount());
+  it("never shows a black frame across same-source and cross-source cuts, end to end", () => {
+    const env = setup();
+    env.buffer.play();
+    const order: number[] = [];
+    run(env, 34, () => {
+      const i = env.last().activeIndex;
+      if (i !== null && order[order.length - 1] !== i) order.push(i);
+      // Only the visible element is ever audible.
+      const audible = env.media.filter((m) => !m.muted && !m.paused);
+      expect(audible.length).toBeLessThanOrEqual(1);
+      if (audible.length === 1) expect(audible[0]).toBe(env.front());
+    });
+    expect(order).toEqual([0, 1, 2, 3, 4]);
+    // End of the cut: stopped, holding the last frame.
+    expect(env.last().playing).toBe(false);
+    expect(env.last().playheadSeconds).toBe(33);
+    expect(env.front().paused).toBe(true);
+    expect(env.front().hasFrame()).toBe(true);
+  });
+
+  it("switches within a frame of each out-point (no overshoot past the edit)", () => {
+    const env = setup();
+    env.buffer.play();
+    let lastIndex = 0;
+    run(env, 10.5, () => {
+      const i = env.last().activeIndex!;
+      if (i !== lastIndex) {
+        // The new edit starts at its own in-point, not mid-way.
+        expect(env.front().currentTime).toBeCloseTo(plan.sequence[i]!.sourceInSeconds, 1);
+        lastIndex = i;
+      }
+    });
+    expect(lastIndex).toBe(1);
+    expect(env.last().playheadSeconds).toBeGreaterThanOrEqual(10);
+    expect(env.last().playheadSeconds).toBeLessThan(10.6);
+  });
+
+  it("holds the last frame (does not go black) while a slow next clip loads, then swaps and plays", () => {
+    const env = setup(false);
+    // First edit: load + seek it manually.
+    env.buffer.play();
+    env.media[0].finishLoad();
+    env.media[0].finishSeek();
+    expect(env.last().activeIndex).toBe(0);
+    env.media[1].finishLoad(); // pre-roll of e2 (same file) — leave its seek pending
+    // Run to e1's out-point: the back element isn't ready, so the front holds.
+    for (let t = 0; t < 10.1; t += 1 / 60) {
+      env.front().advance(1 / 60);
+      env.buffer.tick();
+    }
+    expect(env.last().activeIndex).toBe(0);
+    expect(env.last().frontSlot).toBe(0);
+    expect(env.media[0].hasFrame()).toBe(true); // last frame still on screen
+    expect(env.media[0].paused).toBe(true); // held still and silent
+    env.media[1].finishSeek(); // next frame decoded → swap
+    expect(env.last().frontSlot).toBe(1);
+    expect(env.last().activeIndex).toBe(1);
+    expect(env.media[1].paused).toBe(false);
+    expect(env.media[1].muted).toBe(false);
+    expect(env.media[0].muted).toBe(true);
+  });
+
+  it("seeks across edit boundaries to the right source position", () => {
+    const env = setup();
+    env.buffer.play();
+    env.buffer.seek(24); // 1s into e5 (18C_0681 @ 22:00)
+    expect(env.last().activeIndex).toBe(3);
+    expect(env.front().src).toBe(plan.sequence[3]!.src);
+    expect(env.front().currentTime).toBeCloseTo(23, 6);
+    expect(env.last().playheadSeconds).toBeCloseTo(24, 6);
+    env.buffer.seek(12); // back to e2, 2s in (00:00:25:00 + 2)
+    expect(env.last().activeIndex).toBe(1);
+    expect(env.front().currentTime).toBeCloseTo(27, 6);
+    expect(env.front().hasFrame()).toBe(true);
+  });
+
+  it("seeking inside the edit on screen moves the same element (no swap)", () => {
+    const env = setup();
+    env.buffer.play();
+    const slot = env.last().frontSlot;
+    env.buffer.seek(4);
+    expect(env.last().frontSlot).toBe(slot);
+    expect(env.front().currentTime).toBeCloseTo(66, 6);
+  });
+
+  it("play after the end restarts from the first edit", () => {
+    const env = setup();
+    env.buffer.play();
+    run(env, 34);
+    expect(env.last().playing).toBe(false);
+    env.buffer.play();
+    expect(env.last().activeIndex).toBe(0);
+    expect(env.last().playing).toBe(true);
   });
 });

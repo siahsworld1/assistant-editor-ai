@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
-import { CornerDownLeft, GitBranch, Loader2, Sparkles } from "lucide-react";
+import { AlertTriangle, CornerDownLeft, GitBranch, Loader2, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/ae/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,8 +36,15 @@ const suggestions = [
 ];
 
 function ChatPage() {
-  const { versions, activeVersionId, setActiveVersion, runCommand, building, connection } =
-    useAE();
+  const {
+    versions,
+    activeVersionId,
+    setActiveVersion,
+    runCommand,
+    building,
+    connection,
+    directorNotice,
+  } = useAE();
   const [input, setInput] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -128,6 +135,17 @@ function ChatPage() {
                 </button>
               </div>
             ))}
+
+            {directorNotice && !building && (
+              <div
+                role="alert"
+                data-testid="director-notice"
+                className="panel flex items-start gap-2 border-warning/40 bg-warning/[0.06] p-4 text-sm text-warning"
+              >
+                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                <span>{directorNotice}</span>
+              </div>
+            )}
 
             {building && (
               <div className="panel flex items-center gap-2 p-4 text-sm text-muted-foreground">

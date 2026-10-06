@@ -3,6 +3,8 @@
 // Nothing in the UI binds to raw engine JSON — everything passes through here.
 
 import type {
+  AiTaskStatus,
+  AnalysisOutcome,
   AnalysisSummary,
   Clip,
   EditDecision,
@@ -313,6 +315,34 @@ export function extractBuildSummary(payload: unknown): { summary: string; change
   return { summary, changes };
 }
 
+/** Where the analysis stood when the Director was asked to build. */
+export type DirectorAnalysisStatus = "not-run" | "running" | "failed" | "partial" | "succeeded";
+
+export interface BuildStatus {
+  /** "blocked": nothing could be built — `message` says why (never "run
+   * Analyze first" when an analysis ran but its AI failed). Null for an
+   * engine that doesn't report it. */
+  status: "built" | "fallback" | "blocked" | null;
+  analysis: DirectorAnalysisStatus | null;
+  message: string | null;
+}
+
+export function extractBuildStatus(payload: unknown): BuildStatus {
+  const root = isRec(payload) ? payload : {};
+  const s = str(pick(root, "status"));
+  const status = s === "built" || s === "fallback" || s === "blocked" ? s : null;
+  const analysisRaw = pick(root, "analysis");
+  const a = isRec(analysisRaw) ? str(pick(analysisRaw, "status")) : "";
+  const analyses: DirectorAnalysisStatus[] = ["not-run", "running", "failed", "partial", "succeeded"];
+  const analysis = (analyses as string[]).includes(a) ? (a as DirectorAnalysisStatus) : null;
+  const message = isRec(analysisRaw) ? str(pick(analysisRaw, "message")) || null : null;
+  return {
+    status,
+    analysis,
+    message: status === "blocked" ? str(pick(root, "summary")) || message : message,
+  };
+}
+
 /* ------------------------- /analyze (optional body) ---------------------- */
 
 export interface AnalyzeResult {
@@ -369,6 +399,38 @@ function normalizeSummary(raw: Rec): Partial<AnalysisSummary> {
 
 /* --------------------- /project and /nle (optional) ---------------------- */
 
+const OUTCOMES: AnalysisOutcome[] = ["succeeded", "partial", "failed"];
+
+function normalizeOutcome(v: unknown): AnalysisOutcome | null {
+  const s = str(v);
+  return (OUTCOMES as string[]).includes(s) ? (s as AnalysisOutcome) : null;
+}
+
+/** Engine AI step status (worker/ai_status.py) → safe, typed fields only. */
+export function normalizeAiTask(raw: unknown): AiTaskStatus | null {
+  if (!isRec(raw)) return null;
+  const status = str(pick(raw, "status"));
+  if (status !== "succeeded" && status !== "failed" && status !== "not-applicable") return null;
+  const out: AiTaskStatus = { task: str(pick(raw, "task"), "unknown"), status };
+  for (const key of ["provider", "category", "message", "clipId", "filename"] as const) {
+    const v = str(pick(raw, key));
+    if (v) out[key] = v;
+  }
+  if (typeof raw["retryable"] === "boolean") out.retryable = raw["retryable"];
+  if (typeof raw["httpStatus"] === "number") out.httpStatus = raw["httpStatus"];
+  return out;
+}
+
+function normalizeAiMap(v: unknown): Record<string, AiTaskStatus> | undefined {
+  if (!isRec(v)) return undefined;
+  const out: Record<string, AiTaskStatus> = {};
+  for (const [task, raw] of Object.entries(v)) {
+    const entry = normalizeAiTask(raw);
+    if (entry) out[task] = entry;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 const CLIP_ROLES: Clip["role"][] = ["interview", "b-roll", "ambient"];
 const CLIP_STATES: Clip["state"][] = ["pending", "analyzing", "analyzed", "error"];
 
@@ -382,6 +444,8 @@ function normalizeClips(v: unknown): Clip[] {
     const thumbnailRelPath = str(pick(raw, "thumbnailRelPath", "thumbnail_rel_path"));
     // 0/absent means "no audio stream or not measured" — left undefined, never defaulted.
     const audioChannels = Math.floor(num(pick(raw, "audioChannels", "audio_channels"), 0));
+    const ai = normalizeAiMap(pick(raw, "ai"));
+    const aiStatus = normalizeOutcome(pick(raw, "aiStatus"));
     return {
       id: str(pick(raw, "id", "clipId"), `clip-${i + 1}`),
       filename: str(pick(raw, "filename", "name", "file", "path"), `clip-${i + 1}`),
@@ -400,6 +464,8 @@ function normalizeClips(v: unknown): Clip[] {
       hasTranscript: bool(pick(raw, "hasTranscript", "transcribed")),
       visualEvidenceCount: num(pick(raw, "visualEvidenceCount", "visualEvidence"), 0),
       technicalIssues: strList(pick(raw, "technicalIssues", "issues")),
+      ...(ai ? { ai } : {}),
+      ...(aiStatus ? { aiStatus } : {}),
       thumbHue: num(pick(raw, "thumbHue"), (i * 47) % 360),
       ...(note ? { note } : {}),
     } satisfies Clip;
@@ -507,6 +573,13 @@ export function normalizeProjectPatch(payload: unknown): Partial<ProjectBrain> {
     const analysisId = str(pick(root, "analysisId"));
     patch.analysisId = analysisId || null;
   }
+  // AI step outcome (worker/ai_status.py). Always replaced when the engine
+  // reports it, so a successful retry clears a previous failure.
+  if ("analysisOutcome" in root) patch.analysisOutcome = normalizeOutcome(root["analysisOutcome"]);
+  if (Array.isArray(root["aiIssues"])) {
+    patch.aiIssues = root["aiIssues"].map(normalizeAiTask).filter((e): e is AiTaskStatus => e !== null);
+  }
+  if ("analysisMessage" in root) patch.analysisMessage = str(root["analysisMessage"]) || null;
   // Always set (never conditionally omitted) so a resolved error clears on the next
   // successful poll instead of lingering in state after the user re-runs Analyze.
   if ("error" in root || "analysisState" in root || "state" in root) {

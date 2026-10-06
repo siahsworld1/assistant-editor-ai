@@ -48,7 +48,7 @@ function fmt(seconds: number): string {
 }
 
 /** MediaError.code -> a human explanation, since the DOM's default is a bare number. */
-function describeMediaError(err: MediaError | null): string {
+export function describeMediaError(err: MediaError | null): string {
   if (!err) return "Playback failed for an unknown reason.";
   switch (err.code) {
     case MediaError.MEDIA_ERR_ABORTED:

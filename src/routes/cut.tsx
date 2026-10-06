@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Download, Hammer, Loader2, Pause, Play } from "lucide-react";
 import { toast } from "sonner";
-import { MediaPlayer } from "@/components/ae/MediaPlayer";
+import { SequencePlayer } from "@/components/ae/SequencePlayer";
 import { useState } from "react";
 import {
   CutawayOverlay,
@@ -211,16 +211,7 @@ function CutPage() {
                   )}
                 </div>
                 <div className="relative mx-auto max-w-md">
-                  <MediaPlayer
-                    ref={playback.playerRef}
-                    src={playback.activeSegment?.src ?? null}
-                    startAtSeconds={playback.pendingStart}
-                    hideControls
-                    onTimeUpdate={playback.handleTimeUpdate}
-                    onDurationChange={playback.handleSegmentReady}
-                    onPlayStateChange={playback.handlePlayStateChange}
-                    onEnded={playback.handleEnded}
-                  />
+                  <SequencePlayer playback={playback} />
                   <CutawayOverlay
                     overlay={playback.overlay}
                     playheadSeconds={playback.playheadSeconds}

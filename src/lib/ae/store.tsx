@@ -256,6 +256,12 @@ interface AEContextValue {
   retryConnection: () => void;
   setMode: (mode: AppMode) => void;
   analyze: () => void;
+  /** Re-runs only the AI steps that failed in the loaded analysis — no proxy,
+   * thumbnail or metadata work (POST /analyze/retry-ai). */
+  retryAiAnalysis: () => void;
+  /** Why the Director couldn't build (analysis never run / still running /
+   * failed / incomplete) — shown instead of an empty version. */
+  directorNotice: string | null;
   chooseStory: (id: string) => void;
   audition: (id: string | null) => void;
   toggleStorySelect: (id: string) => void;
@@ -399,6 +405,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<SettingsState>(defaultSettings);
   const [targetSeconds, setTargetSeconds] = useState(360);
   const [building, setBuilding] = useState(false);
+  const [directorNotice, setDirectorNotice] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
 
   const storeRef = useRef<ProjectStore | null>(null);
@@ -1063,6 +1070,43 @@ export function AEProvider({ children }: { children: ReactNode }) {
     })();
   }, []);
 
+  const retryAiAnalysis = useCallback(() => {
+    const client = clientRef.current;
+    if (!client) return;
+    setProject((p) =>
+      p ? { ...p, analysisState: "running", analysisProgress: 5, analysisError: null } : p,
+    );
+    void (async () => {
+      // Like analyze(): this only starts the job; the polling effect above
+      // follows it through GET /project until the engine reports completion.
+      const refresh = async (error: string | null) => {
+        const patch = await client.getProjectPatch().catch(() => null);
+        setProject((p) =>
+          p
+            ? {
+                ...p,
+                ...(patch ?? {}),
+                analysisState: patch?.analysisState ?? "complete",
+                analysisError: error,
+              }
+            : p,
+        );
+      };
+      try {
+        const res = await client.retryAi();
+        if (!res.accepted) {
+          await refresh(
+            res.reason === "analysis-running"
+              ? "An analysis is already running — wait for it to finish."
+              : null,
+          );
+        }
+      } catch (err) {
+        await refresh(err instanceof Error ? err.message : "Retry request failed.");
+      }
+    })();
+  }, []);
+
   // Demo-only analysis animation.
   useEffect(() => {
     if (connection !== "demo") return;
@@ -1129,6 +1173,12 @@ export function AEProvider({ children }: { children: ReactNode }) {
             targetSeconds,
             command,
           });
+          if (result.status?.status === "blocked") {
+            // Nothing was built: say why instead of adding an empty version.
+            setDirectorNotice(result.status.message ?? result.summary);
+            return;
+          }
+          setDirectorNotice(null);
           pushVersion(command, prev.id, result);
         } else if (modeRef.current === "demo") {
           const { summary, changes, timeline } = commandResult(command, prev);
@@ -1224,6 +1274,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
       retryConnection,
       setMode,
       analyze,
+      retryAiAnalysis,
+      directorNotice,
       chooseStory: (id: string) => setChosenStoryId(id),
       audition: (id: string | null) => setAuditionId(id),
       toggleStorySelect: (id: string) =>
@@ -1264,6 +1316,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
       targetSeconds,
       building,
       analyze,
+      retryAiAnalysis,
+      directorNotice,
       runCommand,
       setMode,
       projects,

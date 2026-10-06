@@ -11,6 +11,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+import ai_status
+
 
 @dataclass
 class ClipState:
@@ -35,6 +37,16 @@ class ClipState:
     visual_evidence_count: int = 0
     technical_issues: list[str] = field(default_factory=list)
     note: str | None = None
+    # What happened to this clip's AI steps, keyed by task ("transcription",
+    # "visual-analysis") — see ai_status.py. `state` only says the clip itself
+    # was processed (metadata, proxy, thumbnail); a failed AI step is recorded
+    # here instead of being reported as analyzed evidence.
+    ai: dict = field(default_factory=dict)
+
+    def ai_outcome(self) -> str | None:
+        """'succeeded' | 'partial' | 'failed', or None when no AI status was
+        recorded (an analysis saved before AI status existed)."""
+        return ai_status.outcome(list(self.ai.values())) if self.ai else None
 
     def to_json(self) -> dict:
         d = {
@@ -55,6 +67,8 @@ class ClipState:
             "hasTranscript": self.has_transcript,
             "visualEvidenceCount": self.visual_evidence_count,
             "technicalIssues": self.technical_issues,
+            "ai": self.ai,
+            "aiStatus": self.ai_outcome(),
         }
         if self.note:
             d["note"] = self.note
@@ -76,6 +90,8 @@ class ProjectStore:
             self.visual_evidence: list[dict] = []  # {id, clipId, kind, label, atTc, confidence}
             self.selects: list[dict] = []
             self.stories: list[dict] = []
+            # Project-level AI steps ("selects", "stories") — see ai_status.py.
+            self.ai_tasks: dict = {}
             self.analysis_state = "idle"  # idle | running | complete | error
             self.analysis_progress = 0
             self.error: str | None = None
@@ -92,6 +108,15 @@ class ProjectStore:
             self.analysis_state = "running"
             self.analysis_progress = 2
 
+    def begin_retry(self):
+        """Re-enters "running" for a retry of failed AI steps WITHOUT resetting
+        the analysis — clips, proxies, thumbnails and every successful result
+        stay as they are."""
+        with self._lock:
+            self.analysis_state = "running"
+            self.analysis_progress = 5
+            self.error = None
+
     def set_progress(self, pct: int):
         with self._lock:
             self.analysis_progress = max(0, min(100, int(pct)))
@@ -105,11 +130,36 @@ class ProjectStore:
             self.analysis_state = "error"
             self.error = message
 
-    def complete(self):
+    def complete(self, keep_analysis_id: bool = False):
+        """keep_analysis_id: a retry of failed AI steps keeps the clips (and
+        their ids) the saved cuts were built on, so it keeps the analysis id."""
         with self._lock:
             self.analysis_state = "complete"
             self.analysis_progress = 100
-            self.analysis_id = uuid.uuid4().hex
+            if not (keep_analysis_id and self.analysis_id):
+                self.analysis_id = uuid.uuid4().hex
+
+    def ai_entries(self) -> list[dict]:
+        """Every recorded AI step of this analysis, clip steps first."""
+        with self._lock:
+            entries = []
+            for clip in self.clips.values():
+                for entry in clip.ai.values():
+                    entries.append({**entry, "clipId": clip.id, "filename": clip.filename})
+            entries.extend(self.ai_tasks.values())
+            return entries
+
+    def analysis_outcome(self) -> str | None:
+        """None until an analysis completes (or for one saved before AI status
+        was recorded); then 'succeeded' | 'partial' | 'failed'."""
+        with self._lock:
+            if self.analysis_state != "complete":
+                return None
+            entries = self.ai_entries()
+            return ai_status.outcome(entries) if entries else None
+
+    def ai_issues(self) -> list[dict]:
+        return [e for e in self.ai_entries() if e.get("status") == "failed"]
 
     def snapshot_summary(self) -> dict:
         with self._lock:
@@ -133,6 +183,13 @@ class ProjectStore:
                 "analysisState": self.analysis_state,
                 "analysisProgress": self.analysis_progress,
                 "analysisId": self.analysis_id,
+                # Whether the AI steps of a completed analysis all worked
+                # (worker/ai_status.py): 'succeeded' | 'partial' | 'failed', or
+                # None while running / for an analysis saved before this existed.
+                "analysisOutcome": self.analysis_outcome(),
+                "aiIssues": self.ai_issues(),
+                "aiTasks": dict(self.ai_tasks),
+                "analysisMessage": ai_status.headline(self.analysis_outcome() or "succeeded", self.ai_issues()),
                 # The evidence WATCH's Clip Inspector shows. Previously only
                 # per-clip counts were sent, so the inspector reported "No
                 # dialogue detected" / "Nothing logged yet" for every clip even

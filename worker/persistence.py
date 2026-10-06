@@ -67,6 +67,9 @@ def save_snapshot(store: ProjectStore) -> Path | None:
             "visualEvidence": store.visual_evidence,
             "selects": store.selects,
             "stories": store.stories,
+            # Status of the project-level AI steps (selects, stories); per-clip
+            # AI status travels inside each clip. See ai_status.py.
+            "aiTasks": store.ai_tasks,
         }
         dest = snapshot_path(store.media_root)
     partial = dest.with_name(dest.name + ".partial")
@@ -119,6 +122,8 @@ def restore_snapshot(store: ProjectStore, project_id: str | None, media_root: st
         store.visual_evidence = list(data.get("visualEvidence") or [])
         store.selects = list(data.get("selects") or [])
         store.stories = list(data.get("stories") or [])
+        ai_tasks = data.get("aiTasks")
+        store.ai_tasks = dict(ai_tasks) if isinstance(ai_tasks, dict) else {}
         store.analysis_id = data.get("analysisId")
         store.analysis_state = "complete"
         store.analysis_progress = 100

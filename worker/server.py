@@ -79,6 +79,35 @@ def analyze():
     return jsonify({"accepted": True, "state": "running", "progress": STORE.analysis_progress or 2})
 
 
+@app.route("/analyze/retry-ai", methods=["POST", "OPTIONS"])
+def retry_ai():
+    """Re-runs only the AI steps that failed in the loaded analysis (see
+    pipeline.retry_failed_ai) — no re-probe, proxy or thumbnail work."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if STORE.analysis_state != "complete":
+        return jsonify({"accepted": False, "reason": "no-completed-analysis", "state": STORE.analysis_state})
+    pending = pipeline.failed_ai_steps()
+    project_failed = [t for t, e in STORE.ai_tasks.items() if e.get("status") == "failed"]
+    if not pending and not project_failed:
+        return jsonify({"accepted": False, "reason": "nothing-to-retry", "state": STORE.analysis_state})
+    if not _analysis_lock.acquire(blocking=False):
+        return jsonify({"accepted": False, "reason": "analysis-running", "state": STORE.analysis_state})
+
+    def run():
+        try:
+            pipeline.retry_failed_ai()
+        finally:
+            _analysis_lock.release()
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({
+        "accepted": True,
+        "state": "running",
+        "retrying": [{"clipId": c, "task": t} for c, t in pending] + [{"task": t} for t in project_failed],
+    })
+
+
 @app.route("/selects", methods=["GET"])
 def selects():
     return jsonify({"selects": STORE.selects})
