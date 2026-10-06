@@ -30,6 +30,17 @@ SNAPSHOT_NAME = ".ae_analysis.json"
 SCHEMA_VERSION = 1
 MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024
 
+# Analysis persistence is ON for every normal worker. Set to "0" for runs that
+# must leave the project's saved state alone — worker/validate_e2e.py does, so
+# validating real footage never replaces the .ae_analysis.json (and with it the
+# analysisId) a real project and its saved cuts depend on. When off, the worker
+# neither writes nor reads snapshots.
+PERSIST_ENV = "ASSISTANT_EDITOR_PERSIST_ANALYSIS"
+
+
+def persistence_enabled() -> bool:
+    return os.environ.get(PERSIST_ENV, "1") != "0"
+
 _CLIP_FIELDS = {f.name for f in fields(ClipState)}
 
 
@@ -39,6 +50,9 @@ def snapshot_path(media_root: str) -> Path:
 
 def save_snapshot(store: ProjectStore) -> Path | None:
     """Writes the completed analysis atomically. Never raises."""
+    if not persistence_enabled():
+        log.info("analysis persistence is off for this run — not writing %s", SNAPSHOT_NAME)
+        return None
     with store._lock:  # noqa: SLF001 - single-process, consistent snapshot
         if store.analysis_state != "complete" or not store.media_root:
             return None
@@ -69,6 +83,8 @@ def save_snapshot(store: ProjectStore) -> Path | None:
 def restore_snapshot(store: ProjectStore, project_id: str | None, media_root: str) -> dict:
     """Loads a saved analysis for `media_root` into `store` if — and only if —
     it still matches the media on disk. Returns {"restored": bool, "reason": str}."""
+    if not persistence_enabled():
+        return {"restored": False, "reason": "persistence-disabled"}
     path = snapshot_path(media_root)
     if not path.is_file():
         return {"restored": False, "reason": "no-saved-analysis"}

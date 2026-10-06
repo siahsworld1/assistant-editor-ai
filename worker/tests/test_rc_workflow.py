@@ -154,6 +154,38 @@ class TestSavedAnalysis(_MediaFolderCase):
         self.assertEqual(again["reason"], "already-loaded")
 
 
+class TestNormalAnalysisStillPersists(_MediaFolderCase):
+    """The validator turns persistence off for itself only: a normal analysis
+    run through the real pipeline still saves (and can restore) its snapshot."""
+
+    def setUp(self):
+        super().setUp()
+        STORE.reset()
+        os.environ.pop(persistence.PERSIST_ENV, None)
+
+    def tearDown(self):
+        os.environ.pop(persistence.PERSIST_ENV, None)
+        super().tearDown()
+
+    def test_a_normal_analysis_saves_a_restorable_snapshot(self):
+        pipeline.run_analysis("proj-normal", str(self.root))
+        self.assertEqual(STORE.analysis_state, "complete", STORE.error)
+        saved = self.root / persistence.SNAPSHOT_NAME
+        self.assertTrue(saved.is_file())
+        analysis_id = STORE.analysis_id
+        STORE.reset()
+        res = persistence.restore_snapshot(STORE, "proj-normal", str(self.root))
+        self.assertTrue(res["restored"], res)
+        self.assertEqual(STORE.analysis_id, analysis_id)
+
+    def test_with_persistence_off_nothing_is_written_or_read(self):
+        os.environ[persistence.PERSIST_ENV] = "0"
+        pipeline.run_analysis("proj-off", str(self.root))
+        self.assertEqual(STORE.analysis_state, "complete", STORE.error)
+        self.assertFalse((self.root / persistence.SNAPSHOT_NAME).exists())
+        self.assertEqual(persistence.restore_snapshot(STORE, "p", str(self.root))["reason"], "persistence-disabled")
+
+
 class TestSourceFrames(_MediaFolderCase):
     def test_returns_real_cached_frames_at_the_requested_source_times(self):
         import server

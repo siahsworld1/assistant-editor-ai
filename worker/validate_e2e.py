@@ -72,6 +72,16 @@ REPO_ROOT = WORKER_DIR.parent
 # any relative paths behave exactly like a normal run of the worker.
 os.chdir(WORKER_DIR)
 
+# Validation must never change a real project's state. The real pipeline saves
+# its analysis next to the footage (<media-root>/.ae_analysis.json, see
+# persistence.py); a validation run over a real project's folder replaced it,
+# changing the analysisId and so — correctly — orphaning that project's saved
+# cuts. Persistence is switched off for this process BEFORE the worker is
+# imported: the validator exercises the full pipeline but never writes or reads
+# the project's saved analysis. (Proxies/thumbnails it shares are keyed by each
+# source's identity, so reusing or recreating them can't invalidate a project.)
+os.environ["ASSISTANT_EDITOR_PERSIST_ANALYSIS"] = "0"
+
 import media  # noqa: E402
 
 

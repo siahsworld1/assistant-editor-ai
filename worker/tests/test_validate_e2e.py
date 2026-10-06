@@ -58,8 +58,11 @@ def _free_port() -> int:
     return port
 
 
-def _run_validator(media_root: str, out_dir: Path, port: int, extra_args: list[str] | None = None) -> subprocess.CompletedProcess:
+def _run_validator(
+    media_root: str, out_dir: Path, port: int, extra_args: list[str] | None = None, env_extra: dict | None = None,
+) -> subprocess.CompletedProcess:
     env = dict(os.environ)
+    env.update(env_extra or {})
     env.pop("OPENAI_API_KEY", None)
     env.pop("ANTHROPIC_API_KEY", None)
     # Popping the keys alone isn't enough: the validator imports server.py,
@@ -129,6 +132,47 @@ class TestValidateE2eHarness(unittest.TestCase):
         # stage) and not PASS (there's nothing real to check).
         for name in ("stories", "decisions", "preview", "export"):
             self.assertEqual(_stage_status(report, name), "SKIP", f"stage {name} should SKIP with no selects:\n{report}")
+
+    def test_never_touches_a_real_projects_saved_analysis_or_app_state(self):
+        """Regression: validating a real project's folder replaced its
+        .ae_analysis.json — a new analysisId — which (correctly) orphaned the
+        project's saved cuts. The validator must leave all project state alone
+        while still running the full pipeline."""
+        import hashlib
+
+        snapshot = self.footage / ".ae_analysis.json"
+        original = json.dumps({"schema": 1, "analysisId": "real-project-analysis", "clips": []}).encode()
+        snapshot.write_bytes(original)
+        home = self.tmp / "home"
+        app_data = home / "Library" / "Application Support" / "Assistant Editor AI"
+        (app_data / "edit-state").mkdir(parents=True)
+        edit_state = app_data / "edit-state" / "proj-1.json"
+        edit_state.write_text(json.dumps({"schema": 1, "analysisId": "real-project-analysis", "versions": [{"id": "v2"}]}))
+        app_state = app_data / "app-state.json"
+        app_state.write_text(json.dumps({"activeProjectId": "proj-1"}))
+
+        def digest(root: Path) -> dict:
+            return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob("*")) if p.is_file()}
+
+        app_before = digest(home)
+        import site
+
+        # A throwaway HOME (so the real app's userData can't even be reached),
+        # keeping Python's user site-packages where the worker's deps live.
+        env_extra = {"HOME": str(home), "PYTHONUSERBASE": site.getuserbase()}
+        proc = _run_validator(str(self.footage), self.out_dir, _free_port(), env_extra=env_extra)
+
+        self.assertEqual(snapshot.read_bytes(), original, "the project's saved analysis was modified")
+        self.assertEqual(digest(home), app_before, "app userData (edit state / app state) was modified")
+        report = json.loads((self.out_dir / "report.json").read_text())
+        for name in ("import_footage", "worker_startup", "analyze_run", "proxies"):
+            self.assertEqual(_stage_status(report, name), "PASS", f"stage {name}:\n{proc.stdout[-2000:]}")
+
+    def test_does_not_create_a_saved_analysis_where_none_existed(self):
+        proc = _run_validator(str(self.footage), self.out_dir, _free_port())
+        report = json.loads((self.out_dir / "report.json").read_text())
+        self.assertEqual(_stage_status(report, "analyze_run"), "PASS", proc.stdout[-2000:])
+        self.assertFalse((self.footage / ".ae_analysis.json").exists())
 
     def test_fails_fast_and_clearly_on_a_nonexistent_media_root(self):
         bogus_root = str(self.tmp / "does-not-exist")
