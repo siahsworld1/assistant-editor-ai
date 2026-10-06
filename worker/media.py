@@ -490,6 +490,11 @@ def tc_to_seconds(tc: str, fps: float = 24.0) -> float | None:
     parts = tc.strip().split(":")
     if len(parts) not in (3, 4):
         return None
+    # Digits only: int() alone would accept "-00"/"+05"/" 5" — e.g. it read
+    # "-00:00:01:00" as a valid 1.0s, silently dropping the sign. Matches the
+    # app's own export gate (src/lib/nle/timecode.ts TC_RE, digits only).
+    if not all(p.isascii() and p.isdigit() for p in parts):
+        return None
     try:
         nums = [int(p) for p in parts]
     except ValueError:

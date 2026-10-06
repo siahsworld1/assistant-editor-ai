@@ -875,6 +875,63 @@ describe("buildXmeml — real Premiere test #7: stereo source audio", () => {
   });
 });
 
+// P0 Step 4: worker/pipeline.py::_validate_decisions now derives every
+// decision's durationSeconds from sourceOut - sourceIn (at the CLIP's fps) and
+// lays lanes out without overlap. This pins the downstream half: given such
+// decisions, each clipitem's sequence span (<end>-<start> at 24fps) and source
+// span (<out>-<in> at the clip's 23.976) describe the same real time within one
+// frame — i.e. Premiere sees no implied speed change.
+describe("buildXmeml — source-range-authoritative durations (P0 Step 4)", () => {
+  it("keeps sequence span and source span in agreement for a 23.976 source in a 24fps sequence", () => {
+    const fps = 23.976;
+    const clip = { ...makeClip("clip-681", "18C_0681.MP4", "18C_0681.MP4", fps), resolution: "3840x2160", audioChannels: 2 };
+    const tc = (s: number, f: number) => `00:00:${String(s).padStart(2, "0")}:${String(f).padStart(2, "0")}`;
+    // [in, out] as (seconds, frame) pairs — including non-zero frame fields.
+    const ranges: Array<[[number, number], [number, number]]> = [
+      [[5, 0], [25, 0]],
+      [[1, 5], [4, 17]],
+      [[26, 12], [29, 3]],
+      [[10, 0], [10, 1]], // a single frame
+    ];
+    let cursor = 0;
+    const decisions = ranges.map(([[is, iff], [os, of]], i) => {
+      const inS = is + iff / fps;
+      const outS = os + of / fps;
+      const d = {
+        id: `e${i + 1}`,
+        lane: "interview" as const,
+        clipId: clip.id,
+        label: `e${i + 1}`,
+        sourceInTc: tc(is, iff),
+        sourceOutTc: tc(os, of),
+        timelineStartSeconds: cursor,
+        durationSeconds: Math.round((outS - inS) * 1e6) / 1e6, // exactly what the worker now emits
+      };
+      cursor += d.durationSeconds;
+      return d;
+    });
+    const tl = { ...makeTimeline(decisions), totalSeconds: cursor };
+    const { usable } = validateTimelineForExport(tl, [clip]);
+    expect(usable).toHaveLength(ranges.length);
+    const { xml, warnings } = buildXmeml(tl, usable, [clip], MEDIA_ROOT);
+    expect(warnings).toEqual([]);
+
+    const items = [...xml.matchAll(/<clipitem id="([^"]+)"[^>]*>[\s\S]*?<start>(\d+)<\/start>\s*<end>(\d+)<\/end>\s*<in>(\d+)<\/in>\s*<out>(\d+)<\/out>/g)];
+    expect(items).toHaveLength(ranges.length * 3); // V1 + both stereo channels per event
+    const oneSourceFrame = 1 / fps;
+    let previousEnd: Record<string, number> = {};
+    for (const [, id, start, end, inF, outF] of items) {
+      const sequenceSeconds = (Number(end) - Number(start)) / 24;
+      const sourceSeconds = (Number(outF) - Number(inF)) / fps;
+      expect(Math.abs(sequenceSeconds - sourceSeconds), `${id}: sequence ${sequenceSeconds}s vs source ${sourceSeconds}s`).toBeLessThanOrEqual(oneSourceFrame);
+      // Back-to-back on each track: no gaps, no overlaps.
+      const track = id!.replace(/-e\d+/, "");
+      if (previousEnd[track] !== undefined) expect(Number(start)).toBe(previousEnd[track]);
+      previousEnd = { ...previousEnd, [track]: Number(end) };
+    }
+  });
+});
+
 function linksReferencing(xml: string, id: string): number {
   return [...xml.matchAll(/<linkclipref>([^<]+)<\/linkclipref>/g)].filter((m) => m[1] === id).length;
 }

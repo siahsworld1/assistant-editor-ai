@@ -16,6 +16,7 @@ an API key, or the network at all.
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import tempfile
 import traceback
@@ -419,11 +420,34 @@ def _generate_stories(reasoning_provider: ReasoningProvider | None = None):
     STORE.stories = stories
 
 
+# How far past a clip's measured end a model-supplied out point may land and
+# still be treated as tail rounding (then clamped to the real end) rather than
+# a hallucinated range (dropped).
+SOURCE_TAIL_TOLERANCE_SECONDS = 0.5
+
+
 def _validate_decisions(decisions: list, clips: dict) -> tuple[list, list[str]]:
-    """Drops any decision that doesn't reference a real, known clip or whose
-    source in/out timecodes don't parse or fall outside that clip's actual
-    duration. This is the "validated edit decisions" gate — nothing downstream
-    (preview, export) should ever see a decision that wasn't checked here."""
+    """The "validated edit decisions" gate — nothing downstream (preview,
+    export) should ever see a decision that wasn't checked AND normalized here.
+
+    Drops any decision that references an unknown clip, has unparsable source
+    timecodes, an empty/inverted/negative source range, or a range outside the
+    clip's real media. For everything kept, the SOURCE RANGE is authoritative:
+
+      - durationSeconds is always re-derived as sourceOut - sourceIn. The model
+        returns durationSeconds separately, and exporters place an event on the
+        timeline from durationSeconds but read the media from in/out; when the
+        two disagree, an NLE imports an implicit speed change (a 20s source
+        range in a 12s slot plays at 1.66x) — audio drifts, sync breaks.
+      - Timecodes are parsed at the CLIP's own fps (a 23.976 source's frame
+        field means 1/23.976s, never 1/24s), exactly as before.
+      - An out point a hair past the clip's end (tail rounding) is clamped to
+        the clip's last frame instead of pointing past the media.
+      - Re-derived durations can make events on one lane overlap; see
+        _resolve_lane_overlaps().
+
+    Every material correction is reported in the returned warnings, which
+    build_timeline() surfaces in the version's change notes."""
     valid: list = []
     warnings: list[str] = []
     for i, d in enumerate(decisions):
@@ -436,22 +460,84 @@ def _validate_decisions(decisions: list, clips: dict) -> tuple[list, list[str]]:
             warnings.append(f"Dropped '{label}': references unknown clipId '{clip_id}'.")
             continue
         fps = clip.fps or 24.0
-        in_s = media.tc_to_seconds(str(d.get("sourceInTc", "")), fps)
-        out_s = media.tc_to_seconds(str(d.get("sourceOutTc", "")), fps)
+        in_tc = str(d.get("sourceInTc", ""))
+        out_tc = str(d.get("sourceOutTc", ""))
+        in_s = media.tc_to_seconds(in_tc, fps)
+        out_s = media.tc_to_seconds(out_tc, fps)
         if in_s is None or out_s is None:
+            # Also covers negative timecodes: tc_to_seconds rejects them.
             warnings.append(f"Dropped '{label}': unparsable source timecode.")
             continue
         if out_s <= in_s:
             warnings.append(f"Dropped '{label}': source out is not after source in.")
             continue
-        # Small tolerance for rounding at the tail of a clip.
-        if clip.duration_seconds > 0 and out_s > clip.duration_seconds + 0.5:
+        clip_end = clip.duration_seconds
+        if clip_end > 0:
+            if in_s >= clip_end:
+                warnings.append(f"Dropped '{label}': source in ({in_s:.1f}s) is at or past the clip's end ({clip_end:.1f}s).")
+                continue
+            if out_s > clip_end + SOURCE_TAIL_TOLERANCE_SECONDS:
+                warnings.append(
+                    f"Dropped '{label}': source out ({out_s:.1f}s) exceeds clip duration ({clip_end:.1f}s)."
+                )
+                continue
+            if out_s > clip_end:
+                # Floor to a whole frame at the clip's rate so the clamped
+                # out point is a real frame that exists in the media.
+                out_tc = media.seconds_to_tc(clip_end, fps)
+                out_s = media.tc_to_seconds(out_tc, fps)
+                if out_s is None or out_s <= in_s:
+                    warnings.append(f"Dropped '{label}': nothing left of the source range after clamping to the clip's end.")
+                    continue
+                warnings.append(f"Trimmed '{label}': source out clamped to the clip's last frame ({out_tc}).")
+
+        duration = round(out_s - in_s, 6)
+        claimed = d.get("durationSeconds")
+        if isinstance(claimed, (int, float)) and abs(float(claimed) - duration) > 0.5 / fps:
             warnings.append(
-                f"Dropped '{label}': source out ({out_s:.1f}s) exceeds clip duration ({clip.duration_seconds:.1f}s)."
+                f"Corrected '{label}': duration {float(claimed):.2f}s didn't match its source range; "
+                f"using {duration:.2f}s from source in/out."
             )
-            continue
-        valid.append(d)
-    return valid, warnings
+        valid.append({**d, "sourceInTc": in_tc, "sourceOutTc": out_tc, "durationSeconds": duration})
+
+    return _resolve_lane_overlaps(valid, warnings), warnings
+
+
+def _resolve_lane_overlaps(decisions: list, warnings: list[str]) -> list:
+    """Keeps events on the same lane from overlapping once durations come from
+    the source range. Within a lane, events are taken in timeline order; one
+    that starts before the previous event ends is moved to start exactly where
+    it ends (reported). A missing/negative/non-numeric start is placed after
+    the lane's last event — which is also how the deterministic fallback
+    assembly gets laid out back-to-back. Gaps are left as the model placed
+    them; lanes never affect each other. Input order is preserved."""
+    def start_of(d) -> float | None:
+        v = d.get("timelineStartSeconds")
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        v = float(v)
+        return v if math.isfinite(v) and v >= 0 else None
+
+    placed: dict[int, float] = {}
+    by_lane: dict[str, list[int]] = {}
+    for idx, d in enumerate(decisions):
+        by_lane.setdefault(str(d.get("lane", "interview")), []).append(idx)
+    for lane, idxs in by_lane.items():
+        timed = sorted((i for i in idxs if start_of(decisions[i]) is not None), key=lambda i: start_of(decisions[i]))
+        untimed = [i for i in idxs if start_of(decisions[i]) is None]
+        end = 0.0
+        for i in timed + untimed:
+            d = decisions[i]
+            wanted = start_of(d)
+            start = end if wanted is None else max(wanted, end)
+            if wanted is not None and start - wanted > 1e-6:
+                warnings.append(
+                    f"Moved '{d.get('label', 'event')}' from {wanted:.2f}s to {start:.2f}s so it doesn't overlap "
+                    f"the previous {lane} event."
+                )
+            placed[i] = round(start, 6)
+            end = start + float(d["durationSeconds"])
+    return [{**d, "timelineStartSeconds": placed[i]} for i, d in enumerate(decisions)]
 
 
 def build_timeline(
@@ -517,9 +603,11 @@ def build_timeline(
         log.warning("build_timeline: model result had zero valid decisions (%s); using fallback", warnings)
 
     # Deterministic fallback: lay the story's selects back-to-back in beat order so
-    # /build always returns something usable even if the model call fails.
+    # /build always returns something usable even if the model call fails. No
+    # timeline position is set here: _validate_decisions() derives each event's
+    # duration from its frame-exact source range and places it right after the
+    # previous one, so the layout can never disagree with the in/out points.
     decisions = []
-    cursor = 0.0
     ordered_ids = [sid for beat in story["beats"] for sid in beat["selectIds"]] or list(selects_by_id.keys())
     for i, sid in enumerate(ordered_ids):
         sel = selects_by_id.get(sid)
@@ -533,12 +621,9 @@ def build_timeline(
                 "label": f"{sel['speaker']} — {sel['transcriptExcerpt'][:40]}",
                 "sourceInTc": sel["startTc"],
                 "sourceOutTc": sel["endTc"],
-                "timelineStartSeconds": round(cursor, 1),
-                "durationSeconds": sel["durationSeconds"],
                 "selectId": sid,
             }
         )
-        cursor += sel["durationSeconds"]
     validated, warnings = _validate_decisions(decisions, clips)
     return {
         "summary": f"Assembled '{story['title']}' from {len(validated)} selects (fallback assembly — the reasoning model was unavailable or returned nothing valid).",
