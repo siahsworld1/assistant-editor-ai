@@ -19,6 +19,7 @@ class ClipState:
     camera: str
     resolution: str
     fps: float
+    audio_channels: int = 0  # 0 = no audio stream / not measured
     rel_path: str = ""
     proxy_rel_path: str = ""
     thumbnail_rel_path: str = ""
@@ -42,6 +43,7 @@ class ClipState:
             "camera": self.camera,
             "resolution": self.resolution,
             "fps": self.fps,
+            "audioChannels": self.audio_channels,
             "speakers": self.speakers,
             "state": self.state,
             "progress": self.progress,

@@ -129,8 +129,8 @@ def _ffprobe_failure(reason: str) -> dict:
     legitimately quiet file — every other field here is just a safe default, not
     a real measurement, and must never be presented to the user as one."""
     return {
-        "duration": 0.0, "resolution": "—", "fps": 24.0, "has_audio": False, "camera": "—",
-        "ok": False, "probeError": reason[:300],
+        "duration": 0.0, "resolution": "—", "fps": 24.0, "has_audio": False, "audio_channels": 0,
+        "camera": "—", "ok": False, "probeError": reason[:300],
     }
 
 
@@ -141,6 +141,13 @@ def _run_ffprobe_once(path: Path, timeout: float) -> subprocess.CompletedProcess
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         capture_output=True, text=True, timeout=timeout,
     )
+
+
+def _int_or_zero(value) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def ffprobe_info(path: Path) -> dict:
@@ -234,6 +241,10 @@ def ffprobe_info(path: Path) -> dict:
         "resolution": resolution,
         "fps": fps,
         "has_audio": audio is not None,
+        # Real channel count of the first audio stream (0 = no audio stream).
+        # The XMEML exporter needs this to describe a stereo source as stereo —
+        # see src/lib/nle/xmeml.ts. Never defaulted: unknown stays 0.
+        "audio_channels": _int_or_zero((audio or {}).get("channels")),
         "camera": camera,
         "ok": True,
         "probeError": None,

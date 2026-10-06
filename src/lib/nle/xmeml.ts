@@ -76,6 +76,13 @@
 // clipitem actually draws from. Fixed via sourceTrackXml()/clipItemXml()
 // below — see the real-test-#6 comment on sourceTrackXml() for the DTD
 // citation and the real Premiere-XML precedent this was checked against.
+// (7) With <sourcetrack> in place, A1 played "static/hiss": the real source
+// (18C_0681.MP4, AAC stereo) has its dialogue only on channel 2, and the
+// single A1 clipitem's <trackindex>1 told Premiere to play channel 1 only.
+// Fixed by reproducing the source's real channel layout the way Premiere's
+// own export does (exploded stereo track pair, one clipitem per channel,
+// <channelcount>, sequence <outputs>) — see the real-test-#7 comment above
+// LinkRef below.
 
 import type { Clip, EditDecisionLane, UniversalTimeline } from "../ae/types";
 // Explicit ".ts" extensions — see the comment on the equivalent import in
@@ -303,44 +310,122 @@ function audioSamplecharacteristics(indent: string): string {
 // referencing a <file> that also carries the other type) exists for V1 too
 // whenever a source clip has embedded audio; it just happened not to
 // manifest as a symptom yet.
-function sourceTrackXml(mediaType: "video" | "audio", indent: string): string {
-  return [`${indent}<sourcetrack>`, `${indent}  <mediatype>${mediaType}</mediatype>`, `${indent}  <trackindex>1</trackindex>`, `${indent}</sourcetrack>`].join(
-    "\n",
-  );
-}
-
-/** A clipitem's <link> pairing to its synced counterpart on another track —
- * DTD: <!ELEMENT link (mediatype | trackindex | clipindex | groupindex |
- * linkclipref)*>. Both the video and the audio clipitem of a synced pair each
- * carry two <link> blocks: one referencing themselves, one referencing their
- * partner — this is what makes an NLE move/trim/delete them together instead
- * of treating the video and its own production audio as unrelated events. */
-interface LinkPartner {
-  selfId: string;
-  selfMediaType: "video" | "audio";
-  selfTrackIndex: number;
-  partnerId: string;
-  partnerMediaType: "video" | "audio";
-  partnerTrackIndex: number;
-  clipIndex: number;
-  groupIndex: number;
-}
-
-function linkBlockXml(link: LinkPartner, indent: string): string {
-  const one = (linkclipref: string, mediatype: string, trackindex: number) =>
-    [
-      `${indent}<link>`,
-      `${indent}  <linkclipref>${linkclipref}</linkclipref>`,
-      `${indent}  <mediatype>${mediatype}</mediatype>`,
-      `${indent}  <trackindex>${trackindex}</trackindex>`,
-      `${indent}  <clipindex>${link.clipIndex}</clipindex>`,
-      `${indent}  <groupindex>${link.groupIndex}</groupindex>`,
-      `${indent}</link>`,
-    ].join("\n");
+//
+// Real Premiere test #7 refined the trackindex part of this: for audio,
+// <trackindex> selects the SOURCE CHANNEL, so "always 1" meant "channel 1
+// only" for a stereo source. It's now the channel this clipitem carries — see
+// the real-test-#7 comment above LinkRef.
+function sourceTrackXml(mediaType: "video" | "audio", trackIndex: number, indent: string): string {
   return [
-    one(link.selfId, link.selfMediaType, link.selfTrackIndex),
-    one(link.partnerId, link.partnerMediaType, link.partnerTrackIndex),
+    `${indent}<sourcetrack>`,
+    `${indent}  <mediatype>${mediaType}</mediatype>`,
+    `${indent}  <trackindex>${trackIndex}</trackindex>`,
+    `${indent}</sourcetrack>`,
   ].join("\n");
+}
+
+// Real Premiere test #7 (on top of 65d0c47): A1 imported with waveforms but
+// played "mostly static/hiss/extremely quiet". Measured with ffprobe/astats,
+// the real source (18C_0681.MP4, AAC stereo 48kHz) carries its dialogue ONLY
+// on source channel 2 (RMS -24 dB); channel 1 is a near-silent input (RMS
+// -69.6 dB, hiss). Premiere's own direct import of that file is a single
+// Stereo clip, L->L / R->R. This exporter emitted ONE audio clipitem with
+// <sourcetrack><trackindex>1</trackindex> and no <channelcount> — i.e. "source
+// channel 1 only" — which is exactly the hiss channel the user heard.
+//
+// The fix mirrors how Premiere's OWN XMEML export represents a stereo source
+// (Premiere-exported fixtures premiere_example.xml / premiere_generators.xml
+// in OpenTimelineIO's FCP-XML adapter test data), not a hard-coded channel:
+//   - <file><media><audio> declares the real <channelcount> (ffprobe-measured,
+//     Clip.audioChannels);
+//   - a stereo sequence track is "exploded" into two XML <track>s with
+//     premiereTrackType="Stereo", currentExplodedTrackIndex 0/1,
+//     totalExplodedTrackCount 2 and <outputchannelindex> 1/2;
+//   - a stereo source becomes TWO clipitems (premiereChannelType="stereo"),
+//     one per exploded track, with <sourcetrack><trackindex> 1 and 2 — both
+//     channels preserved, routed L->1 / R->2 exactly like the source; a mono
+//     source is ONE clipitem (premiereChannelType="mono") on exploded track 0;
+//   - the sequence <audio> declares <numOutputChannels>2 and an <outputs>
+//     block of two one-channel groups;
+//   - the video clipitem links to itself plus every audio channel clipitem,
+//     and each audio channel clipitem carries the same full set of links, with
+//     <clipindex> = the clip's 1-based position on that link's track and
+//     <groupindex>1 (the source's single audio channel group) on audio links.
+// No channel is chosen as "the dialogue channel" — the source's own layout is
+// reproduced, and the editor mixes it in Premiere as they would the original.
+
+/** One <link> entry — DTD: <!ELEMENT link (linkclipref | mediatype |
+ * trackindex | clipindex | groupindex)*>. Every clipitem of a synced group
+ * (V1 picture + each of its audio channels) carries the SAME full list, which
+ * is what makes an NLE move/trim/delete them together. */
+interface LinkRef {
+  id: string;
+  mediaType: "video" | "audio";
+  /** 1-based index among the sequence's tracks of that media type. */
+  trackIndex: number;
+  /** 1-based position of this clipitem within its own track. */
+  clipIndex: number;
+  /** Present on audio links only (Premiere omits it on the video link). */
+  groupIndex?: number;
+}
+
+/** Sequence-level <outputs>: one single-channel group per output channel,
+ * exactly the shape Premiere exports for a stereo sequence. */
+function sequenceOutputsXml(indent: string): string {
+  const groups = Array.from({ length: EXPLODED_STEREO_TRACKS }, (_, i) =>
+    [
+      `${indent}  <group>`,
+      `${indent}    <index>${i + 1}</index>`,
+      `${indent}    <numchannels>1</numchannels>`,
+      `${indent}    <downmix>0</downmix>`,
+      `${indent}    <channel>`,
+      `${indent}      <index>${i + 1}</index>`,
+      `${indent}    </channel>`,
+      `${indent}  </group>`,
+    ].join("\n"),
+  );
+  return [`${indent}<outputs>`, ...groups, `${indent}</outputs>`].join("\n");
+}
+
+function linksXml(links: readonly LinkRef[], indent: string): string {
+  return links
+    .map((l) =>
+      [
+        `${indent}<link>`,
+        `${indent}  <linkclipref>${l.id}</linkclipref>`,
+        `${indent}  <mediatype>${l.mediaType}</mediatype>`,
+        `${indent}  <trackindex>${l.trackIndex}</trackindex>`,
+        `${indent}  <clipindex>${l.clipIndex}</clipindex>`,
+        ...(l.groupIndex !== undefined ? [`${indent}  <groupindex>${l.groupIndex}</groupindex>`] : []),
+        `${indent}</link>`,
+      ].join("\n"),
+    )
+    .join("\n");
+}
+
+/** Premiere represents a stereo sequence track as this many XML <track>s. */
+const EXPLODED_STEREO_TRACKS = 2;
+
+/** The source's real audio channel count, or undefined when unknown (no audio
+ * stream, or metadata from a worker that predates Clip.audioChannels). */
+function sourceAudioChannels(clip: Clip | undefined): number | undefined {
+  const n = clip?.audioChannels;
+  return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/** How many channel clipitems (1 or 2) a source gets on an exploded stereo
+ * pair. Unknown layouts keep the pre-#7 single-clipitem shape rather than
+ * guessing; >2 channels can't be represented on one stereo pair, so channels
+ * 1-2 are exported and the rest are reported, never silently dropped. */
+function exportedChannelCount(clip: Clip | undefined, name: string, warnings: string[]): 1 | 2 {
+  const n = sourceAudioChannels(clip);
+  if (n === undefined || n === 1) return 1;
+  if (n > EXPLODED_STEREO_TRACKS) {
+    warnings.push(
+      `"${name}" has ${n} audio channels — only channels 1-2 were exported as a stereo pair; add channels 3-${n} manually in Premiere.`,
+    );
+  }
+  return 2;
 }
 
 /**
@@ -396,7 +481,18 @@ function fileBlockXml(
     );
   }
   if (kinds.has("audio")) {
-    mediaParts.push(`${indent}    <audio>\n${audioSamplecharacteristics(`${indent}      `)}\n${indent}    </audio>`);
+    // Real-test-#7: the measured channel count, placed after
+    // <samplecharacteristics> exactly as Premiere's own export does. Omitted
+    // (pre-#7 shape) when unknown rather than guessed.
+    const channels = sourceAudioChannels(clip);
+    mediaParts.push(
+      [
+        `${indent}    <audio>`,
+        audioSamplecharacteristics(`${indent}      `),
+        ...(channels !== undefined ? [`${indent}      <channelcount>${channels}</channelcount>`] : []),
+        `${indent}    </audio>`,
+      ].join("\n"),
+    );
   }
 
   return [
@@ -421,19 +517,31 @@ function fileBlockXml(
 // (sequence frames) are legitimately different numbers for the same real-time
 // span — Apple's own XMEML docs call this out explicitly for clipitem
 // <duration> once framerate is involved.
-function clipItemXml(range: FrameRange, index: number, trackPrefix: string, timelineFps: number, fileBlock: string, link?: LinkPartner): string {
+interface ClipItemSource {
+  /** Which of the referenced file's media kinds this clipitem draws from —
+   * see the real-test-#6 comment on sourceTrackXml() above. */
+  mediaType: "video" | "audio";
+  /** <sourcetrack><trackindex>: for audio, the SOURCE CHANNEL (1-based) —
+   * see the real-test-#7 comment above LinkRef. Always 1 for video. */
+  trackIndex: number;
+  /** premiereChannelType attribute on audio clipitems (real-test-#7). */
+  channelType?: "mono" | "stereo";
+}
+
+function clipItemXml(
+  range: FrameRange,
+  itemId: string,
+  timelineFps: number,
+  fileBlock: string,
+  source: ClipItemSource,
+  links: readonly LinkRef[],
+): string {
   const { decision, clip, inFrame, outFrame, startFrame, timelineDurationFrames } = range;
-  const itemId = sanitizeXmlId(`${trackPrefix}-${decision.id}`, `${trackPrefix}-clip-${index + 1}`);
   const name = xmlEscape(clip?.filename ?? decision.label ?? decision.clipId);
-  // trackPrefix is always "v1"/"v2" (video tracks) or "a1"/"a2" (audio
-  // tracks) — see the call sites in buildXmeml() below — so its first
-  // character alone tells us which of the referenced file's media kinds
-  // (always present, per clipKinds in buildXmeml()) this clipitem draws
-  // from. See the real-test-#6 comment on sourceTrackXml() above.
-  const sourceMediaType: "video" | "audio" = trackPrefix.startsWith("v") ? "video" : "audio";
+  const channelAttr = source.channelType ? ` premiereChannelType="${source.channelType}"` : "";
 
   return [
-    `      <clipitem id="${itemId}">`,
+    `      <clipitem id="${itemId}"${channelAttr}>`,
     `        <name>${name}</name>`,
     `        <duration>${timelineDurationFrames}</duration>`,
     rateBlock(timelineFps, "        "),
@@ -442,8 +550,8 @@ function clipItemXml(range: FrameRange, index: number, trackPrefix: string, time
     `        <in>${inFrame}</in>`,
     `        <out>${outFrame}</out>`,
     fileBlock,
-    sourceTrackXml(sourceMediaType, "        "),
-    ...(link ? [linkBlockXml(link, "        ")] : []),
+    sourceTrackXml(source.mediaType, source.trackIndex, "        "),
+    ...(links.length > 0 ? [linksXml(links, "        ")] : []),
     `      </clipitem>`,
   ].join("\n");
 }
@@ -527,63 +635,139 @@ export function buildXmeml(
     return fileBlockXml(fileId, range.clip, name, mediaRoot, range.clipFps, kinds, fallback, warnings, definedFileIds, indent);
   };
 
-  const interviewLink = (r: FrameRange, i: number): LinkPartner => ({
-    selfId: sanitizeXmlId(`v1-${r.decision.id}`, `v1-clip-${i + 1}`),
-    selfMediaType: "video",
-    selfTrackIndex: 1,
-    partnerId: sanitizeXmlId(`a1-${r.decision.id}`, `a1-clip-${i + 1}`),
-    partnerMediaType: "audio",
-    partnerTrackIndex: 1,
-    clipIndex: i + 1,
-    groupIndex: i + 1,
-  });
-  const interviewAudioLink = (r: FrameRange, i: number): LinkPartner => ({
-    selfId: sanitizeXmlId(`a1-${r.decision.id}`, `a1-clip-${i + 1}`),
-    selfMediaType: "audio",
-    selfTrackIndex: 1,
-    partnerId: sanitizeXmlId(`v1-${r.decision.id}`, `v1-clip-${i + 1}`),
-    partnerMediaType: "video",
-    partnerTrackIndex: 1,
-    clipIndex: i + 1,
-    groupIndex: i + 1,
-  });
+  // Real-test-#7: one channel count per SOURCE clip, resolved once (so a
+  // >2-channel warning is reported once per clip, not once per use).
+  const channelCountByClip = new Map<string, 1 | 2>();
+  const channelsFor = (r: FrameRange): 1 | 2 => {
+    const key = r.decision.clipId;
+    let n = channelCountByClip.get(key);
+    if (n === undefined) {
+      n = exportedChannelCount(r.clip, r.clip?.filename ?? r.decision.label ?? key, warnings);
+      channelCountByClip.set(key, n);
+    }
+    return n;
+  };
+
+  /** One audio channel clipitem of an event, placed on an exploded stereo
+   * track pair. `trackIndex` is its 1-based index among ALL audio tracks. */
+  interface AudioChannelItem {
+    id: string;
+    channel: number;
+    trackIndex: number;
+    clipIndex: number;
+  }
+
+  // Lays out a lane's events on an exploded stereo pair (real-test-#7): every
+  // event puts its channel-1 clipitem on the pair's first track; stereo events
+  // also put a channel-2 clipitem on the second. `clipIndex` is the item's real
+  // position on ITS track, which differs between the two tracks as soon as a
+  // lane mixes mono and stereo sources. Channel 1 keeps the pre-#7 id
+  // ("a1-<decision>") so existing references stay stable.
+  const layoutAudioPair = (ranges: FrameRange[], prefix: string, firstTrackIndex: number): AudioChannelItem[][] => {
+    const perTrackCount = Array.from({ length: EXPLODED_STEREO_TRACKS }, () => 0);
+    return ranges.map((r, i) => {
+      const items: AudioChannelItem[] = [];
+      for (let channel = 1; channel <= channelsFor(r); channel++) {
+        perTrackCount[channel - 1] = (perTrackCount[channel - 1] ?? 0) + 1;
+        const suffix = channel === 1 ? "" : `-ch${channel}`;
+        items.push({
+          id: sanitizeXmlId(`${prefix}-${r.decision.id}${suffix}`, `${prefix}-clip-${i + 1}${suffix}`),
+          channel,
+          trackIndex: firstTrackIndex + channel - 1,
+          clipIndex: perTrackCount[channel - 1] ?? 1,
+        });
+      }
+      return items;
+    });
+  };
+
+  const audioLinkRefs = (items: AudioChannelItem[]): LinkRef[] =>
+    items.map((a) => ({ id: a.id, mediaType: "audio", trackIndex: a.trackIndex, clipIndex: a.clipIndex, groupIndex: 1 }));
+
+  // A1 pair = the interview lane's own synced production audio (the same
+  // dialogue that made it into the transcript), linked to its V1 picture. The
+  // A2 pair is the app's own "audio" decision lane (e.g. a narration insert
+  // with no picture of its own) — a different kind of event, not a synced
+  // partner of anything on V1/V2, so it's only linked within itself.
+  const interviewAudio = layoutAudioPair(interview, "a1", 1);
+  const standaloneLayoutBase = interview.length > 0 ? EXPLODED_STEREO_TRACKS + 1 : 1;
+  const standaloneAudioItems = layoutAudioPair(standaloneAudio, "a2", standaloneLayoutBase);
+
+  const v1Id = (r: FrameRange, i: number) => sanitizeXmlId(`v1-${r.decision.id}`, `v1-clip-${i + 1}`);
+  // Premiere's own export: the picture's link (no groupindex) followed by one
+  // link per audio channel clipitem — the identical list on every member.
+  const interviewLinks = (r: FrameRange, i: number): LinkRef[] => [
+    { id: v1Id(r, i), mediaType: "video", trackIndex: 1, clipIndex: i + 1 },
+    ...audioLinkRefs(interviewAudio[i] ?? []),
+  ];
 
   const videoTracks = [
     interview.length > 0
       ? `    <track>\n${interview
-          .map((r, i) => clipItemXml(r, i, "v1", fps, fileBlockFor(r, i, "        "), interviewLink(r, i)))
+          .map((r, i) =>
+            clipItemXml(r, v1Id(r, i), fps, fileBlockFor(r, i, "        "), { mediaType: "video", trackIndex: 1 }, interviewLinks(r, i)),
+          )
           .join("\n")}\n    </track>`
       : null,
     broll.length > 0
       ? `    <track>\n${broll
-          .map((r, i) => clipItemXml(r, i, "v2", fps, fileBlockFor(r, i, "        ")))
+          .map((r, i) =>
+            clipItemXml(
+              r,
+              sanitizeXmlId(`v2-${r.decision.id}`, `v2-clip-${i + 1}`),
+              fps,
+              fileBlockFor(r, i, "        "),
+              { mediaType: "video", trackIndex: 1 },
+              [],
+            ),
+          )
           .join("\n")}\n    </track>`
       : null,
   ].filter((t): t is string => t !== null);
 
-  // A1 carries the interview lane's own synced production audio — the same
-  // dialogue that made it into the transcript — linked back to its V1 video
-  // via <link>, so an NLE moves/trims them together instead of the video
-  // arriving on V1 with silence where dialogue should be (the exact bug this
-  // fixes: real interview picture reached Premiere with no matching audio on
-  // A1). A2, built separately below, is the app's own "audio" decision lane
-  // (e.g. a narration insert with no video component of its own) — kept on
-  // its own track since it's a different kind of audio event, not a synced
-  // partner of anything on V1/V2.
+  /** Emits a lane as Premiere's exploded stereo track pair. */
+  const explodedPairXml = (
+    ranges: FrameRange[],
+    items: AudioChannelItem[][],
+    linksFor: (r: FrameRange, i: number) => LinkRef[],
+  ): string[] =>
+    Array.from({ length: EXPLODED_STEREO_TRACKS }, (_, t) => {
+      const channel = t + 1;
+      const clipitems = ranges
+        .map((r, i) => {
+          const item = (items[i] ?? []).find((a) => a.channel === channel);
+          if (!item) return null;
+          const channelType = (items[i] ?? []).length > 1 ? "stereo" : "mono";
+          return clipItemXml(
+            r,
+            item.id,
+            fps,
+            fileBlockFor(r, i, "        "),
+            { mediaType: "audio", trackIndex: channel, channelType },
+            linksFor(r, i),
+          );
+        })
+        .filter((c): c is string => c !== null);
+      return [
+        `    <track currentExplodedTrackIndex="${t}" totalExplodedTrackCount="${EXPLODED_STEREO_TRACKS}" premiereTrackType="Stereo">`,
+        ...clipitems,
+        `      <outputchannelindex>${channel}</outputchannelindex>`,
+        `    </track>`,
+      ].join("\n");
+    });
+
   const audioTracks: string[] = [];
   if (interview.length > 0) {
-    audioTracks.push(
-      `    <track>\n${interview
-        .map((r, i) => clipItemXml(r, i, "a1", fps, fileBlockFor(r, i, "        "), interviewAudioLink(r, i)))
-        .join("\n")}\n    </track>`,
-    );
+    audioTracks.push(...explodedPairXml(interview, interviewAudio, interviewLinks));
   }
   if (standaloneAudio.length > 0) {
-    audioTracks.push(
-      `    <track>\n${standaloneAudio
-        .map((r, i) => clipItemXml(r, i, "a2", fps, fileBlockFor(r, i, "        ")))
-        .join("\n")}\n    </track>`,
-    );
+    // Mono standalone events stay unlinked (nothing to link to); a stereo one
+    // links its two channel clipitems to each other.
+    const standaloneLinks = (_r: FrameRange, i: number): LinkRef[] => {
+      const items = standaloneAudioItems[i] ?? [];
+      return items.length > 1 ? audioLinkRefs(items) : [];
+    };
+    audioTracks.push(...explodedPairXml(standaloneAudio, standaloneAudioItems, standaloneLinks));
   }
 
   const xml = [
@@ -613,9 +797,14 @@ export function buildXmeml(
     ...(audioTracks.length > 0
       ? [
           `      <audio>`,
+          // Real-test-#7: a stereo sequence, declared the way Premiere's own
+          // export does — two output channels, one per exploded track
+          // (<outputchannelindex> 1/2 on each track pair above).
+          `        <numOutputChannels>${EXPLODED_STEREO_TRACKS}</numOutputChannels>`,
           `        <format>`,
           audioSamplecharacteristics("          "),
           `        </format>`,
+          sequenceOutputsXml("        "),
           ...audioTracks,
           `      </audio>`,
         ]

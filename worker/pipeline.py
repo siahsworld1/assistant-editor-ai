@@ -123,6 +123,7 @@ def _analyze_one_clip(
         camera=info["camera"],
         resolution=info["resolution"],
         fps=info["fps"] or 24.0,
+        audio_channels=info.get("audio_channels", 0),
         speakers=[speaker] if (role == "interview" and speaker) else [],
         state="analyzing",
     )

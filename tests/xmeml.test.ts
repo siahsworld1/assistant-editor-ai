@@ -77,8 +77,11 @@ describe("buildXmeml", () => {
     // clipitem's own nested <file><media><video> block — so a document-wide
     // count is unambiguous (no need to slice out a "video section" first, which
     // would break on the first nested </video> closing tag). V1 (interview),
-    // V2 (b-roll), A1 (interview's own synced audio) = 3.
-    expect((xml.match(/<track>/g) ?? []).length).toBe(3);
+    // V2 (b-roll), A1 (interview's own synced audio) = 3 lanes. Since
+    // real-test-#7 an audio lane is Premiere's exploded stereo PAIR of XML
+    // <track>s, so: V1 + V2 plain, plus the A1 pair = 4 <track> elements.
+    expect((xml.match(/<track>/g) ?? []).length).toBe(2);
+    expect((xml.match(/<track [^>]*premiereTrackType="Stereo"/g) ?? []).length).toBe(2);
     expect(xml).toContain("A001_INT_MARISOL_01.mov");
     expect(xml).toContain("B101_BROLL_GARDEN.mov");
     expect(xml).toContain(`file:///Users/editor/Footage/community-doc/A001_INT_MARISOL_01.mov`);
@@ -230,7 +233,8 @@ describe("buildXmeml", () => {
       // Exactly one audio track (A1) — this timeline has no standalone
       // "audio"-lane decisions, only interview-synced audio.
       const audioSection = topLevelAudioSection(xml);
-      expect((audioSection.match(/<track>/g) ?? []).length).toBe(1);
+      // (Real-test-#7: one audio lane = one exploded stereo pair.)
+      expect((audioSection.match(/<track [^>]*premiereTrackType="Stereo"/g) ?? []).length).toBe(2);
       // The audio clipitem carries the same source clip name as its video
       // counterpart — it's the same file's own audio, not a separate asset.
       expect(audioSection).toContain("A001_INT_MARISOL_01.mov");
@@ -286,7 +290,11 @@ describe("buildXmeml", () => {
       const audioSection = topLevelAudioSection(xml);
       // Both the interview's synced A1 audio and the standalone A2 narration
       // are present, on two distinct tracks.
-      expect((audioSection.match(/<track>/g) ?? []).length).toBe(2);
+      // (Real-test-#7: each audio lane is an exploded stereo pair → 2 × 2.
+      // Counted document-wide: premiereTrackType only ever appears on
+      // sequence-level audio tracks, while audioSection is cut short by the
+      // nested </audio> of narration.wav's own <file> definition inside A2.)
+      expect((xml.match(/<track [^>]*premiereTrackType="Stereo"/g) ?? []).length).toBe(4);
       expect(audioSection).toContain("narration.wav");
       // The standalone audio-lane clipitem is never linked to anything.
       expect(linksReferencing(xml, "a2-e3")).toBe(0);
@@ -632,7 +640,8 @@ describe("buildXmeml", () => {
       const { xml, warnings } = buildXmeml(tl, usable, [clip976], MEDIA_ROOT);
       expect(warnings).toEqual([]);
 
-      const clipitemBlocks = [...xml.matchAll(/<clipitem id="[^"]+">[\s\S]*?<\/clipitem>/g)].map((m) => m[0]);
+      // (Real-test-#7: audio clipitems now carry a premiereChannelType attribute.)
+      const clipitemBlocks = [...xml.matchAll(/<clipitem id="[^"]+"[^>]*>[\s\S]*?<\/clipitem>/g)].map((m) => m[0]);
       expect(clipitemBlocks.length).toBe(2); // 1. V1 references the source video; A1 is its own separate clipitem.
       const v1Block = clipitemBlocks.find((b) => b.includes('id="v1-'));
       const a1Block = clipitemBlocks.find((b) => b.includes('id="a1-'));
@@ -687,6 +696,182 @@ describe("buildXmeml", () => {
       expect(xml).toMatch(/<sequence id="[^"]+">/);
       expect([...xml.matchAll(/<colordepth>/g)].length).toBe(1);
     });
+  });
+});
+
+// Real Premiere test #7: 18C_0681.MP4 (AAC stereo 48kHz) carries dialogue
+// ONLY on source channel 2; channel 1 is a near-silent hiss input. The pre-#7
+// exporter emitted one A1 clipitem with <sourcetrack><trackindex>1 and no
+// <channelcount>, and Premiere played just channel 1 — "static/hiss". These
+// tests pin the Premiere-native stereo representation (see the real-test-#7
+// comment above LinkRef in xmeml.ts) and that every earlier fix survives it.
+describe("buildXmeml — real Premiere test #7: stereo source audio", () => {
+  const stereo976 = (id = "clip-681", filename = "18C_0681.MP4"): Clip => ({
+    ...makeClip(id, filename, filename, 23.976),
+    resolution: "3840x2160",
+    audioChannels: 2,
+  });
+  const interviewEvent = (id: string, clipId: string, startSeconds: number, inTc: string, outTc: string, seconds: number) => ({
+    id,
+    lane: "interview" as const,
+    clipId,
+    label: id,
+    sourceInTc: inTc,
+    sourceOutTc: outTc,
+    timelineStartSeconds: startSeconds,
+    durationSeconds: seconds,
+  });
+  const clipitems = (xml: string) =>
+    [...xml.matchAll(/<clipitem id="([^"]+)"([^>]*)>([\s\S]*?)<\/clipitem>/g)].map((m) => ({ id: m[1]!, attrs: m[2]!, body: m[3]! }));
+  const exportOne = (clips: Clip[], decisions: UniversalTimeline["decisions"]) => {
+    const tl = makeTimeline(decisions);
+    const { usable } = validateTimelineForExport(tl, clips);
+    return buildXmeml(tl, usable, clips, MEDIA_ROOT);
+  };
+
+  it("declares the real channel count and emits BOTH source channels as a Premiere stereo pair", () => {
+    const { xml, warnings } = exportOne([stereo976()], [interviewEvent("e1", "clip-681", 0, "00:00:05:00", "00:00:25:00", 20)]);
+    expect(warnings).toEqual([]);
+
+    // The one real <file> definition declares the measured layout.
+    expect([...xml.matchAll(/<channelcount>2<\/channelcount>/g)].length).toBe(1);
+
+    const items = clipitems(xml);
+    const ch1 = items.find((c) => c.id === "a1-e1");
+    const ch2 = items.find((c) => c.id === "a1-e1-ch2");
+    expect(ch1).toBeDefined();
+    expect(ch2).toBeDefined();
+    // Each channel clipitem draws a DIFFERENT source channel — never channel 1
+    // twice, and never a hard-coded "the dialogue is on 2".
+    expect(ch1!.body).toMatch(/<sourcetrack>\s*<mediatype>audio<\/mediatype>\s*<trackindex>1<\/trackindex>/);
+    expect(ch2!.body).toMatch(/<sourcetrack>\s*<mediatype>audio<\/mediatype>\s*<trackindex>2<\/trackindex>/);
+    expect(ch1!.attrs).toContain('premiereChannelType="stereo"');
+    expect(ch2!.attrs).toContain('premiereChannelType="stereo"');
+    // Both channels cover the identical source range and timeline position.
+    for (const c of [ch1!, ch2!]) {
+      expect(c.body).toContain("<in>120</in>");
+      expect(c.body).toContain("<start>0</start>");
+      expect(c.body).toContain("<end>480</end>");
+    }
+    // V1 still draws video only.
+    expect(items.find((c) => c.id === "v1-e1")!.body).toMatch(/<sourcetrack>\s*<mediatype>video<\/mediatype>\s*<trackindex>1<\/trackindex>/);
+  });
+
+  it("lays the pair out as exploded Stereo tracks routed to output channels 1 and 2", () => {
+    const { xml } = exportOne([stereo976()], [interviewEvent("e1", "clip-681", 0, "00:00:05:00", "00:00:25:00", 20)]);
+    const audio = topLevelAudioSection(xml);
+    expect(audio).toMatch(/^\s*<audio>\s*<numOutputChannels>2<\/numOutputChannels>\s*<format>/);
+    expect([...audio.matchAll(/<group>\s*<index>(\d)<\/index>\s*<numchannels>1<\/numchannels>\s*<downmix>0<\/downmix>\s*<channel>\s*<index>(\d)<\/index>/g)].map((m) => `${m[1]}:${m[2]}`)).toEqual([
+      "1:1",
+      "2:2",
+    ]);
+
+    const tracks = [...xml.matchAll(/<track ([^>]*)>([\s\S]*?)<\/track>/g)];
+    expect(tracks.map((t) => t[1])).toEqual([
+      'currentExplodedTrackIndex="0" totalExplodedTrackCount="2" premiereTrackType="Stereo"',
+      'currentExplodedTrackIndex="1" totalExplodedTrackCount="2" premiereTrackType="Stereo"',
+    ]);
+    // Channel 1 on exploded track 0 → output 1; channel 2 on track 1 → output 2.
+    expect(tracks[0]![2]).toContain('id="a1-e1"');
+    expect(tracks[0]![2]).toMatch(/<outputchannelindex>1<\/outputchannelindex>\s*$/);
+    expect(tracks[1]![2]).toContain('id="a1-e1-ch2"');
+    expect(tracks[1]![2]).toMatch(/<outputchannelindex>2<\/outputchannelindex>\s*$/);
+  });
+
+  it("links picture and both channels as one unit, exactly like Premiere's own export", () => {
+    const { xml } = exportOne([stereo976()], [interviewEvent("e1", "clip-681", 0, "00:00:05:00", "00:00:25:00", 20)]);
+    const expected = [
+      "v1-e1|video|1|1|",
+      "a1-e1|audio|1|1|1",
+      "a1-e1-ch2|audio|2|1|1",
+    ];
+    for (const item of clipitems(xml)) {
+      const links = [
+        ...item.body.matchAll(
+          /<link>\s*<linkclipref>([^<]+)<\/linkclipref>\s*<mediatype>(\w+)<\/mediatype>\s*<trackindex>(\d+)<\/trackindex>\s*<clipindex>(\d+)<\/clipindex>\s*(?:<groupindex>(\d+)<\/groupindex>\s*)?<\/link>/g,
+        ),
+      ].map((m) => [m[1], m[2], m[3], m[4], m[5] ?? ""].join("|"));
+      // Every member carries the identical full set; the video link has no
+      // groupindex, audio links are group 1 (the source's one channel group).
+      expect(links).toEqual(expected);
+    }
+  });
+
+  it("gives a mono source one mono clipitem and leaves the second exploded track empty", () => {
+    const mono = { ...makeClip("clip-mono", "lav_mono.wav", "lav_mono.wav", 24), audioChannels: 1 };
+    const { xml, warnings } = exportOne([mono], [interviewEvent("e1", "clip-mono", 0, "00:00:01:00", "00:00:03:00", 2)]);
+    expect(warnings).toEqual([]);
+    expect(xml).toContain("<channelcount>1</channelcount>");
+    const audioItems = clipitems(xml).filter((c) => c.id.startsWith("a1-"));
+    expect(audioItems.map((c) => c.id)).toEqual(["a1-e1"]);
+    expect(audioItems[0]!.attrs).toContain('premiereChannelType="mono"');
+    const tracks = [...xml.matchAll(/<track ([^>]*)>([\s\S]*?)<\/track>/g)];
+    expect(tracks.length).toBe(2);
+    expect(tracks[1]![2].trim()).toBe("<outputchannelindex>2</outputchannelindex>");
+  });
+
+  it("uses each clip's real position on ITS track for clipindex when a lane mixes stereo and mono", () => {
+    const mono = { ...makeClip("clip-mono", "lav_mono.wav", "lav_mono.wav", 23.976), audioChannels: 1 };
+    const { xml } = exportOne(
+      [stereo976(), mono],
+      [
+        interviewEvent("e1", "clip-681", 0, "00:00:01:00", "00:00:03:00", 2),
+        interviewEvent("e2", "clip-mono", 2, "00:00:01:00", "00:00:03:00", 2),
+        interviewEvent("e3", "clip-681", 4, "00:00:10:00", "00:00:12:00", 2),
+      ],
+    );
+    const tracks = [...xml.matchAll(/<track ([^>]*)>([\s\S]*?)<\/track>/g)].map((t) => t[2]!);
+    expect([...tracks[0]!.matchAll(/<clipitem id="([^"]+)"/g)].map((m) => m[1])).toEqual(["a1-e1", "a1-e2", "a1-e3"]);
+    expect([...tracks[1]!.matchAll(/<clipitem id="([^"]+)"/g)].map((m) => m[1])).toEqual(["a1-e1-ch2", "a1-e3-ch2"]);
+    // e3's channel 2 is the 2nd clip on exploded track 2 (not the 3rd).
+    const e3Video = clipitems(xml).find((c) => c.id === "v1-e3")!;
+    expect(e3Video.body).toMatch(/<linkclipref>a1-e3-ch2<\/linkclipref>\s*<mediatype>audio<\/mediatype>\s*<trackindex>2<\/trackindex>\s*<clipindex>2<\/clipindex>/);
+    expect(e3Video.body).toMatch(/<linkclipref>a1-e3<\/linkclipref>\s*<mediatype>audio<\/mediatype>\s*<trackindex>1<\/trackindex>\s*<clipindex>3<\/clipindex>/);
+  });
+
+  it("keeps every earlier fix intact with stereo sources: dedup, colordepth scope, clip-vs-sequence rate", () => {
+    const { xml, warnings } = exportOne(
+      [stereo976()],
+      [
+        interviewEvent("e1", "clip-681", 0, "00:00:01:00", "00:00:03:00", 2),
+        interviewEvent("e2", "clip-681", 2, "00:00:10:00", "00:00:12:00", 2),
+      ],
+    );
+    expect(warnings).toEqual([]);
+    // 2d7ef23: exactly ONE real <file> definition; every other use (V1 #2 and
+    // all four audio channel clipitems) is a bare reference.
+    expect([...xml.matchAll(/<file id="file-clip-681">/g)].length).toBe(1);
+    expect([...xml.matchAll(/<file id="file-clip-681"\/>/g)].length).toBe(5);
+    // acaab01: colordepth only in the once-per-sequence format block.
+    expect([...xml.matchAll(/<colordepth>/g)].length).toBe(1);
+    // 2e59af3: file rate = clip's real 23.976 (24/TRUE); sequence and every
+    // clipitem stay at the 24fps timeline rate (24/FALSE).
+    const fileBlock = xml.slice(xml.indexOf('<file id="file-clip-681">'), xml.indexOf("</file>"));
+    expect(fileBlock).toMatch(/<rate>\s*<timebase>24<\/timebase>\s*<ntsc>TRUE<\/ntsc>/);
+    for (const item of clipitems(xml)) {
+      expect(item.body).toMatch(/^\s*<name>[^<]*<\/name>\s*<duration>\d+<\/duration>\s*<rate>\s*<timebase>24<\/timebase>\s*<ntsc>FALSE<\/ntsc>/);
+    }
+    // 2056a49 geometry: real dimensions in sequence + file video blocks.
+    expect([...xml.matchAll(/<width>3840<\/width>\s*<height>2160<\/height>/g)].length).toBe(2);
+  });
+
+  it("reports (never silently drops) channels beyond a stereo pair, once per source clip", () => {
+    const quad = { ...stereo976("clip-quad", "C0001_4ch.MXF"), audioChannels: 4 };
+    const { xml, warnings } = exportOne(
+      [quad],
+      [interviewEvent("e1", "clip-quad", 0, "00:00:01:00", "00:00:03:00", 2), interviewEvent("e2", "clip-quad", 2, "00:00:05:00", "00:00:07:00", 2)],
+    );
+    expect(warnings.filter((w) => w.includes("4 audio channels"))).toHaveLength(1);
+    expect(xml).toContain("<channelcount>4</channelcount>");
+    expect(clipitems(xml).filter((c) => c.id.startsWith("a1-")).map((c) => c.id)).toEqual(["a1-e1", "a1-e2", "a1-e1-ch2", "a1-e2-ch2"]);
+  });
+
+  it("keeps the pre-#7 single-channel shape when the channel layout is unknown, instead of guessing", () => {
+    const unknown = makeClip("clip-unknown", "legacy.mov", "legacy.mov", 24); // no audioChannels
+    const { xml, warnings } = exportOne([unknown], [interviewEvent("e1", "clip-unknown", 0, "00:00:01:00", "00:00:03:00", 2)]);
+    expect(warnings).toEqual([]);
+    expect(xml).not.toContain("<channelcount>");
+    expect(clipitems(xml).filter((c) => c.id.startsWith("a1-")).map((c) => c.id)).toEqual(["a1-e1"]);
   });
 });
 

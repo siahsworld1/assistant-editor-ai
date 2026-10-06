@@ -378,6 +378,8 @@ function normalizeClips(v: unknown): Clip[] {
     const relPath = str(pick(raw, "relPath", "rel_path"));
     const proxyRelPath = str(pick(raw, "proxyRelPath", "proxy_rel_path"));
     const thumbnailRelPath = str(pick(raw, "thumbnailRelPath", "thumbnail_rel_path"));
+    // 0/absent means "no audio stream or not measured" — left undefined, never defaulted.
+    const audioChannels = Math.floor(num(pick(raw, "audioChannels", "audio_channels"), 0));
     return {
       id: str(pick(raw, "id", "clipId"), `clip-${i + 1}`),
       filename: str(pick(raw, "filename", "name", "file", "path"), `clip-${i + 1}`),
@@ -389,6 +391,7 @@ function normalizeClips(v: unknown): Clip[] {
       camera: str(pick(raw, "camera", "device"), "—"),
       resolution: str(pick(raw, "resolution", "res"), "—"),
       fps: num(pick(raw, "fps", "frameRate"), 24),
+      ...(audioChannels > 0 ? { audioChannels } : {}),
       speakers: strList(pick(raw, "speakers")),
       state: (CLIP_STATES as string[]).includes(state) ? (state as Clip["state"]) : "pending",
       progress: num(pick(raw, "progress"), 0),

@@ -63,6 +63,11 @@ export interface Clip {
   camera: string;
   resolution: string;
   fps: number;
+  /** Channel count of the source's audio stream, measured by ffprobe
+   * (worker/media.py::ffprobe_info). Undefined when the clip has no audio or
+   * was analyzed by a worker that didn't report it — exporters must treat that
+   * as "unknown", never guess a layout. See src/lib/nle/xmeml.ts. */
+  audioChannels?: number | undefined;
   speakers: string[];
   state: ClipAnalysisState;
   progress: number;

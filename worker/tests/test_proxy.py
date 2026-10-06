@@ -222,6 +222,83 @@ class TestFfprobeInfoFailureReporting(unittest.TestCase):
         self.assertIsNotNone(info["probeError"])
 
 
+def _make_av_clip(dest: Path, audio_channels: int | None, seconds: float = 1.0) -> bool:
+    """A real tiny H.264 .mov with `audio_channels` AAC channels (None = no
+    audio stream at all). Channel 1 and 2 get different tones so they're real,
+    distinct channels — like 18C_0681.MP4, whose dialogue is only on channel 2."""
+    args = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=size=320x240:rate=24:duration={seconds}"]
+    for i in range(audio_channels or 0):
+        args += ["-f", "lavfi", "-i", f"sine=frequency={440 * (i + 1)}:duration={seconds}"]
+    if audio_channels and audio_channels > 1:
+        # amerge turns the N mono tones into one N-channel audio stream.
+        inputs = "".join(f"[{i + 1}:a]" for i in range(audio_channels))
+        args += ["-filter_complex", f"{inputs}amerge=inputs={audio_channels}[a]", "-map", "0:v", "-map", "[a]"]
+    args += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+    if audio_channels:
+        args += ["-c:a", "aac"]
+    args.append(str(dest))
+    try:
+        subprocess.run(args, capture_output=True, timeout=60, check=True)
+        return dest.exists() and dest.stat().st_size > 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+@unittest.skipUnless(_ffmpeg_present(), "ffmpeg/ffprobe not on PATH")
+class TestFfprobeAudioChannels(unittest.TestCase):
+    """Real Premiere test #7: the XMEML exporter can only describe a stereo
+    source as stereo if the worker reports the source's real channel count.
+    Real ffmpeg-synthesized files, real ffprobe — no mocking."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ae-channels-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _probe(self, audio_channels):
+        src = self.tmp / f"ch{audio_channels}.mov"
+        if not _make_av_clip(src, audio_channels):
+            self.skipTest("Could not synthesize a test clip with this ffmpeg build.")
+        info = media.ffprobe_info(src)
+        self.assertTrue(info["ok"], info.get("probeError"))
+        return info
+
+    def test_stereo_source_reports_two_channels(self):
+        info = self._probe(2)
+        self.assertTrue(info["has_audio"])
+        self.assertEqual(info["audio_channels"], 2)
+
+    def test_mono_source_reports_one_channel(self):
+        self.assertEqual(self._probe(1)["audio_channels"], 1)
+
+    def test_video_without_audio_reports_zero_not_a_guess(self):
+        info = self._probe(None)
+        self.assertFalse(info["has_audio"])
+        self.assertEqual(info["audio_channels"], 0)
+
+    def test_unreadable_file_reports_zero(self):
+        bogus = self.tmp / "bogus.MP4"
+        bogus.write_bytes(b"not media")
+        info = media.ffprobe_info(bogus)
+        self.assertFalse(info["ok"])
+        self.assertEqual(info["audio_channels"], 0)
+
+    def test_channel_count_reaches_the_project_json_the_app_reads(self):
+        from store import ClipState
+
+        clip = ClipState(
+            id="clip-001", filename="18C_0681.MP4", role="interview", duration_seconds=32.4,
+            camera="HEVC", resolution="3840x2160", fps=23.976, audio_channels=2,
+        )
+        self.assertEqual(clip.to_json()["audioChannels"], 2)
+        # Default stays "unknown" (0) — never a guessed layout.
+        self.assertEqual(
+            ClipState(id="c", filename="f", role="b-roll", duration_seconds=1, camera="—", resolution="—", fps=24).to_json()["audioChannels"],
+            0,
+        )
+
+
 class TestFfprobeTimeoutRetry(unittest.TestCase):
     """Mocked tests for the timeout/retry logic itself — these must run fast
     (no real 120s+240s waits), so they patch media._run_ffprobe_once (and
