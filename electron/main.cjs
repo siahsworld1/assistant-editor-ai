@@ -1,4 +1,14 @@
-const { app, BrowserWindow, dialog, ipcMain, protocol, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, protocol, session, shell } = require("electron");
+const { disableRemoteDebugging } = require("./debug-switches.cjs");
+
+// First thing, before Chromium starts any service: a packaged app ignores
+// --remote-debugging-port and friends (see debug-switches.cjs).
+const strippedDebugSwitches = disableRemoteDebugging({ isPackaged: app.isPackaged, commandLine: app.commandLine });
+if (strippedDebugSwitches.length) {
+  console.warn(`[assistant-editor] ignored debugging switches: ${strippedDebugSwitches.join(", ")}`);
+}
+
+const fs = require("node:fs");
 const path = require("node:path");
 const { validateRequest, sanitizeHeaders } = require("./allowlist.cjs");
 const { EmbeddedRenderer } = require("./renderer-server.cjs");
@@ -31,7 +41,9 @@ if (identity.migration.migrated) {
   );
 }
 
-const isDev = !app.isPackaged || process.env["ASSISTANT_EDITOR_DEV"] === "1";
+// Developer tools exist only in development builds — never in the packaged
+// app, whatever its environment says.
+const devToolsEnabled = !app.isPackaged;
 const DEV_RENDERER_URL = process.env["ASSISTANT_EDITOR_RENDERER_URL"] || "http://localhost:8080";
 /** Forces the packaged code path (embedded renderer) while developing/testing. */
 const FORCE_EMBEDDED = process.env["ASSISTANT_EDITOR_EMBEDDED"] === "1";
@@ -98,7 +110,7 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       webviewTag: false,
-      devTools: isDev,
+      devTools: devToolsEnabled,
     },
   });
 
@@ -116,6 +128,10 @@ function createWindow() {
   });
 
   mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (!isTrustedTarget(url)) event.preventDefault();
+  });
+  // A server-side redirect must not take the window off the interface either.
+  mainWindow.webContents.on("will-redirect", (event, url) => {
     if (!isTrustedTarget(url)) event.preventDefault();
   });
 
@@ -145,7 +161,7 @@ function showStartupError(message) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      devTools: isDev,
+      devTools: devToolsEnabled,
     },
   });
   errorWindow.on("closed", () => {
@@ -155,6 +171,52 @@ function showStartupError(message) {
   errorWindow.webContents.once("did-finish-load", () => {
     errorWindow?.webContents.send("assistant-editor:startup-error", message);
   });
+}
+
+/** Third-party notices written into the packaged app by scripts/after-pack.cjs. */
+function acknowledgementsPath() {
+  return path.join(process.resourcesPath, "licenses", "Acknowledgements.html");
+}
+
+/** macOS menu: the standard app/Edit/View/Window menus, and Help → Acknowledgements
+ * in place of Electron's default links to electronjs.org. */
+function installApplicationMenu() {
+  app.setAboutPanelOptions({
+    applicationName: "Assistant Editor AI",
+    applicationVersion: app.getVersion(),
+    credits: "Includes open-source software — see Help › Acknowledgements.",
+  });
+  const help = [];
+  if (fs.existsSync(acknowledgementsPath())) {
+    help.push({ label: "Acknowledgements", click: () => void shell.openPath(acknowledgementsPath()) });
+  }
+  const viewItems = [
+    { role: "resetZoom" },
+    { role: "zoomIn" },
+    { role: "zoomOut" },
+    { type: "separator" },
+    { role: "togglefullscreen" },
+  ];
+  if (devToolsEnabled) viewItems.unshift({ role: "reload" }, { role: "toggleDevTools" }, { type: "separator" });
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      { role: "appMenu" },
+      { role: "editMenu" },
+      { label: "View", submenu: viewItems },
+      { role: "windowMenu" },
+      { role: "help", submenu: help },
+    ]),
+  );
+}
+
+/** The interface needs no device or browser permissions (camera, microphone,
+ * notifications, clipboard API, geolocation, …): deny every request. */
+function denyWebPermissions() {
+  const allowed = new Set(["fullscreen"]);
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    callback(allowed.has(permission));
+  });
+  session.defaultSession.setPermissionCheckHandler((_wc, permission) => allowed.has(permission));
 }
 
 /** Boot: resolve a renderer URL, then open the app window (or the error window). */
@@ -330,6 +392,8 @@ app.whenReady().then(() => {
   // setActiveMediaRoot (see desktop-capabilities.cjs). Registered once, here,
   // after `capabilities` exists so the handler always reads its *current* state.
   protocol.handle("ae-media", createMediaProtocolHandler(() => capabilities?.activeMediaRoot ?? null));
+  denyWebPermissions();
+  if (process.platform === "darwin") installApplicationMenu();
   // Re-authorise roots persisted by previous sessions.
   void capabilities.readAll();
   void premiere.start().then((res) => {
@@ -381,6 +445,13 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 
 app.on("web-contents-created", (_e, contents) => {
   contents.on("will-attach-webview", (event) => event.preventDefault());
+  // Every window (including the startup-error page) stays on the interface and
+  // opens no popups; createWindow() replaces the popup handler for the main
+  // window so external links go to the user's browser.
+  contents.on("will-navigate", (event, url) => {
+    if (!isTrustedTarget(url)) event.preventDefault();
+  });
+  contents.setWindowOpenHandler(() => ({ action: "deny" }));
 });
 
 module.exports = { embedded, premiere, worker };

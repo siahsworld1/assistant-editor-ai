@@ -107,24 +107,62 @@
   },
   "main": "electron/main.cjs",
   "build": {
-    "appId": "ai.assistanteditor.companion",
+    "appId": "com.1855andco.assistanteditorai",
     "productName": "Assistant Editor AI",
+    "copyright": "Copyright © 2026 Eighteen Fifty Five and Company, LLC. All rights reserved.",
     "files": [
       "electron/**/*",
       "package.json",
       "!electron/smoke-test.cjs",
-      "!electron/smoke-test-packaged.cjs"
+      "!electron/smoke-test-packaged.cjs",
+      "!node_modules{,/**/*}"
     ],
     "directories": {
       "output": "release"
     },
+    "afterPack": "scripts/after-pack.cjs",
+    "publish": null,
+    "electronFuses": {
+      "runAsNode": true,
+      "enableCookieEncryption": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "grantFileProtocolExtraPrivileges": false,
+      "resetAdHocDarwinSignature": true
+    },
     "mac": {
       "target": [
-        "dmg",
-        "zip"
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
       ],
       "category": "public.app-category.video",
+      "minimumSystemVersion": "14.0",
+      "bundleShortVersion": "1.0.0",
+      "bundleVersion": "1",
+      "extendInfo": {
+        "NSCameraUsageDescription": null,
+        "NSMicrophoneUsageDescription": null,
+        "NSAudioCaptureUsageDescription": null,
+        "NSBluetoothAlwaysUsageDescription": null,
+        "NSBluetoothPeripheralUsageDescription": null
+      },
       "identity": null
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "title": "${productName} ${version}"
     },
     "win": {
       "target": [
@@ -165,7 +203,7 @@
     ],
     "asar": true
   },
-  "version": "0.3.1",
+  "version": "1.0.0-beta.1",
   "description": "Assistant Editor AI desktop companion for professional post-production.",
   "author": "Assistant Editor AI"
 }
