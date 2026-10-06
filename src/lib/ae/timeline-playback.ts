@@ -20,23 +20,62 @@ export interface PlayableSegment {
   sourceOutSeconds: number;
 }
 
-function buildSegments(timeline: UniversalTimeline, clips: Clip[]): PlayableSegment[] {
-  const byId = new Map(clips.map((c) => [c.id, c]));
-  return timeline.decisions
-    .filter((d) => d.lane !== "audio")
+function toSegments(
+  decisions: EditDecision[],
+  byId: Map<string, Clip>,
+  timelineFps: number,
+): PlayableSegment[] {
+  return decisions
     .slice()
     .sort((a, b) => a.timelineStartSeconds - b.timelineStartSeconds)
     .map((d) => {
       const clip = byId.get(d.clipId);
-      const sourceInSeconds = tcToSeconds(d.sourceInTc, timeline.fps) ?? 0;
-      const parsedOut = tcToSeconds(d.sourceOutTc, timeline.fps);
+      // Source timecodes are in the CLIP's own rate (a 23.976 source's frame
+      // field is 1/23.976s) — the same rule the worker validation and the
+      // XMEML exporter use. Reading them at the timeline's rate drifted up to
+      // a frame per edit.
+      const fps = clip?.fps || timelineFps || 24;
+      const sourceInSeconds = tcToSeconds(d.sourceInTc, fps) ?? 0;
+      const parsedOut = tcToSeconds(d.sourceOutTc, fps);
       const sourceOutSeconds = parsedOut !== null && parsedOut > sourceInSeconds ? parsedOut : sourceInSeconds + d.durationSeconds;
       return { decision: d, clip, src: previewSrcForClip(clip), sourceInSeconds, sourceOutSeconds };
     });
 }
 
+/**
+ * The primary playback sequence is V1 (interview) — its picture AND its sync
+ * audio, so audio always follows picture. B-roll (V2) is NOT part of the
+ * sequence: those events are cutaways laid over V1 and are returned separately
+ * as overlays. Previously V1 and V2 were played as one interleaved sequence, so
+ * a cutaway over an interview jumped away from the interview's audio. A
+ * timeline with no V1 events plays its V2 events as the sequence instead.
+ */
+export function buildPlaybackPlan(timeline: UniversalTimeline, clips: Clip[]) {
+  const byId = new Map(clips.map((c) => [c.id, c]));
+  const v1 = timeline.decisions.filter((d) => d.lane === "interview");
+  const v2 = timeline.decisions.filter((d) => d.lane === "b-roll");
+  return v1.length > 0
+    ? { sequence: toSegments(v1, byId, timeline.fps), overlays: toSegments(v2, byId, timeline.fps) }
+    : { sequence: toSegments(v2, byId, timeline.fps), overlays: [] as PlayableSegment[] };
+}
+
+/** The V2 overlay visible at a timeline position, if any. */
+export function overlayAt(
+  overlays: PlayableSegment[],
+  timelineSeconds: number,
+): PlayableSegment | null {
+  for (let i = overlays.length - 1; i >= 0; i--) {
+    const o = overlays[i]!;
+    const start = o.decision.timelineStartSeconds;
+    if (o.src && timelineSeconds >= start && timelineSeconds < start + o.decision.durationSeconds)
+      return o;
+  }
+  return null;
+}
+
 export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) {
-  const segments = useMemo(() => buildSegments(timeline, clips), [timeline, clips]);
+  const plan = useMemo(() => buildPlaybackPlan(timeline, clips), [timeline, clips]);
+  const segments = plan.sequence;
   const hasPlayableMedia = segments.some((s) => s.src);
 
   const playerRef = useRef<MediaPlayerHandle | null>(null);
@@ -59,10 +98,21 @@ export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) 
     [segments],
   );
 
-  const goToSegment = useCallback((index: number, localStart: number) => {
-    setActiveIndex(index);
-    setPendingStart(localStart);
-  }, []);
+  const goToSegment = useCallback(
+    (index: number, localStart: number) => {
+      // MediaPlayer only repositions when its src CHANGES. Consecutive events
+      // cut from the same source clip share one src, so without an explicit
+      // seek playback ran straight past the first event's out-point instead
+      // of jumping to the next event's in-point (found playing a real cut that
+      // used 18C_0687 twice in a row).
+      const current = activeIndex !== null ? segments[activeIndex]?.src : null;
+      const sameSource = current != null && current === segments[index]?.src;
+      setActiveIndex(index);
+      setPendingStart(localStart);
+      if (sameSource) playerRef.current?.seek(localStart);
+    },
+    [activeIndex, segments],
+  );
 
   const play = useCallback(() => {
     if (segments.length === 0) return;
@@ -132,7 +182,10 @@ export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) 
         if (next !== null) {
           goToSegment(next, segments[next]!.sourceInSeconds);
         } else {
+          // End of the cut: actually stop — otherwise the source clip played
+          // on past the last event's out-point.
           wantPlayingRef.current = false;
+          playerRef.current?.pause();
           setPlayheadSeconds(timeline.totalSeconds);
         }
       }
@@ -154,8 +207,13 @@ export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) 
     wantPlayingRef.current = false;
   }, []);
 
+  const overlay = overlayAt(plan.overlays, playheadSeconds);
+
   return {
     segments,
+    overlays: plan.overlays,
+    /** The V2 cutaway to show over the player right now (picture only). */
+    overlay,
     activeSegment,
     hasPlayableMedia,
     playerRef,

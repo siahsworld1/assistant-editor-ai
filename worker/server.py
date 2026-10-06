@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,8 @@ if os.environ.get("ASSISTANT_EDITOR_SKIP_DOTENV") != "1":
 
 from flask import Flask, jsonify, request  # noqa: E402 - load_dotenv must run first
 
+import media  # noqa: E402
+import persistence  # noqa: E402
 import pipeline  # noqa: E402
 from store import STORE  # noqa: E402
 
@@ -97,6 +100,69 @@ def build():
     command = body.get("command") or body.get("prompt")
     result = pipeline.build_timeline(project_id, story_id, target_seconds, command)
     return jsonify(result)
+
+
+@app.route("/restore", methods=["POST", "OPTIONS"])
+def restore():
+    """Loads the saved analysis for a project's media folder (persistence.py)
+    after the app or worker restarted. Never touches a running analysis."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    project_id = body.get("projectId") or body.get("project")
+    media_root = body.get("mediaRoot") or ""
+    if not isinstance(media_root, str) or not os.path.isabs(media_root) or not os.path.isdir(media_root):
+        return jsonify({"restored": False, "reason": "invalid-media-root"}), 400
+    if STORE.analysis_state == "running":
+        return jsonify({"restored": False, "reason": "analysis-running"})
+    if (
+        STORE.analysis_state == "complete"
+        and STORE.media_root
+        and os.path.realpath(STORE.media_root) == os.path.realpath(media_root)
+    ):
+        return jsonify({"restored": True, "reason": "already-loaded", "analysisId": STORE.analysis_id})
+    return jsonify(persistence.restore_snapshot(STORE, project_id, media_root))
+
+
+FRAME_WIDTHS = {160, 240, 320}
+MAX_FRAMES_PER_REQUEST = 16
+
+
+@app.route("/frames", methods=["POST", "OPTIONS"])
+def frames():
+    """Real frames of one analyzed clip at given SOURCE times (seconds), for
+    the SELECTS / STORY / CUT visuals. Extracted from the clip's proxy when it
+    has one (fast 960px H.264), else the original; cached under
+    mediaRoot/.ae_thumbs/frames/ keyed by the source's identity, so a frame is
+    only ever reused for the exact source version it came from."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    clip = STORE.clips.get(str(body.get("clipId", "")))
+    if clip is None or not STORE.media_root:
+        return jsonify({"error": "unknown clip"}), 404
+    width = body.get("width") if body.get("width") in FRAME_WIDTHS else 240
+    times = [t for t in (body.get("times") or []) if isinstance(t, (int, float)) and not isinstance(t, bool)]
+    times = times[:MAX_FRAMES_PER_REQUEST]
+    root = Path(STORE.media_root)
+    original = root / clip.rel_path
+    proxy = root / clip.proxy_rel_path if clip.proxy_rel_path else None
+    source = proxy if proxy is not None and media.cached_artifact_is_valid(proxy) else original
+    key = clip.source_key or media.source_cache_key(original)
+    if not key or not source.is_file():
+        return jsonify({"error": "source media unavailable"}), 404
+    last = max(0.0, (clip.duration_seconds or 0.0) - 0.05)
+    out = []
+    for t in times:
+        seconds = round(min(max(0.0, float(t)), last), 3)
+        rel = f"{media.THUMB_DIR_NAME}/frames/{key}-{int(seconds * 1000):08d}-w{width}.jpg"
+        dest = root / rel
+        if media.cached_artifact_is_valid(dest):
+            out.append({"seconds": seconds, "relPath": rel})
+            continue
+        ok, error = media.extract_frame_at(source, dest, seconds, max_width=width, quality=6)
+        out.append({"seconds": seconds, "relPath": rel} if ok else {"seconds": seconds, "error": error})
+    return jsonify({"clipId": clip.id, "frames": out})
 
 
 @app.route("/project", methods=["GET"])

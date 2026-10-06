@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { EngineClient, resolveTransport } from "./service";
-import type { BuildResult } from "./service";
+import type { BuildResult, SourceFrame } from "./service";
 import type { HostContext } from "./transport";
 import type { WorkerStatus } from "@/types/bridge";
 import type {
@@ -103,6 +103,85 @@ function writeActiveProjectId(id: string | null) {
   }
 }
 
+/** Which project to reopen. The desktop app keeps it in the main process —
+ * the packaged renderer gets a new loopback port (= origin = empty
+ * localStorage) on every launch; localStorage remains the web/dev fallback. */
+async function loadActiveProjectId(): Promise<string | null> {
+  const desktop = typeof window === "undefined" ? undefined : window.assistantEditorDesktop;
+  if (desktop?.available) {
+    try {
+      const res = await desktop.getActiveProject();
+      if (res.ok && res.id) return res.id;
+    } catch {
+      /* fall through */
+    }
+  }
+  return readActiveProjectId();
+}
+
+function rememberActiveProject(id: string | null) {
+  writeActiveProjectId(id);
+  const desktop = typeof window === "undefined" ? undefined : window.assistantEditorDesktop;
+  if (desktop?.available) void desktop.setActiveProject(id).catch(() => {});
+}
+
+const EDIT_STATE_SCHEMA = 1;
+
+/** The editor-side state saved per project so a cut survives quitting. */
+export interface SavedEditState {
+  schema: typeof EDIT_STATE_SCHEMA;
+  /** The engine analysis these versions were built from; restored only against it. */
+  analysisId: string;
+  versions: EditVersion[];
+  activeVersionId: string;
+  chosenStoryId: string | null;
+  targetSeconds: number;
+  storyboardSelectIds: string[];
+  savedAt: string;
+}
+
+/** Validates a saved edit state; null unless it is well-formed AND belongs to
+ * `analysisId` (versions from another analysis reference other clip ids). */
+export function parseSavedEditState(
+  raw: unknown,
+  analysisId: string | null | undefined,
+): SavedEditState | null {
+  if (!analysisId || typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (r["schema"] !== EDIT_STATE_SCHEMA || r["analysisId"] !== analysisId) return null;
+  const versions = Array.isArray(r["versions"])
+    ? (r["versions"] as unknown[]).filter(
+        (v): v is EditVersion =>
+          typeof v === "object" &&
+          v !== null &&
+          typeof (v as EditVersion).id === "string" &&
+          Array.isArray((v as EditVersion).timeline?.decisions),
+      )
+    : [];
+  if (versions.length === 0) return null;
+  const active = typeof r["activeVersionId"] === "string" ? (r["activeVersionId"] as string) : "";
+  const target = Number(r["targetSeconds"]);
+  return {
+    schema: EDIT_STATE_SCHEMA,
+    analysisId,
+    versions,
+    activeVersionId: versions.some((v) => v.id === active)
+      ? active
+      : versions[versions.length - 1]!.id,
+    chosenStoryId: typeof r["chosenStoryId"] === "string" ? (r["chosenStoryId"] as string) : null,
+    targetSeconds: Number.isFinite(target) && target >= 5 && target <= 36000 ? target : 360,
+    storyboardSelectIds: Array.isArray(r["storyboardSelectIds"])
+      ? (r["storyboardSelectIds"] as unknown[]).filter((x): x is string => typeof x === "string")
+      : [],
+    savedAt: typeof r["savedAt"] === "string" ? (r["savedAt"] as string) : "",
+  };
+}
+
+function samePath(a: string, b: string): boolean {
+  const norm = (p: string) => p.replace(/\/+$/, "");
+  return norm(a) === norm(b);
+}
+
 function emptyTimeline(targetSeconds: number): UniversalTimeline {
   return {
     id: "tl-empty",
@@ -184,6 +263,12 @@ interface AEContextValue {
   setActiveVersion: (id: string) => void;
   setTargetSeconds: (s: number) => void;
   updateSettings: (patch: Partial<SettingsState>) => void;
+  /** Real frames of a clip at source times, aligned with `times` (null = unavailable). */
+  fetchFrames: (
+    clipId: string,
+    times: number[],
+    width?: 160 | 240 | 320,
+  ) => Promise<Array<SourceFrame | null>>;
 }
 
 const AEContext = createContext<AEContextValue | null>(null);
@@ -343,6 +428,15 @@ export function AEProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  /** `${projectId}:${analysisId}` once that pair's saved edit state has been
+   * loaded (or found absent). Saving is blocked until then, so a fresh baseline
+   * can never overwrite a saved cut before it has been restored. */
+  const hydratedKeyRef = useRef<string | null>(null);
+  /** Set below once the engine-sync helpers exist (they're declared later). */
+  const projectSwitchedRef = useRef<(record: ProjectRecord | null) => void>(() => {});
+  const targetSecondsRef = useRef(targetSeconds);
+  targetSecondsRef.current = targetSeconds;
+
   const activeRef = useRef<{ record: ProjectRecord | null; index: MediaIndex | null }>({
     record: null,
     index: null,
@@ -387,12 +481,15 @@ export function AEProvider({ children }: { children: ReactNode }) {
         const list = await store.list();
         if (cancelled) return;
         setProjects(list);
-        const wanted = readActiveProjectId();
+        const wanted = await loadActiveProjectId();
         const record = list.find((p) => p.id === wanted) ?? list[0] ?? null;
         const index = record ? await reindex(record) : null;
         if (cancelled) return;
-        if (record) writeActiveProjectId(record.id);
+        if (record) rememberActiveProject(record.id);
         applyActive(record, index);
+        // The engine may already be live (it starts in parallel): restore this
+        // project now. If it isn't live yet, the boot sync does it instead.
+        projectSwitchedRef.current(record);
       } catch (err) {
         if (!cancelled) {
           setProjectError(
@@ -422,8 +519,9 @@ export function AEProvider({ children }: { children: ReactNode }) {
       try {
         const record = newProjectRecord(input);
         setProjects(await store.save(record));
-        writeActiveProjectId(record.id);
+        rememberActiveProject(record.id);
         applyActive(record, null);
+        projectSwitchedRef.current(record);
         return record;
       } catch (err) {
         setProjectError(err instanceof Error ? err.message : "The project could not be created.");
@@ -449,8 +547,9 @@ export function AEProvider({ children }: { children: ReactNode }) {
           setProjectError("That project is no longer in the local project store.");
           return;
         }
-        writeActiveProjectId(record.id);
+        rememberActiveProject(record.id);
         applyActive(record, await reindex(record));
+        projectSwitchedRef.current(record);
       } catch (err) {
         setProjectError(err instanceof Error ? err.message : "The project could not be opened.");
       } finally {
@@ -470,8 +569,9 @@ export function AEProvider({ children }: { children: ReactNode }) {
         setProjects(list);
         if (activeRef.current.record?.id === id) {
           const next = list[0] ?? null;
-          writeActiveProjectId(next?.id ?? null);
+          rememberActiveProject(next?.id ?? null);
           applyActive(next, next ? await reindex(next) : null);
+          projectSwitchedRef.current(next);
         }
       } catch (err) {
         setProjectError(err instanceof Error ? err.message : "The project could not be removed.");
@@ -510,6 +610,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       };
       if (store) setProjects(await store.save(updated));
       applyActive(updated, outcome.index);
+      projectSwitchedRef.current(updated);
       return outcome;
     } catch (err) {
       const error = err instanceof Error ? err.message : "Media import failed.";
@@ -561,6 +662,141 @@ export function AEProvider({ children }: { children: ReactNode }) {
       setChosenStoryId((cur) => cur ?? st.value[0]?.id ?? null);
     }
   }, []);
+
+  /** Applies a project's saved edit state if it belongs to this analysis. */
+  const hydrateEditState = useCallback(async (projectId: string, analysisId: string) => {
+    const key = `${projectId}:${analysisId}`;
+    if (hydratedKeyRef.current === key) return;
+    const desktop = typeof window === "undefined" ? undefined : window.assistantEditorDesktop;
+    let saved: SavedEditState | null = null;
+    if (desktop?.available) {
+      try {
+        const res = await desktop.loadEditState(projectId);
+        saved = parseSavedEditState(res.state, analysisId);
+      } catch {
+        saved = null;
+      }
+    }
+    if (activeRef.current.record?.id !== projectId) return; // switched meanwhile
+    if (saved) {
+      setVersions(saved.versions);
+      setActiveVersionId(saved.activeVersionId);
+      setChosenStoryId(saved.chosenStoryId);
+      setTargetSeconds(saved.targetSeconds);
+      setStoryboardSelectIds(saved.storyboardSelectIds);
+    }
+    hydratedKeyRef.current = key;
+  }, []);
+
+  /**
+   * Brings the engine and the editor back to where a project was left: reloads
+   * the engine's saved analysis for the project's media folder, then that
+   * analysis's selects/stories and the project's saved cuts. The engine is
+   * single-tenant — if what it holds belongs to another folder, it's ignored
+   * rather than shown under this project.
+   */
+  const syncProjectWithEngine = useCallback(
+    async (client: EngineClient, record: ProjectRecord | null) => {
+      hydratedKeyRef.current = null;
+      if (!record?.mediaRoot) {
+        setSelects([]);
+        setStories([]);
+        return;
+      }
+      await client.restore(record.id, record.mediaRoot);
+      const patch = await client.getProjectPatch();
+      if (activeRef.current.record?.id !== record.id) return;
+      if (!patch?.mediaRoot || !samePath(patch.mediaRoot, record.mediaRoot)) {
+        setSelects([]);
+        setStories([]);
+        return;
+      }
+      setProject((p) => (p ? { ...p, ...patch } : p));
+      if (patch.analysisState === "complete" && patch.analysisId) {
+        await refreshEvidence(client);
+        await hydrateEditState(record.id, patch.analysisId);
+      }
+    },
+    [refreshEvidence, hydrateEditState],
+  );
+
+  /** Clears editor state when switching projects, before the new one syncs. */
+  const resetEditor = useCallback(() => {
+    hydratedKeyRef.current = null;
+    setSelects([]);
+    setStories([]);
+    setChosenStoryId(null);
+    setStoryboardSelectIds([]);
+    setVersions([baselineVersion(targetSecondsRef.current)]);
+    setActiveVersionId("v1");
+  }, []);
+
+  projectSwitchedRef.current = () => {
+    resetEditor();
+  };
+
+  // Restore the active project's engine analysis + saved cuts whenever the
+  // engine is (re)connected or the active project / its media folder changes —
+  // whichever happens last. Driven by state, not by call sites: at launch the
+  // project list and the engine come up in parallel, and a call-site sync
+  // could run in the gap between them and silently restore nothing.
+  const engineLive = connection === "live" || connection === "degraded";
+  useEffect(() => {
+    if (!engineLive || mode === "demo" || capabilities?.project === false) return;
+    const client = clientRef.current;
+    if (!client) return;
+    void syncProjectWithEngine(client, activeRef.current.record);
+  }, [
+    engineLive,
+    mode,
+    capabilities?.project,
+    activeProject?.id,
+    activeProject?.mediaRoot,
+    syncProjectWithEngine,
+  ]);
+
+  // Persist the editor state (versions, active cut, chosen story, target) per
+  // project, debounced — but only once that project's saved state for the
+  // current analysis has been loaded (hydratedKeyRef), never before.
+  useEffect(() => {
+    if (mode === "demo") return;
+    const desktop = typeof window === "undefined" ? undefined : window.assistantEditorDesktop;
+    const projectId = activeProject?.id;
+    const analysisId = project?.analysisId;
+    if (!desktop?.available || !projectId || !analysisId) return;
+    if (hydratedKeyRef.current !== `${projectId}:${analysisId}`) return;
+    // Nothing the user made yet (one empty version, default story, no picks):
+    // don't save it — writing it would replace a previously saved cut history
+    // with an untouched baseline (e.g. right after a re-analysis).
+    const pristine =
+      versions.length === 1 &&
+      versions[0]!.timeline.decisions.length === 0 &&
+      storyboardSelectIds.length === 0 &&
+      (chosenStoryId === null || chosenStoryId === stories[0]?.id);
+    if (pristine) return;
+    const state: SavedEditState = {
+      schema: EDIT_STATE_SCHEMA,
+      analysisId,
+      versions,
+      activeVersionId,
+      chosenStoryId,
+      targetSeconds,
+      storyboardSelectIds,
+      savedAt: new Date().toISOString(),
+    };
+    const t = setTimeout(() => void desktop.saveEditState(projectId, state).catch(() => {}), 300);
+    return () => clearTimeout(t);
+  }, [
+    mode,
+    activeProject?.id,
+    project?.analysisId,
+    versions,
+    activeVersionId,
+    chosenStoryId,
+    targetSeconds,
+    storyboardSelectIds,
+    stories,
+  ]);
 
   // Boot / reconnect
   useEffect(() => {
@@ -660,17 +896,14 @@ export function AEProvider({ children }: { children: ReactNode }) {
         setVersions([baselineVersion(targetSeconds)]);
         setActiveVersionId("v1");
 
-        // Guaranteed evidence endpoints.
-        await refreshEvidence(client);
+        // An engine without /project only has its evidence endpoints; otherwise
+        // the project-sync effect below restores the project once live.
+        if (caps.project === false) await refreshEvidence(client);
         if (cancelled) return;
 
-        // Optional enrichments — failures never change connection state.
-        const [patch, hosts] = await Promise.all([
-          caps.project === false ? Promise.resolve(null) : client.getProjectPatch(),
-          caps.nle === false ? Promise.resolve(null) : client.getNle(),
-        ]);
+        // Optional enrichment — failures never change connection state.
+        const hosts = caps.nle === false ? null : await client.getNle();
         if (cancelled) return;
-        if (patch) setProject((p) => (p ? { ...p, ...patch } : p));
         if (hosts) {
           setNle(hosts);
           setNleReported(true);
@@ -753,7 +986,21 @@ export function AEProvider({ children }: { children: ReactNode }) {
         setProject((p) => (p ? { ...p, ...patch, analysisState: resolvedState } : p));
         // Polling stops naturally next render since this effect's dependency
         // (project.analysisState) will no longer be "running".
-        if (resolvedState === "complete") await refreshEvidence(client);
+        if (resolvedState === "complete") {
+          // A NEW analysis re-ranks selects and re-numbers clips, so cuts built
+          // on the previous one no longer reference valid material: start a
+          // fresh history (the previous analysis's saved cuts stay on disk,
+          // tied to their own analysisId).
+          const record = activeRef.current.record;
+          const key = record && patch.analysisId ? `${record.id}:${patch.analysisId}` : null;
+          if (key && hydratedKeyRef.current !== key) {
+            setVersions([baselineVersion(targetSecondsRef.current)]);
+            setActiveVersionId("v1");
+            setChosenStoryId(null);
+            hydratedKeyRef.current = key;
+          }
+          await refreshEvidence(client);
+        }
       })();
     }, ANALYSIS_POLL_MS);
     return () => {
@@ -903,6 +1150,19 @@ export function AEProvider({ children }: { children: ReactNode }) {
     [versions, activeVersionId, chosenStoryId, stories, targetSeconds, pushVersion],
   );
 
+  const fetchFrames = useCallback(
+    async (clipId: string, times: number[], width: 160 | 240 | 320 = 240) => {
+      const client = clientRef.current;
+      if (!client || times.length === 0) return times.map(() => null);
+      try {
+        return await client.frames(clipId, times, width);
+      } catch {
+        return times.map(() => null);
+      }
+    },
+    [],
+  );
+
   const retryConnection = useCallback(() => {
     void (async () => {
       const worker = typeof window === "undefined" ? undefined : window.assistantEditorWorker;
@@ -974,6 +1234,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       setActiveVersion: (id: string) => setActiveVersionId(id),
       setTargetSeconds,
       updateSettings: (patch: Partial<SettingsState>) => setSettings((s) => ({ ...s, ...patch })),
+      fetchFrames,
     }),
     [
       mode,
@@ -1017,6 +1278,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       openProject,
       deleteProject,
       importMedia,
+      fetchFrames,
     ],
   );
 

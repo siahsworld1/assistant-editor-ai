@@ -7,11 +7,19 @@
 export const TC_RE = /^(\d{1,2}):(\d{2}):(\d{2}):(\d{2})$/;
 
 export function secondsToTc(seconds: number, fps: number): string {
-  const s = Math.max(0, seconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = Math.floor(s % 60);
-  const f = Math.floor((s - Math.floor(s)) * fps);
+  // Floating-point tolerance: a time built from a whole frame count (e.g.
+  // 13 + 18/23.976) can come back as 17.999999… frames, which a bare floor
+  // displayed one frame early ("…:17" for a "…:18" in-point). A frame field
+  // that reaches the frame rate carries into the next second.
+  let whole = Math.floor(Math.max(0, seconds));
+  let f = Math.floor((Math.max(0, seconds) - whole) * fps + 1e-6);
+  if (f >= Math.max(1, Math.round(fps || 24))) {
+    f = 0;
+    whole += 1;
+  }
+  const h = Math.floor(whole / 3600);
+  const m = Math.floor((whole % 3600) / 60);
+  const sec = whole % 60;
   const p = (n: number) => String(n).padStart(2, "0");
   return `${p(h)}:${p(m)}:${p(sec)}:${p(f)}`;
 }

@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import shutil
 import tempfile
 import traceback
 from pathlib import Path
 
 import media
+import persistence
 import reasoning
 from providers.base import ProviderError, ReasoningProvider, TranscriptionProvider
 from providers.registry import get_reasoning_provider, get_transcription_provider
@@ -94,6 +96,7 @@ def _run_analysis(project_id: str | None, media_root: str | None):
         STORE.set_progress(88)
         _generate_stories(reasoning_provider)
         STORE.complete()
+        persistence.save_snapshot(STORE)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -125,6 +128,7 @@ def _analyze_one_clip(
         resolution=info["resolution"],
         fps=info["fps"] or 24.0,
         audio_channels=info.get("audio_channels", 0),
+        source_key=media.source_cache_key(path) or "",
         speakers=[speaker] if (role == "interview" and speaker) else [],
         state="analyzing",
     )
@@ -158,7 +162,7 @@ def _analyze_one_clip(
         # shows the waveform-style placeholder for those instead) and never fails
         # the clip — but a real failure IS surfaced in technicalIssues, instead
         # of only a server-side log line nobody looking at the app would see.
-        cache_key = media.source_cache_key(path)
+        cache_key = clip.source_key or None
         if ext not in media.AUDIO_ONLY_EXTENSIONS and STORE.media_root:
             thumb_rel, thumb_error = _cached_thumbnail(path, cache_key, info["duration"])
             if thumb_rel:
@@ -540,6 +544,49 @@ def _resolve_lane_overlaps(decisions: list, warnings: list[str]) -> list:
     return [{**d, "timelineStartSeconds": placed[i]} for i, d in enumerate(decisions)]
 
 
+_DURATION_IN_NOTE = re.compile(r"(\d{1,4}(?:\.\d+)?)\s*-?\s*(seconds?|secs?\b|minutes?|mins?\b)", re.IGNORECASE)
+
+
+def target_seconds_from_note(note: str | None) -> float | None:
+    """'30-second', '45 sec', '2-minute' → seconds; None if the note names no length."""
+    if not note:
+        return None
+    m = _DURATION_IN_NOTE.search(note)
+    if not m:
+        return None
+    value = float(m.group(1)) * (60 if m.group(2).lower().startswith("min") else 1)
+    return value if 5 <= value <= 3 * 3600 else None
+
+
+MAX_VISUAL_MOMENTS_PER_CLIP = 8
+
+
+def _clip_material_lines() -> list[str]:
+    """Every analyzed clip, with whether it has dialogue and its REAL logged
+    visual moments — the material the model can lay over the interview as
+    b-roll. Without this the model only ever saw transcript selects, so it had
+    nothing to cut away to (found in the RC test: a prompt asking for B-roll
+    produced no V2 at all). Nothing here is invented: only clips and visual
+    evidence the analysis actually produced."""
+    clips = _clip_lookup()
+    if not clips:
+        return []
+    by_clip: dict[str, list[dict]] = {}
+    for v in STORE.visual_evidence:
+        by_clip.setdefault(v.get("clipId", ""), []).append(v)
+    lines = ["\nCLIP MATERIAL (clipId | file | durationSeconds | dialogue | visual moments at source timecode):"]
+    for c in clips.values():
+        if c.state != "analyzed":
+            continue
+        moments = "; ".join(
+            f"{v['atTc']} {v['kind']}: {v['label']}" for v in by_clip.get(c.id, [])[:MAX_VISUAL_MOMENTS_PER_CLIP]
+        )
+        lines.append(
+            f"{c.id} | {c.filename} | {c.duration_seconds} | {'yes' if c.has_transcript else 'no'} | {moments or '—'}"
+        )
+    return lines
+
+
 def build_timeline(
     project_id: str | None,
     story_id: str | None,
@@ -562,6 +609,13 @@ def build_timeline(
             "decisions": [],
         }
 
+    # An explicit length in the Director note ("a 30-second rough cut") is the
+    # editor's actual request — it wins over the CUT page's target slider,
+    # which otherwise sends its own (unrelated) default alongside the note.
+    requested = target_seconds_from_note(command)
+    if requested is not None:
+        target_seconds = requested
+
     lines = [
         f"STORY: {story['title']} — {story['premise']}",
         f"TARGET SECONDS: {target_seconds}",
@@ -576,6 +630,7 @@ def build_timeline(
         lines.append(
             f"{s['id']} | {s['clipId']} | {s['startTc']} | {s['endTc']} | {s['durationSeconds']} | \"{s['transcriptExcerpt']}\""
         )
+    lines.extend(_clip_material_lines())
     brief = "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
     if reasoning_provider is None:
@@ -599,6 +654,7 @@ def build_timeline(
                 "summary": str(result.get("summary", "Engine returned a new assembly.")),
                 "changes": changes,
                 "decisions": validated,
+                "targetSeconds": target_seconds,
             }
         log.warning("build_timeline: model result had zero valid decisions (%s); using fallback", warnings)
 
@@ -629,4 +685,8 @@ def build_timeline(
         "summary": f"Assembled '{story['title']}' from {len(validated)} selects (fallback assembly — the reasoning model was unavailable or returned nothing valid).",
         "changes": ["Concatenated story selects in beat order", *warnings],
         "decisions": validated,
+        # The target this cut was actually built against (a length named in
+        # the Director note overrides the request) — so the app can scale and
+        # label the version by it instead of an unrelated slider default.
+        "targetSeconds": target_seconds,
     }

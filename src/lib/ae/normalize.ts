@@ -15,7 +15,9 @@ import type {
   SelectEvidence,
   StoryBeat,
   StoryCandidate,
+  TranscriptSegment,
   UniversalTimeline,
+  VisualEvidence,
 } from "./types";
 
 type Rec = Record<string, unknown>;
@@ -405,6 +407,49 @@ function normalizeClips(v: unknown): Clip[] {
 }
 
 /** Optional enrichment — merged over the existing shell, never replacing it wholesale. */
+const VISUAL_KINDS: VisualEvidence["kind"][] = [
+  "face",
+  "motion",
+  "scene",
+  "b-roll",
+  "graphic",
+  "technical",
+];
+
+function normalizeTranscript(list: unknown[]): TranscriptSegment[] {
+  return list
+    .filter(isRec)
+    .map((raw, i) => ({
+      id: str(pick(raw, "id"), `t-${i + 1}`),
+      clipId: str(pick(raw, "clipId", "clip_id")),
+      speaker: str(pick(raw, "speaker"), "Unknown speaker"),
+      startTc: str(pick(raw, "startTc"), "00:00:00:00"),
+      endTc: str(pick(raw, "endTc"), "00:00:00:00"),
+      text: str(pick(raw, "text")),
+      confidence: num(pick(raw, "confidence"), 0),
+    }))
+    .filter((t) => t.clipId && t.text);
+}
+
+function normalizeVisualEvidence(list: unknown[]): VisualEvidence[] {
+  return list
+    .filter(isRec)
+    .map((raw, i) => {
+      const kind = str(pick(raw, "kind"), "scene");
+      return {
+        id: str(pick(raw, "id"), `v-${i + 1}`),
+        clipId: str(pick(raw, "clipId", "clip_id")),
+        kind: (VISUAL_KINDS as string[]).includes(kind)
+          ? (kind as VisualEvidence["kind"])
+          : "scene",
+        label: str(pick(raw, "label")),
+        atTc: str(pick(raw, "atTc"), "00:00:00:00"),
+        confidence: num(pick(raw, "confidence"), 0),
+      };
+    })
+    .filter((v) => v.clipId && v.label);
+}
+
 export function normalizeProjectPatch(payload: unknown): Partial<ProjectBrain> {
   const root = unwrapObject(payload, "project", "brain");
   if (!root) return {};
@@ -452,6 +497,16 @@ export function normalizeProjectPatch(payload: unknown): Partial<ProjectBrain> {
             ? "idle"
             : null;
   if (state) patch.analysisState = state;
+  // The evidence WATCH's Clip Inspector shows. Only replaced when the engine
+  // actually sends it, so an older engine never blanks real data.
+  const transcriptRaw = pick(root, "transcript");
+  if (Array.isArray(transcriptRaw)) patch.transcript = normalizeTranscript(transcriptRaw);
+  const evidenceRaw = pick(root, "visualEvidence", "visual_evidence");
+  if (Array.isArray(evidenceRaw)) patch.visualEvidence = normalizeVisualEvidence(evidenceRaw);
+  if ("analysisId" in root) {
+    const analysisId = str(pick(root, "analysisId"));
+    patch.analysisId = analysisId || null;
+  }
   // Always set (never conditionally omitted) so a resolved error clears on the next
   // successful poll instead of lingering in state after the user re-runs Analyze.
   if ("error" in root || "analysisState" in root || "state" in root) {

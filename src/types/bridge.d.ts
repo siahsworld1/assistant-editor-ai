@@ -48,6 +48,12 @@ export interface DesktopCapabilitiesApi {
   /** Authorizes the ae-media:// playback protocol to stream from this mediaRoot
    * (must already be authorized via chooseMediaFolder). Pass "" to deauthorize. */
   setActiveMediaRoot(root: string): Promise<DesktopMediaRootResponse>;
+  /** The project to reopen on launch (kept by the main process). */
+  getActiveProject(): Promise<{ ok: boolean; id?: string | null; error?: string }>;
+  setActiveProject(id: string | null): Promise<{ ok: boolean; error?: string }>;
+  /** Per-project editor state (versions, active cut, chosen story). */
+  loadEditState(id: string): Promise<{ ok: boolean; state?: unknown; error?: string }>;
+  saveEditState(id: string, state: unknown): Promise<{ ok: boolean; error?: string }>;
 }
 
 /** Snapshot from electron/worker-supervisor.cjs::WorkerSupervisor.status(). */

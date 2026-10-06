@@ -467,17 +467,25 @@ def generate_thumbnail(
     short of the proxy transcode's own 1800s budget while giving real footage
     real headroom instead of failing on a slow-but-fine seek.
     """
+    return extract_frame_at(src, dest, max(0.1, (duration_seconds or 0.0) * 0.15), max_width, quality=4)
+
+
+def extract_frame_at(
+    src: Path, dest: Path, seconds: float, max_width: int = THUMB_MAX_WIDTH, quality: int = 4,
+) -> tuple[bool, str | None]:
+    """One real JPEG frame of `src` at `seconds` (never upscaled), written
+    atomically to `dest`. Same failure contract as generate_thumbnail()."""
     if not ffmpeg_available():
         return False, ffmpeg_missing_reason()
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = _partial_path(dest)
-    ts = max(0.1, (duration_seconds or 0.0) * 0.15)
+    ts = max(0.0, seconds)
     scale_filter = f"scale='min({max_width},iw)':-2"
     try:
         proc = subprocess.run(
             [
                 ffmpeg_bin(), "-y", "-ss", f"{ts:.2f}", "-i", str(src),
-                "-frames:v", "1", "-vf", scale_filter, "-q:v", "4",
+                "-frames:v", "1", "-vf", scale_filter, "-q:v", str(quality),
                 str(partial),
             ],
             capture_output=True, timeout=90,

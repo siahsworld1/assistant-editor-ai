@@ -7,6 +7,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useAE } from "@/lib/ae/store";
+import {
+  SourcePreviewDialog,
+  SourceThumb,
+  type PreviewTarget,
+} from "@/components/ae/SourceVisuals";
+import { sourceRangeOf } from "@/lib/ae/source-range";
 
 export const Route = createFileRoute("/selects")({
   head: () => ({
@@ -37,8 +43,17 @@ const categories = [
 ] as const;
 
 function SelectsPage() {
-  const { selects, storyboardSelectIds, toggleStorySelect, audition, auditionId, loading } =
-    useAE();
+  const {
+    selects,
+    storyboardSelectIds,
+    toggleStorySelect,
+    audition,
+    auditionId,
+    loading,
+    project,
+  } = useAE();
+  const [preview, setPreview] = useState<PreviewTarget | null>(null);
+  const clipById = new Map((project?.clips ?? []).map((c) => [c.id, c]));
   const [cat, setCat] = useState<(typeof categories)[number]["id"]>("all");
   const [speaker, setSpeaker] = useState<string>("all");
 
@@ -107,6 +122,11 @@ function SelectsPage() {
           {rows.map((s) => {
             const added = storyboardSelectIds.includes(s.id);
             const auditioning = auditionId === s.id;
+            // The select's real source range, read at ITS clip's own frame rate.
+            const range = sourceRangeOf(s, clipById);
+            const clip = range?.clip;
+            const inSeconds = range?.inSeconds ?? 0;
+            const outSeconds = range?.outSeconds ?? 0;
             return (
               <article
                 key={s.id}
@@ -116,6 +136,24 @@ function SelectsPage() {
                 )}
               >
                 <div className="flex flex-wrap items-start gap-5">
+                  <SourceThumb
+                    clip={clip}
+                    seconds={inSeconds}
+                    label={s.startTc}
+                    className="w-44 shrink-0"
+                    onClick={
+                      clip
+                        ? () =>
+                            setPreview({
+                              clip,
+                              inSeconds,
+                              outSeconds,
+                              title: `${s.speaker} — “${s.transcriptExcerpt.slice(0, 80)}”`,
+                              subtitle: `score ${s.score}`,
+                            })
+                        : undefined
+                    }
+                  />
                   <div className="flex w-12 shrink-0 flex-col items-center">
                     <span className="font-tc text-xl text-primary">
                       {String(s.rank).padStart(2, "0")}
@@ -228,6 +266,7 @@ function SelectsPage() {
           })}
         </div>
       </div>
+      <SourcePreviewDialog target={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }

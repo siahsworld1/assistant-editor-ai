@@ -113,8 +113,14 @@ fences):
 "sourceInTc": "<HH:MM:SS:FF from the select's startTc>", "sourceOutTc": "<HH:MM:SS:FF from the select's endTc>", \
 "timelineStartSeconds": <number>, "durationSeconds": <number>, "selectId": "<select id or omit>"}]}
 Only use clipIds and selectIds that were given to you. Keep timelineStartSeconds/durationSeconds \
-internally consistent (each event starts where the previous one ends, on the same lane ordering \
-given)."""
+internally consistent: interview events play back-to-back (each starts where the previous one ends).
+B-ROLL: when CLIP MATERIAL lists visual moments that support what is being said, you may add \
+"b-roll" lane events — cutaways laid OVER the interview (the interview audio keeps playing \
+underneath). For each, pick a clip and a source range around one of its listed visual moments \
+(sourceInTc/sourceOutTc inside that clip's durationSeconds), and set timelineStartSeconds so it \
+sits within the span of the interview event it covers. B-roll does not advance the interview \
+timeline. Prefer clips without dialogue, and never cover the first words of a key statement. Only \
+use visual moments that are listed — never invent footage."""
 
 
 def build_timeline(provider: ReasoningProvider, build_brief: str) -> dict | None:

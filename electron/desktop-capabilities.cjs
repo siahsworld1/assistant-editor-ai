@@ -25,6 +25,15 @@ const MAX_PROJECTS = 60;
 const MAX_FILES = 4000;
 const MAX_DEPTH = 4;
 const PROJECT_FILE = "projects.json";
+/** { activeProjectId } — kept in main, not renderer localStorage: the packaged
+ * renderer runs on a fresh loopback port (= a fresh origin, empty localStorage)
+ * every launch. */
+const APP_STATE_FILE = "app-state.json";
+/** One file per project: the editor-side state that otherwise only lived in
+ * React memory (versions, active cut, chosen story, target length). */
+const EDIT_STATE_DIR = "edit-state";
+const MAX_EDIT_STATE_BYTES = 8 * 1024 * 1024;
+const PROJECT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 function clampString(value, max, fallback = "") {
   if (typeof value !== "string") return fallback;
@@ -155,7 +164,69 @@ class DesktopCapabilities {
     if (!key) return { ok: false, error: "Missing project id." };
     const projects = (await this.readAll()).filter((p) => p.id !== key);
     await this.writeAll(projects);
+    if (PROJECT_ID_RE.test(key)) await fsp.rm(this.editStatePath(key), { force: true });
     return { ok: true, projects };
+  }
+
+  async writeAtomic(file, text) {
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    const partial = `${file}.partial`;
+    await fsp.writeFile(partial, text, "utf8");
+    await fsp.rename(partial, file);
+  }
+
+  async getActiveProject() {
+    try {
+      const parsed = JSON.parse(
+        await fsp.readFile(path.join(this.userDataDir, APP_STATE_FILE), "utf8"),
+      );
+      const id =
+        typeof parsed?.activeProjectId === "string" && PROJECT_ID_RE.test(parsed.activeProjectId)
+          ? parsed.activeProjectId
+          : null;
+      return { ok: true, id };
+    } catch {
+      return { ok: true, id: null };
+    }
+  }
+
+  async setActiveProject(id) {
+    if (id !== null && !(typeof id === "string" && PROJECT_ID_RE.test(id))) {
+      return { ok: false, error: "Invalid project id." };
+    }
+    await this.writeAtomic(
+      path.join(this.userDataDir, APP_STATE_FILE),
+      JSON.stringify({ activeProjectId: id }),
+    );
+    return { ok: true };
+  }
+
+  editStatePath(id) {
+    return path.join(this.userDataDir, EDIT_STATE_DIR, `${id}.json`);
+  }
+
+  async loadEditState(id) {
+    if (!(typeof id === "string" && PROJECT_ID_RE.test(id)))
+      return { ok: false, error: "Invalid project id." };
+    try {
+      const raw = await fsp.readFile(this.editStatePath(id), "utf8");
+      const state = JSON.parse(raw);
+      return { ok: true, state: state && typeof state === "object" ? state : null };
+    } catch {
+      return { ok: true, state: null };
+    }
+  }
+
+  async saveEditState(id, state) {
+    if (!(typeof id === "string" && PROJECT_ID_RE.test(id)))
+      return { ok: false, error: "Invalid project id." };
+    if (!state || typeof state !== "object" || Array.isArray(state))
+      return { ok: false, error: "Invalid edit state." };
+    const text = JSON.stringify(state);
+    if (text.length > MAX_EDIT_STATE_BYTES)
+      return { ok: false, error: "Edit state is too large to save." };
+    await this.writeAtomic(this.editStatePath(id), text);
+    return { ok: true };
   }
 
   /** User-gated: opens the OS folder picker. The renderer cannot pass a path in. */
@@ -277,6 +348,10 @@ const ACTIONS = new Set([
   "indexMedia",
   "exportFile",
   "setActiveMediaRoot",
+  "getActiveProject",
+  "setActiveProject",
+  "loadEditState",
+  "saveEditState",
 ]);
 
 /** Dispatcher used by the IPC handler. Rejects anything outside the action list. */
@@ -300,6 +375,14 @@ async function handleDesktopAction(caps, action, payload) {
         return await caps.exportFile(payload?.suggestedName, payload?.content);
       case "setActiveMediaRoot":
         return await caps.setActiveMediaRoot(payload?.root);
+      case "getActiveProject":
+        return await caps.getActiveProject();
+      case "setActiveProject":
+        return await caps.setActiveProject(payload?.id ?? null);
+      case "loadEditState":
+        return await caps.loadEditState(payload?.id);
+      case "saveEditState":
+        return await caps.saveEditState(payload?.id, payload?.state);
       default:
         return { ok: false, error: "Unsupported action" };
     }

@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 
 
@@ -21,6 +22,9 @@ class ClipState:
     resolution: str
     fps: float
     audio_channels: int = 0  # 0 = no audio stream / not measured
+    # media.source_cache_key() of the analyzed source version — lets a saved
+    # analysis be restored only if the media on disk is still the same.
+    source_key: str = ""
     rel_path: str = ""
     proxy_rel_path: str = ""
     thumbnail_rel_path: str = ""
@@ -75,6 +79,10 @@ class ProjectStore:
             self.analysis_state = "idle"  # idle | running | complete | error
             self.analysis_progress = 0
             self.error: str | None = None
+            # Identifies one completed analysis. The app stores it with its edit
+            # state so saved cuts are only restored against the analysis (and
+            # clip ids) they were built from.
+            self.analysis_id: str | None = None
 
     def begin_analysis(self, project_id: str | None, media_root: str | None):
         with self._lock:
@@ -101,6 +109,7 @@ class ProjectStore:
         with self._lock:
             self.analysis_state = "complete"
             self.analysis_progress = 100
+            self.analysis_id = uuid.uuid4().hex
 
     def snapshot_summary(self) -> dict:
         with self._lock:
@@ -123,6 +132,13 @@ class ProjectStore:
                 "summary": self.snapshot_summary(),
                 "analysisState": self.analysis_state,
                 "analysisProgress": self.analysis_progress,
+                "analysisId": self.analysis_id,
+                # The evidence WATCH's Clip Inspector shows. Previously only
+                # per-clip counts were sent, so the inspector reported "No
+                # dialogue detected" / "Nothing logged yet" for every clip even
+                # when analysis had produced real transcript and visual evidence.
+                "transcript": list(self.transcript),
+                "visualEvidence": list(self.visual_evidence),
                 # Additive, backward-compatible: existing consumers that don't know
                 # this key ignore it. Added so a caller polling GET /project (e.g.
                 # worker/validate_e2e.py) can report *why* analysisState == "error"

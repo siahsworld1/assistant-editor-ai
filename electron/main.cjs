@@ -4,6 +4,7 @@ const { validateRequest, sanitizeHeaders } = require("./allowlist.cjs");
 const { EmbeddedRenderer } = require("./renderer-server.cjs");
 const { DesktopCapabilities, handleDesktopAction } = require("./desktop-capabilities.cjs");
 const { PremiereBridge } = require("./premiere-bridge.cjs");
+const { configureAppIdentity } = require("./app-identity.cjs");
 const { WorkerSupervisor, resolveWorkerLaunch } = require("./worker-supervisor.cjs");
 const {
   CredentialService,
@@ -20,6 +21,15 @@ const {
 // Must happen before app.whenReady() — Electron silently ignores privilege
 // registration for a scheme that's already been used or after boot.
 registerMediaProtocolPrivileges(protocol);
+
+// Real product identity for local app data (was the template's
+// "tanstack_start_ts"); copies legacy projects over once. Before "ready".
+const identity = configureAppIdentity(app);
+if (identity.migration.migrated) {
+  console.log(
+    `[assistant-editor] copied legacy app data (${identity.migration.copied.join(", ")}) into ${identity.userData}`,
+  );
+}
 
 const isDev = !app.isPackaged || process.env["ASSISTANT_EDITOR_DEV"] === "1";
 const DEV_RENDERER_URL = process.env["ASSISTANT_EDITOR_RENDERER_URL"] || "http://localhost:8080";

@@ -60,6 +60,18 @@ export interface BuildRequest {
   command?: string;
 }
 
+export interface RestoreResult {
+  restored: boolean;
+  /** e.g. "restored", "already-loaded", "no-saved-analysis", "media-changed". */
+  reason: string;
+}
+
+export interface SourceFrame {
+  seconds: number;
+  /** mediaRoot-relative, served through the ae-media:// protocol. */
+  relPath: string;
+}
+
 export interface BuildResult {
   timeline: UniversalTimeline;
   summary: string;
@@ -187,6 +199,51 @@ export class EngineClient {
       timeoutMs: 90000,
     });
     return { timeline: normalizeTimeline(raw, req.targetSeconds), ...extractBuildSummary(raw) };
+  }
+
+  /**
+   * Reloads the engine's saved analysis for a project's media folder after the
+   * app or engine restarted (worker/persistence.py). Never throws: an engine
+   * without the route, or any failure, simply means "nothing restored".
+   */
+  async restore(projectId: string, mediaRoot: string): Promise<RestoreResult> {
+    try {
+      const raw = (await this.call("project", "/restore", {
+        method: "POST",
+        body: { projectId, mediaRoot },
+        timeoutMs: 30000,
+      })) as Record<string, unknown> | null;
+      return {
+        restored: raw?.["restored"] === true,
+        reason: typeof raw?.["reason"] === "string" ? (raw["reason"] as string) : "unknown",
+      };
+    } catch {
+      return { restored: false, reason: "unavailable" };
+    }
+  }
+
+  /**
+   * Real frames of a clip at source times (seconds). The result is ALIGNED with
+   * `times` (one entry per requested time, null where that frame failed), so a
+   * failure can never shift another frame onto the wrong moment.
+   */
+  async frames(
+    clipId: string,
+    times: number[],
+    width: 160 | 240 | 320 = 240,
+  ): Promise<Array<SourceFrame | null>> {
+    const raw = (await this.call("project", "/frames", {
+      method: "POST",
+      body: { clipId, times, width },
+      timeoutMs: 60000,
+    })) as { frames?: unknown } | null;
+    const list = Array.isArray(raw?.frames) ? raw.frames : [];
+    return times.map((_, i) => {
+      const f = list[i] as { seconds?: unknown; relPath?: unknown } | undefined;
+      return f && typeof f.relPath === "string"
+        ? { seconds: Number(f.seconds), relPath: f.relPath }
+        : null;
+    });
   }
 
   /** Optional enrichment. Resolves to null when the worker does not implement it. */

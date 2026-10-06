@@ -2,6 +2,14 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Download, Hammer, Loader2, Pause, Play } from "lucide-react";
 import { toast } from "sonner";
 import { MediaPlayer } from "@/components/ae/MediaPlayer";
+import { useState } from "react";
+import {
+  CutawayOverlay,
+  Filmstrip,
+  SourcePreviewDialog,
+  type PreviewTarget,
+} from "@/components/ae/SourceVisuals";
+import { decisionSourceRange, timelineScale } from "@/lib/ae/source-range";
 import { PageHeader } from "@/components/ae/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,7 +44,7 @@ export const Route = createFileRoute("/cut")({
 const laneMeta: Record<EditDecisionLane, { label: string; color: string }> = {
   interview: { label: "V1 · Interview", color: "bg-lane-interview" },
   "b-roll": { label: "V2 · B-roll", color: "bg-lane-broll" },
-  audio: { label: "A1 · Ambient", color: "bg-lane-audio" },
+  audio: { label: "A2 · Audio", color: "bg-lane-audio" },
 };
 
 function CutPage() {
@@ -57,14 +65,52 @@ function CutPage() {
 
   const version = versions.find((v) => v.id === activeVersionId) ?? versions[0]!;
   const timeline = version.timeline;
-  const scale = Math.max(timeline.totalSeconds, targetSeconds);
+  // Scale to THIS version (its own length and the target it was built to) —
+  // not the slider, which sets the target for the next build. With a 360s
+  // slider default, a 30-second cut used to fill ~8% of the track.
+  const versionTarget = timeline.targetSeconds || targetSeconds;
+  const scale = timelineScale(timeline.totalSeconds, versionTarget);
   const story = stories.find((s) => s.id === chosenStoryId);
   const clips = project?.clips ?? [];
   const mediaRoot = project?.mediaRoot ?? "";
 
   const playback = useTimelinePlayback(timeline, clips);
 
-  const lanes: EditDecisionLane[] = ["interview", "b-roll", "audio"];
+  const [preview, setPreview] = useState<PreviewTarget | null>(null);
+  const clipById = new Map(clips.map((c) => [c.id, c]));
+  /** An edit's real source range, read at its clip's own frame rate. */
+  const sourceRange = (d: UniversalTimeline["decisions"][number]) => {
+    const r = decisionSourceRange(d, clipById);
+    return { clip: r?.clip, inSeconds: r?.inSeconds ?? 0, outSeconds: r?.outSeconds ?? 0 };
+  };
+  const openSource = (d: UniversalTimeline["decisions"][number]) => {
+    const { clip, inSeconds, outSeconds } = sourceRange(d);
+    if (clip)
+      setPreview({
+        clip,
+        inSeconds,
+        outSeconds,
+        title: d.label,
+        subtitle: `${d.lane} · timeline ${d.timelineStartSeconds.toFixed(1)}s`,
+      });
+  };
+  // Tracks top-to-bottom like an NLE: V2 cutaways over V1 interview; A1 is the
+  // interview's own sync audio (what the XMEML export puts on A1, linked to V1);
+  // A2 only exists when the cut has standalone audio events.
+  const hasA2 = timeline.decisions.some((d) => d.lane === "audio");
+  const trackRows: Array<{
+    id: string;
+    label: string;
+    lane: EditDecisionLane;
+    kind: "video" | "sync-audio" | "audio";
+  }> = [
+    { id: "V2", label: laneMeta["b-roll"].label, lane: "b-roll", kind: "video" },
+    { id: "V1", label: laneMeta.interview.label, lane: "interview", kind: "video" },
+    { id: "A1", label: "A1 · Interview audio", lane: "interview", kind: "sync-audio" },
+    ...(hasA2
+      ? [{ id: "A2", label: laneMeta.audio.label, lane: "audio" as const, kind: "audio" as const }]
+      : []),
+  ];
 
   type ExportFormat = "edl" | "xmeml" | "fcpxml";
   const FORMAT_LABEL: Record<ExportFormat, string> = {
@@ -164,17 +210,29 @@ function CutPage() {
                     </span>
                   )}
                 </div>
-                <MediaPlayer
-                  ref={playback.playerRef}
-                  src={playback.activeSegment?.src ?? null}
-                  startAtSeconds={playback.pendingStart}
-                  hideControls
-                  onTimeUpdate={playback.handleTimeUpdate}
-                  onDurationChange={playback.handleSegmentReady}
-                  onPlayStateChange={playback.handlePlayStateChange}
-                  onEnded={playback.handleEnded}
-                  className="mx-auto max-w-md"
-                />
+                <div className="relative mx-auto max-w-md">
+                  <MediaPlayer
+                    ref={playback.playerRef}
+                    src={playback.activeSegment?.src ?? null}
+                    startAtSeconds={playback.pendingStart}
+                    hideControls
+                    onTimeUpdate={playback.handleTimeUpdate}
+                    onDurationChange={playback.handleSegmentReady}
+                    onPlayStateChange={playback.handlePlayStateChange}
+                    onEnded={playback.handleEnded}
+                  />
+                  <CutawayOverlay
+                    overlay={playback.overlay}
+                    playheadSeconds={playback.playheadSeconds}
+                    playing={playback.isPlaying}
+                  />
+                </div>
+                <div className="mx-auto mt-1 max-w-md truncate font-tc text-[10px] text-muted-foreground">
+                  {playback.activeSegment
+                    ? `V1 ${playback.activeSegment.clip?.filename ?? ""} · ${playback.activeSegment.decision.sourceInTc}`
+                    : ""}
+                  {playback.overlay ? ` · V2 ${playback.overlay.clip?.filename ?? ""}` : ""}
+                </div>
                 <div className="mx-auto mt-2 flex max-w-md items-center gap-3">
                   <button
                     type="button"
@@ -266,46 +324,76 @@ function CutPage() {
                   </div>
                 )}
 
-                {lanes.map((lane) => {
-                  const items = timeline.decisions.filter((d) => d.lane === lane);
+                {trackRows.map((row) => {
+                  const items = timeline.decisions.filter((d) => d.lane === row.lane);
                   return (
-                    <div key={lane} className="flex items-stretch gap-3">
+                    <div key={row.id} className="flex items-stretch gap-3">
                       <div className="w-[112px] shrink-0 pt-3 font-tc text-[11px] text-muted-foreground">
-                        {laneMeta[lane].label}
+                        {row.label}
                       </div>
-                      <div className="hairline-grid relative h-12 flex-1 rounded border border-border bg-surface">
-                        {lane === "audio" ? (
-                          <div className="absolute inset-y-1.5 left-0 right-0 rounded-sm bg-lane-audio/25 px-2 text-[10px] leading-9 text-foreground/70">
-                            S201 room tone bed — full timeline
-                          </div>
-                        ) : (
-                          items.map((d) => (
+                      <div
+                        className={cn(
+                          "hairline-grid relative flex-1 rounded border border-border bg-surface",
+                          row.kind === "video" ? "h-14" : "h-9",
+                        )}
+                      >
+                        {items.map((d) => {
+                          const { clip, inSeconds, outSeconds } = sourceRange(d);
+                          const widthPct = (d.durationSeconds / scale) * 100;
+                          return (
                             <div
-                              key={d.id}
-                              title={`${d.label} · ${d.sourceInTc}–${d.sourceOutTc}`}
+                              key={`${row.id}-${d.id}`}
+                              data-testid={`track-${row.id}-event`}
+                              title={`${clip?.filename ?? d.clipId} · ${d.sourceInTc}–${d.sourceOutTc} · ${d.durationSeconds.toFixed(2)}s`}
                               className={cn(
-                                "absolute inset-y-1.5 overflow-hidden rounded-sm border border-black/30 px-2 py-1",
-                                laneMeta[lane].color,
-                                "opacity-90",
+                                "absolute inset-y-1 overflow-hidden rounded-sm border-x-2 border-y border-black/50",
+                                row.kind === "video"
+                                  ? "bg-black"
+                                  : laneMeta[row.lane === "audio" ? "audio" : "interview"].color,
+                                row.kind === "sync-audio" && "opacity-60",
                               )}
                               style={{
                                 left: `${(d.timelineStartSeconds / scale) * 100}%`,
-                                width: `${(d.durationSeconds / scale) * 100}%`,
+                                width: `${widthPct}%`,
                               }}
                             >
-                              <span className="block truncate text-[10px] font-medium text-black/85">
-                                {d.label}
+                              {row.kind === "video" && (
+                                <Filmstrip
+                                  clip={clip}
+                                  inSeconds={inSeconds}
+                                  outSeconds={outSeconds}
+                                  count={Math.max(1, Math.min(6, Math.round(widthPct / 6)))}
+                                  className="absolute inset-0 opacity-80"
+                                />
+                              )}
+                              <span
+                                className={cn(
+                                  "relative block truncate px-1.5 pt-0.5 text-[10px] font-medium",
+                                  row.kind === "video" ? "text-white drop-shadow" : "text-black/85",
+                                )}
+                              >
+                                {clip?.filename ?? d.label}
+                                {row.kind === "sync-audio" && clip?.audioChannels
+                                  ? ` · ${clip.audioChannels}ch`
+                                  : ""}
                               </span>
-                              <span className="font-tc block truncate text-[9px] text-black/60">
-                                {d.sourceInTc}
+                              <span
+                                className={cn(
+                                  "relative block truncate px-1.5 font-tc text-[9px]",
+                                  row.kind === "video"
+                                    ? "text-white/80 drop-shadow"
+                                    : "text-black/60",
+                                )}
+                              >
+                                {d.sourceInTc} · {d.durationSeconds.toFixed(1)}s
                               </span>
                             </div>
-                          ))
-                        )}
-                        {targetSeconds < scale && (
+                          );
+                        })}
+                        {versionTarget < scale && (
                           <div
                             className="absolute inset-y-0 w-px bg-primary"
-                            style={{ left: `${(targetSeconds / scale) * 100}%` }}
+                            style={{ left: `${(versionTarget / scale) * 100}%` }}
                           />
                         )}
                       </div>
@@ -325,6 +413,7 @@ function CutPage() {
                     <th className="px-5 py-2 font-normal">#</th>
                     <th className="px-3 py-2 font-normal">Lane</th>
                     <th className="px-3 py-2 font-normal">Event</th>
+                    <th className="px-3 py-2 font-normal">Source</th>
                     <th className="px-3 py-2 font-normal">Source in</th>
                     <th className="px-3 py-2 font-normal">Source out</th>
                     <th className="px-3 py-2 font-normal">Duration</th>
@@ -346,6 +435,16 @@ function CutPage() {
                         <span className="ml-2 text-muted-foreground">{d.lane}</span>
                       </td>
                       <td className="px-3 py-2">{d.label}</td>
+                      <td className="px-3 py-2 font-tc text-[11px] text-muted-foreground">
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-1 hover:text-foreground"
+                          onClick={() => openSource(d)}
+                          title="Preview this edit's source range"
+                        >
+                          <Play className="size-3" /> {clipById.get(d.clipId)?.filename ?? d.clipId}
+                        </button>
+                      </td>
                       <td className="px-3 py-2 font-tc text-muted-foreground">{d.sourceInTc}</td>
                       <td className="px-3 py-2 font-tc text-muted-foreground">{d.sourceOutTc}</td>
                       <td className="px-3 py-2 font-tc">{d.durationSeconds.toFixed(1)}s</td>
@@ -442,6 +541,7 @@ function CutPage() {
           </aside>
         </div>
       </div>
+      <SourcePreviewDialog target={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }

@@ -51,6 +51,25 @@ contextBridge.exposeInMainWorld("assistantEditorDesktop", {
       action: "setActiveMediaRoot",
       payload: { root: typeof root === "string" ? root : "" },
     }),
+  // Which project to reopen on launch, and each project's editor state
+  // (versions / active cut / chosen story), so neither is lost on quit.
+  getActiveProject: () =>
+    ipcRenderer.invoke("assistant-editor:desktop", { action: "getActiveProject" }),
+  setActiveProject: (id) =>
+    ipcRenderer.invoke("assistant-editor:desktop", {
+      action: "setActiveProject",
+      payload: { id: typeof id === "string" ? id : null },
+    }),
+  loadEditState: (id) =>
+    ipcRenderer.invoke("assistant-editor:desktop", {
+      action: "loadEditState",
+      payload: { id: typeof id === "string" ? id : "" },
+    }),
+  saveEditState: (id, state) =>
+    ipcRenderer.invoke("assistant-editor:desktop", {
+      action: "saveEditState",
+      payload: { id: typeof id === "string" ? id : "", state },
+    }),
 });
 
 // Premiere Pro (UXP) integration status + a fixed command vocabulary.

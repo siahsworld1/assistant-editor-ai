@@ -6,6 +6,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { formatDuration, useAE } from "@/lib/ae/store";
+import { useState } from "react";
+import {
+  SourcePreviewDialog,
+  SourceThumb,
+  type PreviewTarget,
+} from "@/components/ae/SourceVisuals";
+import { beatSource as resolveBeatSource } from "@/lib/ae/source-range";
 
 export const Route = createFileRoute("/story")({
   head: () => ({
@@ -27,8 +34,23 @@ export const Route = createFileRoute("/story")({
 });
 
 function StoryPage() {
-  const { stories, selects, chosenStoryId, chooseStory, setTargetSeconds } = useAE();
+  const { stories, selects, chosenStoryId, chooseStory, setTargetSeconds, project } = useAE();
   const navigate = useNavigate();
+  const [preview, setPreview] = useState<PreviewTarget | null>(null);
+  const clipById = new Map((project?.clips ?? []).map((c) => [c.id, c]));
+  /** A beat's picture: the real source moment of its first select that
+   * resolves to a real clip — never a stand-in image. */
+  const beatSource = (selectIds: string[]) => {
+    const found = resolveBeatSource(selectIds, selects, clipById);
+    return found.select
+      ? {
+          sel: found.select,
+          clip: found.range.clip,
+          inSeconds: found.range.inSeconds,
+          outSeconds: found.range.outSeconds,
+        }
+      : null;
+  };
 
   return (
     <div>
@@ -81,37 +103,81 @@ function StoryPage() {
               </div>
 
               <ol className="mt-4 flex-1 space-y-2.5">
-                {story.beats.map((beat, i) => (
-                  <li key={beat.id} className="rounded border border-border bg-surface p-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium">
-                        <span className="font-tc mr-2 text-muted-foreground">
-                          {String(i + 1).padStart(2, "0")}
-                        </span>
-                        {beat.label}
-                      </span>
-                      <span className="font-tc text-[11px] text-muted-foreground">
-                        {beat.estimatedSeconds}s
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs text-muted-foreground">{beat.intent}</p>
-                    {beat.selectIds.length > 0 && (
-                      <div className="mt-2 flex flex-wrap gap-1">
-                        {beat.selectIds.map((id) => {
-                          const s = selects.find((x) => x.id === id);
-                          return (
-                            <span
-                              key={id}
-                              className="rounded border border-border px-1.5 py-0.5 font-tc text-[10px] text-muted-foreground"
-                            >
-                              {s ? `${s.speaker.split(" ")[0]} · ${s.startTc}` : id}
+                {story.beats.map((beat, i) => {
+                  const src = beatSource(beat.selectIds);
+                  return (
+                    <li
+                      key={beat.id}
+                      className="flex gap-3 rounded border border-border bg-surface p-3"
+                    >
+                      <SourceThumb
+                        clip={src?.clip}
+                        seconds={src?.inSeconds ?? 0}
+                        label={src?.sel.startTc}
+                        className="w-28 shrink-0 self-start"
+                        onClick={
+                          src
+                            ? () =>
+                                setPreview({
+                                  clip: src.clip,
+                                  inSeconds: src.inSeconds,
+                                  outSeconds: src.outSeconds,
+                                  title: `${beat.label} — ${src.sel.speaker}`,
+                                  subtitle: beat.intent,
+                                })
+                            : undefined
+                        }
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-medium">
+                            <span className="font-tc mr-2 text-muted-foreground">
+                              {String(i + 1).padStart(2, "0")}
                             </span>
-                          );
-                        })}
+                            {beat.label}
+                          </span>
+                          <span className="font-tc text-[11px] text-muted-foreground">
+                            {beat.estimatedSeconds}s
+                          </span>
+                        </div>
+                        <p className="mt-1 text-xs text-muted-foreground">{beat.intent}</p>
+                        {src && (
+                          <p className="mt-1 font-tc text-[10px] text-muted-foreground">
+                            {src.sel.speaker} · {src.clip.filename} · {src.sel.startTc} →{" "}
+                            {src.sel.endTc}
+                          </p>
+                        )}
+                        {beat.selectIds.length > 0 && (
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {beat.selectIds.map((id) => {
+                              const s = selects.find((x) => x.id === id);
+                              return (
+                                <span
+                                  key={id}
+                                  className={cn(
+                                    "rounded border px-1.5 py-0.5 font-tc text-[10px]",
+                                    s
+                                      ? "border-border text-muted-foreground"
+                                      : "border-destructive/50 text-destructive",
+                                  )}
+                                  title={
+                                    s
+                                      ? undefined
+                                      : "This beat references a select that doesn't exist in the current analysis."
+                                  }
+                                >
+                                  {s
+                                    ? `${s.speaker.split(" ")[0]} · ${s.startTc}`
+                                    : `missing select ${id}`}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </li>
-                ))}
+                    </li>
+                  );
+                })}
               </ol>
 
               <div className="mt-4 border-t border-border pt-3">
@@ -151,6 +217,7 @@ function StoryPage() {
           );
         })}
       </div>
+      <SourcePreviewDialog target={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }

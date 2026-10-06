@@ -178,6 +178,9 @@ export interface ProjectBrain {
   /** Real error message from the engine's last analysis run, if analysisState is
    * "error". Null/undefined once a run has completed or none has failed yet. */
   analysisError?: string | null | undefined;
+  /** Identifies one completed engine analysis (worker/store.py). Saved edit
+   * state is only restored against the analysis it was built from. */
+  analysisId?: string | null | undefined;
 }
 
 export interface EngineHealth {

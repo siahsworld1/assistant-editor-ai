@@ -140,7 +140,9 @@ function StatusBar() {
             Reconnect
           </Button>
         )}
-        {connection !== "demo" && (
+        {/* Demo Mode is a development tool: hidden in production builds (the
+            packaged app), still available under the Vite dev server. */}
+        {import.meta.env.DEV && connection !== "demo" && (
           <Button
             size="sm"
             variant="ghost"

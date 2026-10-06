@@ -392,30 +392,33 @@ function SettingsPage() {
             ))}
           </ul>
 
-          <div className="flex items-center justify-between rounded-md border border-border px-4 py-3">
-            <div>
-              <div className="text-xs font-medium">Data source</div>
-              <p className="text-[11px] text-muted-foreground">
-                Demo Mode is explicit — fixtures are never mixed into a live engine session.
-              </p>
+          {/* Development-only control (hidden in production builds / the packaged app). */}
+          {import.meta.env.DEV && (
+            <div className="flex items-center justify-between rounded-md border border-border px-4 py-3">
+              <div>
+                <div className="text-xs font-medium">Data source</div>
+                <p className="text-[11px] text-muted-foreground">
+                  Demo Mode is explicit — fixtures are never mixed into a live engine session.
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant={mode === "auto" ? "secondary" : "outline"}
+                  onClick={() => setMode("auto")}
+                >
+                  Live engine
+                </Button>
+                <Button
+                  size="sm"
+                  variant={mode === "demo" ? "secondary" : "outline"}
+                  onClick={() => setMode("demo")}
+                >
+                  Demo Mode
+                </Button>
+              </div>
             </div>
-            <div className="flex gap-2">
-              <Button
-                size="sm"
-                variant={mode === "auto" ? "secondary" : "outline"}
-                onClick={() => setMode("auto")}
-              >
-                Live engine
-              </Button>
-              <Button
-                size="sm"
-                variant={mode === "demo" ? "secondary" : "outline"}
-                onClick={() => setMode("demo")}
-              >
-                Demo Mode
-              </Button>
-            </div>
-          </div>
+          )}
         </Section>
 
         <Section title="Storage & cache" description="Proxies, analysis artefacts and thumbnails.">
