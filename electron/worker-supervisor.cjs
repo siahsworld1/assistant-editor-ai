@@ -26,20 +26,65 @@ const DEFAULT_START_TIMEOUT_MS = 45000;
 const DEFAULT_STOP_GRACE_MS = 3000;
 const LOG_TAIL_LINES = 60;
 
+/** Inside the packaged app's Resources (see "extraResources" in package.json). */
+const PACKAGED_WORKER_EXECUTABLE = path.join("worker", "assistant-editor-worker");
+const PACKAGED_FFMPEG = path.join("ffmpeg", "bin", "ffmpeg");
+const PACKAGED_FFPROBE = path.join("ffmpeg", "bin", "ffprobe");
+/** The packaged worker gets no Homebrew/user PATH, so nothing it runs can
+ * silently resolve to a machine-installed tool instead of the bundled one. */
+const PACKAGED_WORKER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+
 /**
- * What to run for the worker. Dev: the repo's worker/server.py under Python.
- * Packaged (Step 6): will return the bundled worker executable instead — until
- * then a packaged build gets an explicit error rather than a guess.
- * @returns {{ ok: true, command: string, args: string[], cwd: string, description: string }
+ * What to run for the worker.
+ *  - Development: the repo's worker/server.py under Python (unchanged).
+ *  - Packaged: the PyInstaller-built worker and the bundled ffmpeg/ffprobe,
+ *    all resolved from Electron's Resources directory — never the cwd or PATH.
+ * Either way the result feeds the same WorkerSupervisor lifecycle.
+ * @returns {{ ok: true, command: string, args: string[], cwd: string, env?: Record<string, string>, description: string }
  *         | { ok: false, kind: string, message: string }}
  */
-function resolveWorkerLaunch({ isPackaged, appPath, env = process.env, exists = fs.existsSync }) {
+function resolveWorkerLaunch({
+  isPackaged,
+  appPath,
+  resourcesPath,
+  env = process.env,
+  exists = fs.existsSync,
+}) {
   if (isPackaged) {
+    const executable = path.join(resourcesPath, PACKAGED_WORKER_EXECUTABLE);
+    const ffmpeg = path.join(resourcesPath, PACKAGED_FFMPEG);
+    const ffprobe = path.join(resourcesPath, PACKAGED_FFPROBE);
+    if (!exists(executable)) {
+      return {
+        ok: false,
+        kind: "not-bundled",
+        message: `This build is missing its worker (${executable}). Reinstall the app.`,
+      };
+    }
+    const missingTools = [ffmpeg, ffprobe].filter((p) => !exists(p));
+    if (missingTools.length > 0) {
+      return {
+        ok: false,
+        kind: "ffmpeg-missing",
+        message: `This build is missing ${missingTools.join(" and ")}. Reinstall the app.`,
+      };
+    }
     return {
-      ok: false,
-      kind: "not-bundled",
-      message:
-        "This build does not include the Assistant Editor worker yet (packaging is pending).",
+      ok: true,
+      command: executable,
+      args: [],
+      cwd: path.dirname(executable),
+      env: {
+        ASSISTANT_EDITOR_FFMPEG: ffmpeg,
+        ASSISTANT_EDITOR_FFPROBE: ffprobe,
+        PATH: PACKAGED_WORKER_PATH,
+        // A packaged app never reads stray .env files from wherever it was
+        // installed; credentials arrive via the app itself (Step 7).
+        ASSISTANT_EDITOR_SKIP_DOTENV: "1",
+        // Defense in depth: Flask's app.run() has its own .env loader.
+        FLASK_SKIP_DOTENV: "1",
+      },
+      description: executable,
     };
   }
   const workerDir = path.join(appPath, "worker");
@@ -269,6 +314,7 @@ class WorkerSupervisor {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
           ...this.env,
+          ...spec.env,
           PYTHONUNBUFFERED: "1",
           // worker/server.py exits on its own if this process disappears
           // without a clean quit, so a crash can't leave an orphan behind.
@@ -391,6 +437,7 @@ module.exports = {
   WORKER_SERVICE_ID,
   DEFAULT_PORT,
   DEFAULT_START_TIMEOUT_MS,
+  PACKAGED_WORKER_PATH,
   resolveWorkerLaunch,
   probePort,
   fetchHealth,

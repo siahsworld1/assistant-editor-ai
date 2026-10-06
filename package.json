@@ -14,10 +14,13 @@
     "dev:desktop": "concurrently -k -n vite,electron -c cyan,magenta \"vite dev\" \"wait-on tcp:8080 && cross-env ASSISTANT_EDITOR_DEV=1 electron .\"",
     "desktop:start": "cross-env ASSISTANT_EDITOR_DEV=1 electron .",
     "typecheck": "tsc --noEmit",
-    "desktop:pack": "npm run desktop:prepare && electron-builder --dir",
-    "desktop:build:mac": "npm run desktop:prepare && electron-builder --mac --publish never",
+    "desktop:pack": "npm run desktop:prepare && npm run desktop:bundle-native && electron-builder --dir --arm64",
+    "desktop:build:mac": "npm run desktop:prepare && npm run desktop:bundle-native && electron-builder --mac --arm64 --publish never",
     "desktop:build:win": "npm run desktop:prepare && electron-builder --win --publish never",
     "desktop:prepare": "vite build --config vite.desktop.config.ts",
+    "worker:build": "bash scripts/build-worker.sh",
+    "ffmpeg:prepare": "python3 scripts/prepare-ffmpeg.py",
+    "desktop:bundle-native": "npm run worker:build && npm run ffmpeg:prepare",
     "desktop:start:prod": "cross-env ASSISTANT_EDITOR_EMBEDDED=1 electron .",
     "premiere:prepare": "node scripts/prepare-premiere-package.cjs",
     "test": "vitest run"
@@ -140,6 +143,22 @@
         "filter": [
           "**/*",
           "!**/*.map",
+          "!**/.DS_Store"
+        ]
+      },
+      {
+        "from": "dist-worker/assistant-editor-worker",
+        "to": "worker",
+        "filter": [
+          "**/*",
+          "!**/.DS_Store"
+        ]
+      },
+      {
+        "from": "dist-ffmpeg",
+        "to": "ffmpeg",
+        "filter": [
+          "**/*",
           "!**/.DS_Store"
         ]
       }

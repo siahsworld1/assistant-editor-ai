@@ -475,6 +475,68 @@ class TestDerivedMediaCacheIdentityThroughThePipeline(unittest.TestCase):
         self._assert_artifacts_belong_to_their_own_source(clips, {"a.mov": 160, "b.mov": 320, "c.mov": 400})
 
 
+@unittest.skipUnless(_ffmpeg_present(), "ffmpeg/ffprobe not on PATH")
+class TestBundledToolResolution(unittest.TestCase):
+    """The packaged app passes absolute paths to its own ffmpeg/ffprobe
+    (ASSISTANT_EDITOR_FFMPEG / ASSISTANT_EDITOR_FFPROBE). Those exact binaries
+    must be what runs — and a configured-but-missing binary must fail loudly,
+    never fall back to a copy on PATH (e.g. Homebrew's)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ae-bundled-tools-test-"))
+        self.calls = self.tmp / "calls.log"
+        self.bin = self.tmp / "bundle" / "bin"
+        self.bin.mkdir(parents=True)
+        for tool in ("ffmpeg", "ffprobe"):
+            wrapper = self.bin / tool
+            wrapper.write_text(f'#!/bin/sh\necho "{tool} $0" >> "{self.calls}"\nexec "{shutil.which(tool)}" "$@"\n')
+            wrapper.chmod(0o755)
+        self.clip = self.tmp / "clip.mov"
+        if not _make_av_clip(self.clip, 2):
+            self.skipTest("Could not synthesize a test clip with this ffmpeg build.")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _env(self, ffmpeg: str, ffprobe: str):
+        return patch.dict(os.environ, {media.FFMPEG_ENV: ffmpeg, media.FFPROBE_ENV: ffprobe})
+
+    def test_configured_absolute_binaries_are_the_ones_executed(self):
+        with self._env(str(self.bin / "ffmpeg"), str(self.bin / "ffprobe")):
+            self.assertTrue(media.ffmpeg_available())
+            self.assertTrue(media.ffprobe_info(self.clip)["ok"])
+            ok, err = media.generate_thumbnail(self.clip, self.tmp / "t.jpg", 1.0)
+            self.assertTrue(ok, err)
+            self.assertEqual(media.resolved_tool_paths(), {"ffmpeg": str(self.bin / "ffmpeg"), "ffprobe": str(self.bin / "ffprobe")})
+        calls = self.calls.read_text().splitlines()
+        self.assertIn(f"ffprobe {self.bin / 'ffprobe'}", calls)
+        self.assertIn(f"ffmpeg {self.bin / 'ffmpeg'}", calls)
+
+    def test_a_configured_but_missing_binary_never_falls_back_to_path(self):
+        missing = str(self.tmp / "nope" / "ffprobe")
+        with self._env(str(self.bin / "ffmpeg"), missing):
+            self.assertIsNotNone(shutil.which("ffprobe"))  # a real one IS on PATH...
+            self.assertFalse(media.ffmpeg_available())  # ...and is deliberately not used
+            info = media.ffprobe_info(self.clip)
+            self.assertFalse(info["ok"])
+            self.assertIn("bundled ffmpeg/ffprobe are missing", info["probeError"])
+            self.assertNotIn("brew install", info["probeError"])
+        self.assertFalse(self.calls.exists())  # nothing ran at all
+
+    def test_a_non_executable_configured_binary_is_rejected(self):
+        (self.bin / "ffprobe").chmod(0o644)
+        with self._env(str(self.bin / "ffmpeg"), str(self.bin / "ffprobe")):
+            self.assertFalse(media.ffmpeg_available())
+
+    def test_development_without_configuration_still_uses_path(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(media.FFMPEG_ENV, None)
+            os.environ.pop(media.FFPROBE_ENV, None)
+            self.assertEqual((media.ffmpeg_bin(), media.ffprobe_bin()), ("ffmpeg", "ffprobe"))
+            self.assertTrue(media.ffmpeg_available())
+            self.assertIn("brew install", media.ffmpeg_missing_reason())
+
+
 class TestFfprobeTimeoutRetry(unittest.TestCase):
     """Mocked tests for the timeout/retry logic itself — these must run fast
     (no real 120s+240s waits), so they patch media._run_ffprobe_once (and

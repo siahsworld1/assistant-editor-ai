@@ -70,5 +70,47 @@ class TestParentWatchdog(unittest.TestCase):
         self.assertIn("STILL-ALIVE", proc.stdout, proc.stderr)
 
 
+class TestNoDotenvWhenSkipped(unittest.TestCase):
+    """Regression: Flask's app.run() has its OWN .env loader that searches from
+    the current directory upward. In the packaged app (cwd inside the bundle)
+    it loaded the repo-root .env and the worker made real, paid API calls even
+    with ASSISTANT_EDITOR_SKIP_DOTENV=1. Runs the real server.py main path from
+    a directory containing a .env with fake keys; Werkzeug is stopped right
+    before it would bind the port, and reports what reached os.environ."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="ae-dotenv-test-"))
+        (self.tmp / ".env").write_text("OPENAI_API_KEY=sk-fake-should-never-load-000\nANTHROPIC_API_KEY=sk-ant-fake-000\n")
+        (self.tmp / ".flaskenv").write_text("ANTHROPIC_API_KEY=sk-ant-fake-flaskenv-000\n")
+        hook = self.tmp / "hook"
+        hook.mkdir()
+        (hook / "sitecustomize.py").write_text(
+            "import os, sys, werkzeug.serving\n"
+            "def _stop(*a, **k):\n"
+            "    keys = sorted(k for k in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY') if os.environ.get(k))\n"
+            "    print('KEYS-AT-SERVE=' + ','.join(keys), flush=True)\n"
+            "    os._exit(0)\n"
+            "werkzeug.serving.run_simple = _stop\n"
+        )
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_packaged_style_launch_never_loads_a_dotenv_from_the_working_directory(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")}
+        env.update({"ASSISTANT_EDITOR_SKIP_DOTENV": "1", "PYTHONPATH": f"{self.tmp / 'hook'}:{WORKER_DIR}"})
+        env.pop("FLASK_SKIP_DOTENV", None)  # prove server.py itself is safe, not just the launcher's env
+        proc = subprocess.run(
+            [sys.executable, str(WORKER_DIR / "server.py")],
+            cwd=str(self.tmp), capture_output=True, text=True, timeout=60, env=env,
+        )
+        self.assertIn("KEYS-AT-SERVE=", proc.stdout, proc.stderr[-2000:])
+        self.assertIn("KEYS-AT-SERVE=\n", proc.stdout)  # no key at all reached the server
+
+
 if __name__ == "__main__":
     unittest.main()

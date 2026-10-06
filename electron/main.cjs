@@ -25,7 +25,12 @@ const embedded = new EmbeddedRenderer();
 const premiere = new PremiereBridge();
 /** The local engine (worker/server.py in dev). Started at launch, stopped on quit. */
 const worker = new WorkerSupervisor({
-  launch: () => resolveWorkerLaunch({ isPackaged: app.isPackaged, appPath: app.getAppPath() }),
+  launch: () =>
+    resolveWorkerLaunch({
+      isPackaged: app.isPackaged,
+      appPath: app.getAppPath(),
+      resourcesPath: process.resourcesPath,
+    }),
 });
 /** Project persistence + user-gated media indexing. Created after app ready. */
 let capabilities = null;
@@ -298,11 +303,15 @@ app.on("before-quit", (event) => {
   embedded.stop();
   premiere.stop();
   // Give the worker we own its graceful SIGTERM (bounded by the supervisor's
-  // grace period + SIGKILL) before the app actually exits.
+  // grace period + SIGKILL) before the app actually exits. Finish with
+  // app.exit(), not app.quit(): on macOS a quit that arrived as an Apple Event
+  // (Cmd-Q, Dock "Quit", `osascript quit`) and was deferred here swallows a
+  // re-issued app.quit(), leaving the app running with its worker already
+  // stopped (found in the packaged-app smoke test). All cleanup has run by now.
   if (!workerStopped) {
     event.preventDefault();
     workerStopped = true;
-    void worker.stop().finally(() => app.quit());
+    void worker.stop().finally(() => app.exit(0));
   }
 });
 app.on("quit", () => {

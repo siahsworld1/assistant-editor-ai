@@ -43,8 +43,45 @@ FFPROBE_TIMEOUT_SECONDS = 120
 FFPROBE_MAX_ATTEMPTS = 2
 
 
+# Which ffmpeg/ffprobe to run. The packaged desktop app ships its own copies
+# and passes their absolute paths (electron/worker-supervisor.cjs); when a path
+# is given it is used EXACTLY — never silently swapped for whatever happens to
+# be on PATH (e.g. a Homebrew install). Development leaves these unset and
+# uses the tools on PATH as before.
+FFMPEG_ENV = "ASSISTANT_EDITOR_FFMPEG"
+FFPROBE_ENV = "ASSISTANT_EDITOR_FFPROBE"
+
+
+def ffmpeg_bin() -> str:
+    return os.environ.get(FFMPEG_ENV) or "ffmpeg"
+
+
+def ffprobe_bin() -> str:
+    return os.environ.get(FFPROBE_ENV) or "ffprobe"
+
+
+def _tool_available(tool: str) -> bool:
+    if os.path.isabs(tool):
+        return os.path.isfile(tool) and os.access(tool, os.X_OK)
+    return shutil.which(tool) is not None
+
+
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+    return _tool_available(ffmpeg_bin()) and _tool_available(ffprobe_bin())
+
+
+def resolved_tool_paths() -> dict:
+    """What will actually be executed — for the startup log line."""
+    return {t: (b if os.path.isabs(b) else (shutil.which(b) or f"{b} (not found)")) for t, b in (("ffmpeg", ffmpeg_bin()), ("ffprobe", ffprobe_bin()))}
+
+
+def ffmpeg_missing_reason() -> str:
+    if os.environ.get(FFMPEG_ENV) or os.environ.get(FFPROBE_ENV):
+        return (
+            f"the bundled ffmpeg/ffprobe are missing or not executable "
+            f"({ffmpeg_bin()}, {ffprobe_bin()}) — reinstall the app"
+        )
+    return "ffmpeg/ffprobe not found on PATH — install with `brew install ffmpeg` and restart the worker"
 
 
 @dataclass
@@ -140,7 +177,7 @@ def _run_ffprobe_once(path: Path, timeout: float) -> subprocess.CompletedProcess
     """One real ffprobe invocation. Raises subprocess.TimeoutExpired or OSError —
     callers decide what to do with those, this just runs the process."""
     return subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        [ffprobe_bin(), "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         capture_output=True, text=True, timeout=timeout,
     )
 
@@ -175,7 +212,7 @@ def ffprobe_info(path: Path) -> dict:
     FFPROBE_MAX_ATTEMPTS * FFPROBE_TIMEOUT_SECONDS, not unbounded.
     """
     if not ffmpeg_available():
-        return _ffprobe_failure("ffmpeg/ffprobe not found on PATH")
+        return _ffprobe_failure(ffmpeg_missing_reason())
 
     proc: subprocess.CompletedProcess | None = None
     for attempt in range(1, FFPROBE_MAX_ATTEMPTS + 1):
@@ -261,7 +298,7 @@ def extract_audio(path: Path, out_wav: Path) -> bool:
     try:
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
+                ffmpeg_bin(), "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
                 "-f", "wav", str(out_wav),
             ],
             capture_output=True, timeout=600, check=True,
@@ -288,7 +325,7 @@ def extract_frames(path: Path, out_dir: Path, count: int = 8) -> list[Path]:
         try:
             subprocess.run(
                 [
-                    "ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(path),
+                    ffmpeg_bin(), "-y", "-ss", f"{ts:.2f}", "-i", str(path),
                     "-frames:v", "1", "-q:v", "3", str(out_path),
                 ],
                 capture_output=True, timeout=60, check=True,
@@ -382,7 +419,7 @@ def generate_proxy(src: Path, dest: Path, max_width: int = PROXY_MAX_WIDTH) -> b
     try:
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", str(src),
+                ffmpeg_bin(), "-y", "-i", str(src),
                 "-vf", scale_filter,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                 "-pix_fmt", "yuv420p",
@@ -431,7 +468,7 @@ def generate_thumbnail(
     real headroom instead of failing on a slow-but-fine seek.
     """
     if not ffmpeg_available():
-        return False, "ffmpeg/ffprobe not found on PATH"
+        return False, ffmpeg_missing_reason()
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = _partial_path(dest)
     ts = max(0.1, (duration_seconds or 0.0) * 0.15)
@@ -439,7 +476,7 @@ def generate_thumbnail(
     try:
         proc = subprocess.run(
             [
-                "ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(src),
+                ffmpeg_bin(), "-y", "-ss", f"{ts:.2f}", "-i", str(src),
                 "-frames:v", "1", "-vf", scale_filter, "-q:v", "4",
                 str(partial),
             ],

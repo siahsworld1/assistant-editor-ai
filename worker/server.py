@@ -135,17 +135,50 @@ def _exit_when_parent_dies(parent_pid: int) -> None:
     threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
 
 
+def _selftest() -> int:
+    """`server --selftest`: proves a (packaged) worker can import everything it
+    needs at runtime and reports which ffmpeg/ffprobe it would run — without
+    binding the port. Used by scripts/build-worker.sh after PyInstaller."""
+    import importlib
+    import json
+    import sys
+    import warnings
+
+    import media
+
+    report = {"python": sys.version.split()[0], "frozen": bool(getattr(sys, "frozen", False)), "modules": {}}
+    ok = True
+    for name in ("flask", "werkzeug", "dotenv", "numpy", "openai", "anthropic", "httpx", "certifi",
+                 "providers.anthropic_provider", "providers.openai_provider", "pipeline", "reasoning"):
+        try:
+            mod = importlib.import_module(name)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # e.g. Flask's deprecated __version__
+                report["modules"][name] = getattr(mod, "__version__", "ok")
+        except Exception as exc:  # noqa: BLE001 - report every missing module
+            report["modules"][name] = f"MISSING: {exc}"
+            ok = False
+    report["tools"] = media.resolved_tool_paths()
+    report["ffmpegAvailable"] = media.ffmpeg_available()
+    print(json.dumps(report, indent=2))
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
     import os
+    import sys
+
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
 
     import media
     from providers.base import ProviderError
     from providers.registry import get_reasoning_provider, get_transcription_provider
 
+    tools = media.resolved_tool_paths()
+    log.info("ffmpeg: %s | ffprobe: %s", tools["ffmpeg"], tools["ffprobe"])
     if not media.ffmpeg_available():
-        log.warning(
-            "ffmpeg/ffprobe not found on PATH — analysis will fail until you `brew install ffmpeg`."
-        )
+        log.warning("analysis will fail: %s", media.ffmpeg_missing_reason())
 
     # Provider-agnostic startup check: whichever vendor is selected (via
     # ASSISTANT_EDITOR_TRANSCRIPTION_PROVIDER / ASSISTANT_EDITOR_REASONING_PROVIDER,
@@ -167,4 +200,11 @@ if __name__ == "__main__":
         _exit_when_parent_dies(int(parent_pid))
 
     log.info("Assistant Editor AI worker listening on http://%s:%s", HOST, PORT)
-    app.run(host=HOST, port=PORT, threaded=True)
+    # load_dotenv=False: Flask's own app.run() otherwise searches for .env /
+    # .flaskenv from the CURRENT DIRECTORY upward and loads them — bypassing
+    # ASSISTANT_EDITOR_SKIP_DOTENV above. A packaged worker runs from inside the
+    # app bundle, so it would load whatever .env sits above wherever the app
+    # was installed (found in the packaged-app smoke test: it picked up the
+    # repo-root .env and made real API calls). Dotenv loading is handled
+    # exclusively by the guarded load_dotenv() at the top of this file.
+    app.run(host=HOST, port=PORT, threaded=True, load_dotenv=False)

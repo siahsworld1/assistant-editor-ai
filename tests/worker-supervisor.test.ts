@@ -275,6 +275,37 @@ describe("WorkerSupervisor — shutdown", () => {
   });
 });
 
+describe("WorkerSupervisor — launch environment", () => {
+  it("passes the launch spec's environment (bundled tool paths, sanitized PATH) to the worker", async () => {
+    const port = await freePort();
+    const s: Supervisor = new sup.WorkerSupervisor({
+      port,
+      startTimeoutMs: 8000,
+      env: { ...process.env, FAKE_MODE: "exit", FAKE_PORT: String(port), FAKE_PRINT: "x" },
+      launch: () => ({
+        ok: true,
+        command: process.execPath,
+        args: [
+          "-e",
+          "console.log('ENV', process.env.ASSISTANT_EDITOR_FFMPEG, process.env.PATH); process.exit(4)",
+        ],
+        cwd: dir,
+        env: {
+          ASSISTANT_EDITOR_FFMPEG: "/bundle/ffmpeg/bin/ffmpeg",
+          PATH: sup.PACKAGED_WORKER_PATH,
+        },
+        description: "env probe",
+      }),
+      log: () => {},
+    });
+    cleanups.push(() => s.stop());
+    const status = await s.start();
+    expect(status.error!.logTail!.join("\n")).toContain(
+      `ENV /bundle/ffmpeg/bin/ffmpeg ${sup.PACKAGED_WORKER_PATH}`,
+    );
+  });
+});
+
 describe("WorkerSupervisor — logging", () => {
   it("redacts API keys from captured worker output", async () => {
     const port = await freePort();
@@ -334,9 +365,69 @@ describe("resolveWorkerLaunch", () => {
     expect(spec.kind).toBe("script-missing");
   });
 
-  it("returns an explicit error for packaged builds until the worker is bundled (Step 6)", () => {
-    const spec = sup.resolveWorkerLaunch({ isPackaged: true, appPath, env: {}, exists });
-    expect(spec.ok).toBe(false);
-    expect(spec.kind).toBe("not-bundled");
+  describe("packaged app", () => {
+    const resources = "/Applications/Assistant Editor AI.app/Contents/Resources";
+    const bundled = new Set([
+      `${resources}/worker/assistant-editor-worker`,
+      `${resources}/ffmpeg/bin/ffmpeg`,
+      `${resources}/ffmpeg/bin/ffprobe`,
+    ]);
+    const launch = (exists: (p: string) => boolean, env: Record<string, string> = {}) =>
+      sup.resolveWorkerLaunch({
+        isPackaged: true,
+        appPath: "/ignored/app.asar",
+        resourcesPath: resources,
+        env,
+        exists,
+      });
+
+    it("launches the bundled worker from Resources with absolute bundled ffmpeg/ffprobe", () => {
+      const spec = launch((p) => bundled.has(p));
+      expect(spec.ok).toBe(true);
+      expect(spec.command).toBe(`${resources}/worker/assistant-editor-worker`);
+      expect(spec.args).toEqual([]);
+      expect(spec.cwd).toBe(`${resources}/worker`);
+      expect(spec.env.ASSISTANT_EDITOR_FFMPEG).toBe(`${resources}/ffmpeg/bin/ffmpeg`);
+      expect(spec.env.ASSISTANT_EDITOR_FFPROBE).toBe(`${resources}/ffmpeg/bin/ffprobe`);
+    });
+
+    it("never uses system Python, the repo, or a Homebrew PATH — even if the environment points there", () => {
+      const spec = launch((p) => bundled.has(p), {
+        ASSISTANT_EDITOR_PYTHON: "/opt/homebrew/bin/python3",
+        PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin",
+      });
+      expect(spec.command).not.toMatch(/python/);
+      expect(spec.args).toEqual([]);
+      expect(spec.env.PATH).toBe(sup.PACKAGED_WORKER_PATH);
+      expect(spec.env.PATH).not.toMatch(/homebrew|\/usr\/local/);
+      expect(spec.env.ASSISTANT_EDITOR_SKIP_DOTENV).toBe("1");
+      expect(spec.env.FLASK_SKIP_DOTENV).toBe("1");
+    });
+
+    it("works wherever the app is installed", () => {
+      const elsewhere = "/Users/me/Desktop/Assistant Editor AI.app/Contents/Resources";
+      const spec = sup.resolveWorkerLaunch({
+        isPackaged: true,
+        appPath: "x",
+        resourcesPath: elsewhere,
+        env: {},
+        exists: () => true,
+      });
+      expect(spec.command).toBe(`${elsewhere}/worker/assistant-editor-worker`);
+      expect(spec.env.ASSISTANT_EDITOR_FFMPEG).toBe(`${elsewhere}/ffmpeg/bin/ffmpeg`);
+    });
+
+    it("reports a missing bundled worker explicitly", () => {
+      const spec = launch((p) => bundled.has(p) && !p.endsWith("assistant-editor-worker"));
+      expect(spec.ok).toBe(false);
+      expect(spec.kind).toBe("not-bundled");
+    });
+
+    it("reports missing bundled ffmpeg/ffprobe explicitly instead of falling back", () => {
+      const spec = launch((p) => bundled.has(p) && !p.endsWith("ffprobe"));
+      expect(spec.ok).toBe(false);
+      expect(spec.kind).toBe("ffmpeg-missing");
+      expect(spec.message).toContain("ffprobe");
+    });
   });
 });

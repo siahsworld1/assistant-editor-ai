@@ -54,3 +54,10 @@ worker/validation-output/
 release/
 dist-desktop/
 dist-premiere/
+
+# Packaged-worker build (scripts/build-worker.sh, scripts/prepare-ffmpeg.py):
+# the isolated build venv/PyInstaller workdir, and the bundles electron-builder
+# copies into the app as Resources/worker and Resources/ffmpeg.
+.build/
+dist-worker/
+dist-ffmpeg/

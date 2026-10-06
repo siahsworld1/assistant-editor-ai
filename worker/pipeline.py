@@ -65,7 +65,7 @@ def _run_analysis(project_id: str | None, media_root: str | None):
         STORE.fail("No media folder is set for this project yet. Use Import Media first.")
         return
     if not media.ffmpeg_available():
-        STORE.fail("ffmpeg/ffprobe not found on PATH. Install with `brew install ffmpeg` and restart the worker.")
+        STORE.fail(f"Cannot analyze: {media.ffmpeg_missing_reason()}.")
         return
 
     files = media.walk_media_root(media_root)
