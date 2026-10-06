@@ -9,6 +9,8 @@ Run from worker/: `python3 -m unittest discover -s tests -v`
 from __future__ import annotations
 
 import json
+import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -102,11 +104,12 @@ class TestGenerateProxy(unittest.TestCase):
         self.assertFalse(ok)
         self.assertFalse(dest.exists())
 
-    def test_proxy_is_current_reflects_mtimes(self):
-        dest = self.tmp / media.PROXY_DIR_NAME / "clip-003.mp4"
-        self.assertFalse(media.proxy_is_current(self.src, dest))
+    def test_a_generated_proxy_is_a_valid_cache_entry_and_leaves_no_partial(self):
+        dest = self.tmp / media.PROXY_DIR_NAME / f"{media.source_cache_key(self.src)}.mp4"
+        self.assertFalse(media.cached_artifact_is_valid(dest))
         self.assertTrue(media.generate_proxy(self.src, dest))
-        self.assertTrue(media.proxy_is_current(self.src, dest))
+        self.assertTrue(media.cached_artifact_is_valid(dest))
+        self.assertEqual(sorted(p.name for p in dest.parent.iterdir()), [dest.name])
 
 
 @unittest.skipUnless(_ffmpeg_present(), "ffmpeg/ffprobe not on PATH")
@@ -163,12 +166,13 @@ class TestGenerateThumbnail(unittest.TestCase):
         self.assertTrue(err)  # non-empty string
         self.assertFalse(dest.exists())
 
-    def test_thumbnail_is_current_reflects_mtimes(self):
-        dest = self.tmp / media.THUMB_DIR_NAME / "clip-003.jpg"
-        self.assertFalse(media.thumbnail_is_current(self.src, dest))
+    def test_a_generated_thumbnail_is_a_valid_cache_entry_and_leaves_no_partial(self):
+        dest = self.tmp / media.THUMB_DIR_NAME / f"{media.source_cache_key(self.src)}.jpg"
+        self.assertFalse(media.cached_artifact_is_valid(dest))
         ok, err = media.generate_thumbnail(self.src, dest, duration_seconds=2.0)
         self.assertTrue(ok, err)
-        self.assertTrue(media.thumbnail_is_current(self.src, dest))
+        self.assertTrue(media.cached_artifact_is_valid(dest))
+        self.assertEqual(sorted(p.name for p in dest.parent.iterdir()), [dest.name])
 
     def test_never_samples_frame_zero(self):
         # A 2s clip at 15% in should seek to ~0.3s, never the literal start —
@@ -222,11 +226,11 @@ class TestFfprobeInfoFailureReporting(unittest.TestCase):
         self.assertIsNotNone(info["probeError"])
 
 
-def _make_av_clip(dest: Path, audio_channels: int | None, seconds: float = 1.0) -> bool:
+def _make_av_clip(dest: Path, audio_channels: int | None, seconds: float = 1.0, size: str = "320x240") -> bool:
     """A real tiny H.264 .mov with `audio_channels` AAC channels (None = no
     audio stream at all). Channel 1 and 2 get different tones so they're real,
     distinct channels — like 18C_0681.MP4, whose dialogue is only on channel 2."""
-    args = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=size=320x240:rate=24:duration={seconds}"]
+    args = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=size={size}:rate=24:duration={seconds}"]
     for i in range(audio_channels or 0):
         args += ["-f", "lavfi", "-i", f"sine=frequency={440 * (i + 1)}:duration={seconds}"]
     if audio_channels and audio_channels > 1:
@@ -297,6 +301,178 @@ class TestFfprobeAudioChannels(unittest.TestCase):
             ClipState(id="c", filename="f", role="b-roll", duration_seconds=1, camera="—", resolution="—", fps=24).to_json()["audioChannels"],
             0,
         )
+
+
+class TestSourceCacheKey(unittest.TestCase):
+    """The derived-media cache key is the SOURCE's identity (canonical path +
+    size + mtime), never its position in the media folder."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ae-cachekey-test-"))
+        self.src = self.tmp / "A001_INT.mov"
+        self.src.write_bytes(b"x" * 1000)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_is_deterministic_and_filesystem_safe(self):
+        key = media.source_cache_key(self.src)
+        self.assertEqual(key, media.source_cache_key(self.src))
+        self.assertRegex(key, r"^[0-9a-f]{32}$")
+
+    def test_ignores_other_files_being_added_or_removed(self):
+        before = media.source_cache_key(self.src)
+        (self.tmp / "000_new_first.mov").write_bytes(b"y")
+        self.assertEqual(media.source_cache_key(self.src), before)
+
+    def test_changes_when_size_changes_even_if_mtime_is_preserved(self):
+        before = media.source_cache_key(self.src)
+        st = self.src.stat()
+        self.src.write_bytes(b"x" * 1001)
+        os.utime(self.src, ns=(st.st_atime_ns, st.st_mtime_ns))  # e.g. a Finder copy keeps the old mtime
+        self.assertNotEqual(media.source_cache_key(self.src), before)
+
+    def test_changes_when_mtime_changes_even_if_size_is_identical(self):
+        before = media.source_cache_key(self.src)
+        st = self.src.stat()
+        os.utime(self.src, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        self.assertNotEqual(media.source_cache_key(self.src), before)
+
+    def test_differs_for_a_different_path_with_identical_bytes_and_mtime(self):
+        other = self.tmp / "B101_BROLL.mov"
+        shutil.copy2(self.src, other)
+        self.assertNotEqual(media.source_cache_key(other), media.source_cache_key(self.src))
+
+    def test_resolves_symlinks_to_the_same_source_identity(self):
+        link = self.tmp / "link.mov"
+        link.symlink_to(self.src)
+        self.assertEqual(media.source_cache_key(link), media.source_cache_key(self.src))
+
+    def test_unreadable_source_has_no_key(self):
+        self.assertIsNone(media.source_cache_key(self.tmp / "missing.mov"))
+
+
+def _video_width(path: Path) -> int:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    return int((proc.stdout or "0").strip() or 0)
+
+
+@unittest.skipUnless(_ffmpeg_present(), "ffmpeg/ffprobe not on PATH")
+class TestDerivedMediaCacheIdentityThroughThePipeline(unittest.TestCase):
+    """Regression for the positional-cache bug: proxies/thumbnails were named
+    .ae_proxies/clip-NNN.mp4 by walk POSITION and judged fresh by mtime alone,
+    so after a rename/reorder/removal clip N silently got another source's
+    cached preview. Runs the real pipeline.run_analysis() over real
+    ffmpeg-made clips whose frame WIDTHS differ, so every cached artifact can
+    be traced back to the exact source it was made from. No AI provider is
+    reachable (tests/_no_real_credentials.py), so only the media steps do work."""
+
+    # filename -> frame size. Every width sits under both the proxy (960) and
+    # thumbnail (480) caps, so each artifact keeps its own source's width.
+    SOURCES = {"a.mov": "160x120", "b.mov": "320x240", "c.mov": "400x300"}
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="ae-cache-identity-test-"))
+        for name, size in self.SOURCES.items():
+            if not _make_av_clip(self.root / name, None, size=size):
+                self.skipTest("Could not synthesize test clips with this ffmpeg build.")
+        logging.getLogger("assistant-editor-worker").setLevel(logging.ERROR)
+
+    def tearDown(self):
+        logging.getLogger("assistant-editor-worker").setLevel(logging.NOTSET)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _analyze(self) -> dict:
+        import pipeline
+        from store import STORE
+
+        pipeline.run_analysis("proj-cache-test", str(self.root))
+        self.assertEqual(STORE.analysis_state, "complete", STORE.error)
+        return {c.filename: c for c in STORE.clips.values()}
+
+    def _assert_artifacts_belong_to_their_own_source(self, clips: dict, expected_widths: dict):
+        for filename, width in expected_widths.items():
+            clip = clips[filename]
+            self.assertTrue(clip.proxy_rel_path and clip.thumbnail_rel_path, f"{filename} has no cached artifacts")
+            self.assertEqual(_video_width(self.root / clip.proxy_rel_path), width, f"{filename} got another clip's PROXY")
+            self.assertEqual(_video_width(self.root / clip.thumbnail_rel_path), width, f"{filename} got another clip's THUMBNAIL")
+
+    def test_reorder_never_returns_another_clips_proxy(self):
+        first = self._analyze()
+        self.assertEqual(first["a.mov"].id, "clip-001")
+        # Renaming a.mov to sort last shifts every position: b.mov becomes clip-001.
+        (self.root / "a.mov").rename(self.root / "z.mov")
+        second = self._analyze()
+        self.assertEqual(second["b.mov"].id, "clip-001")  # user-facing ids stay positional
+        self._assert_artifacts_belong_to_their_own_source(second, {"b.mov": 320, "c.mov": 400, "z.mov": 160})
+
+    def test_removing_a_preceding_clip_never_returns_another_clips_thumbnail(self):
+        self._analyze()
+        (self.root / "a.mov").unlink()
+        second = self._analyze()
+        self.assertEqual(second["b.mov"].id, "clip-001")  # b now sits where a was
+        self._assert_artifacts_belong_to_their_own_source(second, {"b.mov": 320, "c.mov": 400})
+
+    def test_modifying_a_source_invalidates_its_cache(self):
+        first = self._analyze()
+        old_proxy, old_thumb = first["b.mov"].proxy_rel_path, first["b.mov"].thumbnail_rel_path
+        # Replace b.mov's content in place with a different-size picture while
+        # PRESERVING its old mtime — the case the old mtime check could never see.
+        st = (self.root / "b.mov").stat()
+        self.assertTrue(_make_av_clip(self.root / "b.mov", None, size="240x180"))
+        os.utime(self.root / "b.mov", ns=(st.st_atime_ns, st.st_mtime_ns))
+        second = self._analyze()
+        self.assertNotEqual(second["b.mov"].proxy_rel_path, old_proxy)
+        self.assertNotEqual(second["b.mov"].thumbnail_rel_path, old_thumb)
+        self._assert_artifacts_belong_to_their_own_source(second, {"a.mov": 160, "b.mov": 240, "c.mov": 400})
+
+    def test_touching_a_source_mtime_invalidates_its_cache(self):
+        first = self._analyze()
+        st = (self.root / "c.mov").stat()
+        os.utime(self.root / "c.mov", ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        second = self._analyze()
+        self.assertNotEqual(second["c.mov"].proxy_rel_path, first["c.mov"].proxy_rel_path)
+        self.assertEqual(second["a.mov"].proxy_rel_path, first["a.mov"].proxy_rel_path)  # untouched clips keep theirs
+
+    def test_unchanged_sources_reuse_their_cache_without_regenerating(self):
+        first = self._analyze()
+        stamps = {
+            name: ((self.root / c.proxy_rel_path).stat().st_mtime_ns, (self.root / c.thumbnail_rel_path).stat().st_mtime_ns)
+            for name, c in first.items()
+        }
+        refuse = AssertionError("an unchanged source must not be re-encoded")
+        with patch.object(media, "generate_proxy", side_effect=refuse), patch.object(media, "generate_thumbnail", side_effect=refuse):
+            second = self._analyze()
+        for name, c in second.items():
+            self.assertEqual(c.proxy_rel_path, first[name].proxy_rel_path)
+            self.assertEqual(c.thumbnail_rel_path, first[name].thumbnail_rel_path)
+            self.assertEqual(
+                ((self.root / c.proxy_rel_path).stat().st_mtime_ns, (self.root / c.thumbnail_rel_path).stat().st_mtime_ns),
+                stamps[name],
+            )
+
+    def test_proxies_and_thumbnails_of_one_source_share_its_identity(self):
+        clips = self._analyze()
+        for name, c in clips.items():
+            key = media.source_cache_key(self.root / name)
+            self.assertEqual(c.proxy_rel_path, f"{media.PROXY_DIR_NAME}/{key}.mp4")
+            self.assertEqual(c.thumbnail_rel_path, f"{media.THUMB_DIR_NAME}/{key}.jpg")
+
+    def test_stale_positional_and_partial_files_are_ignored(self):
+        # Leftovers from the old positional scheme and from an interrupted
+        # encode must never be served.
+        (self.root / media.PROXY_DIR_NAME).mkdir()
+        (self.root / media.THUMB_DIR_NAME).mkdir()
+        (self.root / media.PROXY_DIR_NAME / "clip-001.mp4").write_bytes(b"stale positional proxy")
+        (self.root / media.THUMB_DIR_NAME / "clip-001.jpg").write_bytes(b"stale positional thumb")
+        key_a = media.source_cache_key(self.root / "a.mov")
+        (self.root / media.PROXY_DIR_NAME / f"{key_a}.partial.mp4").write_bytes(b"truncated")
+        clips = self._analyze()
+        self.assertNotIn("clip-001", clips["a.mov"].proxy_rel_path)
+        self._assert_artifacts_belong_to_their_own_source(clips, {"a.mov": 160, "b.mov": 320, "c.mov": 400})
 
 
 class TestFfprobeTimeoutRetry(unittest.TestCase):

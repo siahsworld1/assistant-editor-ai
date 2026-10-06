@@ -152,41 +152,34 @@ def _analyze_one_clip(
         # proxy transcode below, so the WATCH page's media bin shows a real image
         # for this clip almost immediately after Analyze starts rather than only
         # once the whole clip finishes analyzing. Same authorized-mediaRoot
-        # boundary as proxies (media_root/.ae_thumbs/<clipId>.jpg) — no separate
-        # allowlist entry needed. Skipped for audio-only files (WATCH shows the
-        # waveform-style placeholder for those instead) and never fails the clip
-        # — but a real failure IS surfaced in technicalIssues now, instead of
-        # only a server-side log line nobody looking at the app would ever see.
+        # boundary as proxies (media_root/.ae_thumbs/<sourceKey>.jpg) — no
+        # separate allowlist entry needed. Skipped for audio-only files (WATCH
+        # shows the waveform-style placeholder for those instead) and never fails
+        # the clip — but a real failure IS surfaced in technicalIssues, instead
+        # of only a server-side log line nobody looking at the app would see.
+        cache_key = media.source_cache_key(path)
         if ext not in media.AUDIO_ONLY_EXTENSIONS and STORE.media_root:
-            thumb_dir = Path(STORE.media_root) / media.THUMB_DIR_NAME
-            thumb_dest = thumb_dir / f"{clip_id}.jpg"
-            if media.thumbnail_is_current(path, thumb_dest):
-                clip.thumbnail_rel_path = f"{media.THUMB_DIR_NAME}/{clip_id}.jpg"
+            thumb_rel, thumb_error = _cached_thumbnail(path, cache_key, info["duration"])
+            if thumb_rel:
+                clip.thumbnail_rel_path = thumb_rel
             else:
-                thumb_ok, thumb_error = media.generate_thumbnail(path, thumb_dest, info["duration"])
-                if thumb_ok:
-                    clip.thumbnail_rel_path = f"{media.THUMB_DIR_NAME}/{clip_id}.jpg"
-                else:
-                    reason = thumb_error or "unknown ffmpeg failure"
-                    log.warning("thumbnail generation failed for %s: %s — media bin will show the placeholder tile", path.name, reason)
-                    technical_issues.append(f"Thumbnail generation failed: {reason}"[:200])
+                reason = thumb_error or "unknown ffmpeg failure"
+                log.warning("thumbnail generation failed for %s: %s — media bin will show the placeholder tile", path.name, reason)
+                technical_issues.append(f"Thumbnail generation failed: {reason}"[:200])
             STORE.upsert_clip(clip)
 
         # Proxy generation: a scaled-down H.264/AAC MP4 that Chromium's <video>
         # element can actually decode and scrub, unlike many camera-original
         # formats (ProRes/MXF/HEVC variants). Lives under the media root itself
-        # (media_root/.ae_proxies/<clipId>.mp4) so the same authorized-root
+        # (media_root/.ae_proxies/<sourceKey>.mp4) so the same authorized-root
         # boundary that gates the ae-media:// playback protocol already covers
         # it — no separate allowlist entry needed. Skipped for audio-only files
         # (nothing to scale; the original plays fine as-is) and never fails the
         # clip — a missing proxy just means preview falls back to the original.
         if ext not in media.AUDIO_ONLY_EXTENSIONS and STORE.media_root:
-            proxy_dir = Path(STORE.media_root) / media.PROXY_DIR_NAME
-            proxy_dest = proxy_dir / f"{clip_id}.mp4"
-            if media.proxy_is_current(path, proxy_dest):
-                clip.proxy_rel_path = f"{media.PROXY_DIR_NAME}/{clip_id}.mp4"
-            elif media.generate_proxy(path, proxy_dest):
-                clip.proxy_rel_path = f"{media.PROXY_DIR_NAME}/{clip_id}.mp4"
+            proxy_rel = _cached_proxy(path, cache_key)
+            if proxy_rel:
+                clip.proxy_rel_path = proxy_rel
             else:
                 log.warning("proxy generation failed for %s — preview will fall back to the original file", path.name)
             STORE.upsert_clip(clip)
@@ -273,6 +266,33 @@ def _analyze_one_clip(
     finally:
         STORE.upsert_clip(clip)
         shutil.rmtree(clip_dir, ignore_errors=True)
+
+
+def _cached_thumbnail(path: Path, cache_key: str | None, duration: float) -> tuple[str | None, str | None]:
+    """Returns (relPath under media_root, error). Cached by the SOURCE's own
+    identity (media.source_cache_key), never by clip position — see the cache
+    identity comment in media.py. A missing key (source can't be stat'ed)
+    means no caching rather than a guessed name."""
+    if cache_key is None:
+        return None, "could not read source file metadata for caching"
+    rel = f"{media.THUMB_DIR_NAME}/{cache_key}.jpg"
+    dest = Path(STORE.media_root) / rel
+    if media.cached_artifact_is_valid(dest):
+        return rel, None
+    ok, error = media.generate_thumbnail(path, dest, duration)
+    return (rel, None) if ok else (None, error)
+
+
+def _cached_proxy(path: Path, cache_key: str | None) -> str | None:
+    """relPath of a proxy for exactly this source version, generating it if
+    needed; None if it couldn't be produced. Same keying as _cached_thumbnail."""
+    if cache_key is None:
+        return None
+    rel = f"{media.PROXY_DIR_NAME}/{cache_key}.mp4"
+    dest = Path(STORE.media_root) / rel
+    if media.cached_artifact_is_valid(dest) or media.generate_proxy(path, dest):
+        return rel
+    return None
 
 
 def _clip_lookup() -> dict:

@@ -5,8 +5,10 @@ extracting audio + sample frames, inferring role/speaker from filenames, and a r
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -298,6 +300,58 @@ def extract_frames(path: Path, out_dir: Path, count: int = 8) -> list[Path]:
     return frames
 
 
+# --------------------------------------------------------------------------- #
+# Derived-media cache identity (proxies + thumbnails)
+# --------------------------------------------------------------------------- #
+# Cached artifacts used to be named after the clip's POSITION in the media walk
+# (.ae_proxies/clip-002.mp4) and judged "current" if merely newer than the
+# source. Positions shift whenever a file is added, removed or renamed, and
+# camera originals carry old mtimes, so a cached proxy/thumbnail of one clip
+# could be silently served for a different clip. The cache is now keyed by the
+# SOURCE's own identity instead — separate from the user-facing clip id, which
+# is unchanged.
+#
+# Identity = canonical absolute path + size + mtime (ns), hashed. Only stat()
+# metadata is read — never the (multi-GB) media bytes. Any change to the
+# source's size or mtime yields a new key, so a stale artifact is simply never
+# looked up again; old positional files are ignored, not migrated. Bump the
+# version tag to invalidate every cached artifact at once (e.g. if proxy
+# encoding settings change).
+CACHE_KEY_VERSION = "ae-media-cache-v1"
+CACHE_KEY_HEX_CHARS = 32  # 128 bits of SHA-256 — collision-safe, short filenames
+
+
+def source_cache_key(src: Path) -> str | None:
+    """Deterministic, filesystem-safe cache key for one version of one source
+    file. Proxies and thumbnails of the same source version share it. Returns
+    None if the source can't be stat'ed (callers then skip caching)."""
+    try:
+        st = src.stat()
+        canonical = os.path.realpath(src)
+    except OSError:
+        return None
+    material = "\0".join([CACHE_KEY_VERSION, canonical, str(st.st_size), str(st.st_mtime_ns)])
+    return hashlib.sha256(material.encode("utf-8", "surrogateescape")).hexdigest()[:CACHE_KEY_HEX_CHARS]
+
+
+def cached_artifact_is_valid(dest: Path) -> bool:
+    """A keyed artifact is valid iff it exists and is non-empty: the key itself
+    already encodes the exact source version, and generation only ever moves a
+    COMPLETE file into place (see _partial_path), so existence is sufficient."""
+    try:
+        return dest.is_file() and dest.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _partial_path(dest: Path) -> Path:
+    """Where ffmpeg writes before the atomic rename into `dest` — so a crash or
+    timeout mid-encode can never leave a truncated file at the keyed path that
+    cached_artifact_is_valid() would accept. Keeps the real extension last so
+    ffmpeg still infers the output format."""
+    return dest.with_name(f"{dest.stem}.partial{dest.suffix}")
+
+
 PROXY_MAX_WIDTH = 960
 PROXY_DIR_NAME = ".ae_proxies"
 
@@ -323,6 +377,7 @@ def generate_proxy(src: Path, dest: Path, max_width: int = PROXY_MAX_WIDTH) -> b
     if not ffmpeg_available():
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = _partial_path(dest)
     scale_filter = f"scale='min({max_width},iw)':-2"
     try:
         subprocess.run(
@@ -333,22 +388,18 @@ def generate_proxy(src: Path, dest: Path, max_width: int = PROXY_MAX_WIDTH) -> b
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart",
-                str(dest),
+                str(partial),
             ],
             capture_output=True, timeout=1800, check=True,
         )
-        return dest.exists() and dest.stat().st_size > 0
+        if not (partial.exists() and partial.stat().st_size > 0):
+            partial.unlink(missing_ok=True)
+            return False
+        os.replace(partial, dest)
+        return True
     except (subprocess.SubprocessError, OSError):
+        partial.unlink(missing_ok=True)
         dest.unlink(missing_ok=True)
-        return False
-
-
-def proxy_is_current(src: Path, dest: Path) -> bool:
-    """True if `dest` already exists and is newer than `src` — used to skip
-    re-encoding on repeat Analyze runs when the source file hasn't changed."""
-    try:
-        return dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime
-    except OSError:
         return False
 
 
@@ -382,6 +433,7 @@ def generate_thumbnail(
     if not ffmpeg_available():
         return False, "ffmpeg/ffprobe not found on PATH"
     dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = _partial_path(dest)
     ts = max(0.1, (duration_seconds or 0.0) * 0.15)
     scale_filter = f"scale='min({max_width},iw)':-2"
     try:
@@ -389,33 +441,30 @@ def generate_thumbnail(
             [
                 "ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(src),
                 "-frames:v", "1", "-vf", scale_filter, "-q:v", "4",
-                str(dest),
+                str(partial),
             ],
             capture_output=True, timeout=90,
         )
     except subprocess.TimeoutExpired:
-        dest.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
         return False, "ffmpeg timed out after 90s"
     except OSError as exc:
-        dest.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
         return False, f"could not run ffmpeg: {exc}"
 
-    if proc.returncode != 0 or not (dest.exists() and dest.stat().st_size > 0):
-        dest.unlink(missing_ok=True)
+    if proc.returncode != 0 or not (partial.exists() and partial.stat().st_size > 0):
+        partial.unlink(missing_ok=True)
         stderr_lines = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
         reason = stderr_lines[-1] if stderr_lines else f"ffmpeg exited with status {proc.returncode}"
         return False, reason[:300]
 
+    try:
+        os.replace(partial, dest)
+    except OSError as exc:
+        partial.unlink(missing_ok=True)
+        return False, f"could not move thumbnail into place: {exc}"[:300]
     return True, None
 
-
-def thumbnail_is_current(src: Path, dest: Path) -> bool:
-    """True if `dest` already exists and is newer than `src` — mirrors
-    proxy_is_current so repeat Analyze runs don't re-extract an unchanged frame."""
-    try:
-        return dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime
-    except OSError:
-        return False
 
 
 def frame_timecode(index: int, count: int, duration: float, fps: float = 24.0) -> str:
