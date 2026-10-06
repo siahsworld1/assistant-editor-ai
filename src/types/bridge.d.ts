@@ -73,8 +73,42 @@ export interface WorkerLifecycleApi {
   restart(): Promise<WorkerStatus>;
 }
 
+export type CredentialProvider = "openai" | "anthropic";
+
+/** Renderer-safe credential status (electron/credential-store.cjs) — never the key. */
+export interface CredentialStatusResponse {
+  ok: boolean;
+  error?: string;
+  providers: Record<CredentialProvider, { name: string; configured: boolean }>;
+  /** "worker": saved keys drive the worker (packaged app). "development-dotenv":
+   * development keeps using the repository .env. */
+  appliesTo: "worker" | "development-dotenv";
+  worker: { state: WorkerStatus["state"]; owned: boolean };
+}
+
+export interface CredentialChangeResponse extends Partial<CredentialStatusResponse> {
+  ok: boolean;
+  error?: string;
+  /** How the change reached the worker. */
+  worker?: CredentialStatusResponse["worker"] & {
+    applied?: boolean;
+    restarted?: boolean;
+    reason?: "development-dotenv" | "adopted" | "restart-failed";
+    error?: string;
+  };
+}
+
+export interface CredentialsApi {
+  available: true;
+  status(): Promise<CredentialStatusResponse>;
+  save(provider: CredentialProvider, key: string): Promise<CredentialChangeResponse>;
+  remove(provider: CredentialProvider): Promise<CredentialChangeResponse>;
+}
+
 declare global {
   interface Window {
+    /** AI-provider key management — status/save/remove only, never read-back. */
+    assistantEditorCredentials?: CredentialsApi;
     /** Local engine lifecycle owned by the desktop companion (electron/worker-supervisor.cjs). */
     assistantEditorWorker?: WorkerLifecycleApi;
     /** Injected by the Assistant Editor desktop companion (electron/preload.cjs). */

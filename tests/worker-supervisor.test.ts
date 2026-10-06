@@ -31,6 +31,14 @@ const http = require("node:http");
 const mode = process.env.FAKE_MODE;
 const port = Number(process.env.FAKE_PORT);
 if (process.env.FAKE_PRINT) console.log(process.env.FAKE_PRINT);
+if (process.env.FAKE_REPORT_KEYS) {
+  // Proves which keys reached THIS process's environment (by hash), and echoes
+  // one raw so the supervisor's log masking is exercised for real.
+  const sha = (v) => require("node:crypto").createHash("sha256").update(v || "").digest("hex");
+  console.log("KEYS openai=" + sha(process.env.OPENAI_API_KEY) + " anthropic=" + sha(process.env.ANTHROPIC_API_KEY));
+  console.log("RAW " + (process.env.OPENAI_API_KEY || ""));
+  console.log("ARGV " + JSON.stringify(process.argv.slice(1)));
+}
 if (mode === "exit") { console.error("ModuleNotFoundError: No module named 'flask'"); process.exit(3); }
 if (mode === "ignore-term") process.on("SIGTERM", () => console.log("ignoring SIGTERM"));
 if (mode === "never") { setInterval(() => {}, 1000); return; }
@@ -303,6 +311,102 @@ describe("WorkerSupervisor — launch environment", () => {
     expect(status.error!.logTail!.join("\n")).toContain(
       `ENV /bundle/ffmpeg/bin/ffmpeg ${sup.PACKAGED_WORKER_PATH}`,
     );
+  });
+});
+
+describe("WorkerSupervisor — provider credentials (Step 7)", () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const cred = require("../electron/credential-store.cjs");
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { createHash } = require("node:crypto");
+  const sha = (v: string) => createHash("sha256").update(v).digest("hex");
+  const KEY_A = "sk-proj-TESTONLY-1111111111111111111111111111111111";
+  const KEY_B = "sk-proj-TESTONLY-2222222222222222222222222222222222";
+  const ANT = "sk-ant-api03-TESTONLY-33333333333333333333333333333";
+
+  function credentialedSupervisor(
+    port: number,
+    store: unknown,
+    spawnSpy?: ReturnType<typeof vi.fn>,
+  ) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { spawn } = require("node:child_process");
+    let svc: { workerEnv(): Promise<Record<string, string>> } | null = null;
+    const s: Supervisor & { addSecrets(v: string[]): void } = new sup.WorkerSupervisor({
+      port,
+      startTimeoutMs: 8000,
+      stopGraceMs: 1000,
+      env: { ...process.env, FAKE_MODE: "healthy", FAKE_PORT: String(port), FAKE_REPORT_KEYS: "1" },
+      credentials: () => svc!.workerEnv(),
+      launch: () => ({
+        ok: true,
+        command: process.execPath,
+        args: [script],
+        cwd: dir,
+        description: "fake worker",
+      }),
+      log: () => {},
+      spawnImpl: (cmd: string, args: string[], opts: unknown) => {
+        spawnSpy?.(cmd, args, opts);
+        return spawn(cmd, args, opts);
+      },
+    });
+    cleanups.push(() => s.stop());
+    svc = new cred.CredentialService({
+      store,
+      supervisor: s,
+      injectIntoWorker: true,
+      log: () => {},
+    });
+    return {
+      s,
+      svc: svc as unknown as { save(p: string, k: string): Promise<Record<string, unknown>> },
+    };
+  }
+
+  it("puts Keychain keys in the owned worker's environment — never its argv — and masks them in logs", async () => {
+    const port = await freePort();
+    const spawnSpy = vi.fn();
+    const store = new cred.MemoryCredentialStore({ openai: KEY_A, anthropic: ANT });
+    const { s } = credentialedSupervisor(port, store, spawnSpy);
+    expect((await s.start()).state).toBe("ready");
+    const [, args] = spawnSpy.mock.calls[0]!;
+    expect(JSON.stringify(args)).not.toContain(KEY_A);
+    const tail = s.logTail.join("\n");
+    expect(tail).toContain(`KEYS openai=${sha(KEY_A)} anthropic=${sha(ANT)}`); // values arrived via env
+    expect(tail).toContain("RAW [redacted]"); // and a worker printing one is masked
+    expect(tail).not.toContain(KEY_A);
+    expect(tail).not.toContain(KEY_B);
+  });
+
+  it("a saved key reaches the worker through a real, health-gated restart of the owned process", async () => {
+    const port = await freePort();
+    const store = new cred.MemoryCredentialStore({ openai: KEY_A });
+    const { s, svc } = credentialedSupervisor(port, store);
+    const first = await s.start();
+    const res = await svc.save("openai", KEY_B);
+    expect(res.ok).toBe(true);
+    expect(res.worker).toMatchObject({ applied: true, restarted: true });
+    const after = s.status();
+    expect(after.state).toBe("ready");
+    expect(after.pid).not.toBe(first.pid); // a new process...
+    expect(isAlive(first.pid!)).toBe(false); // ...the old one is gone
+    expect(s.logTail.join("\n")).toContain(`KEYS openai=${sha(KEY_B)}`); // ...with the new key
+    expect(JSON.stringify(res)).not.toContain(KEY_B);
+  });
+
+  it("never kills or restarts an adopted worker when a key changes", async () => {
+    const port = await freePort();
+    await serve(port, (_req, res) =>
+      res.end(JSON.stringify({ ok: true, service: "assistant-editor-worker", pid: 4242 })),
+    );
+    const spawnSpy = vi.fn();
+    const { s, svc } = credentialedSupervisor(port, new cred.MemoryCredentialStore(), spawnSpy);
+    expect((await s.start()).owned).toBe(false);
+    const res = await svc.save("openai", KEY_A);
+    expect(res.worker).toMatchObject({ applied: false, reason: "adopted" });
+    expect(spawnSpy).not.toHaveBeenCalled();
+    expect((await sup.fetchHealth({ port })).ok).toBe(true); // still running, untouched
   });
 });
 

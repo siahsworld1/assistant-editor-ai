@@ -167,7 +167,7 @@ async function fetchHealth({ host = DEFAULT_HOST, port = DEFAULT_PORT, timeoutMs
 }
 
 /** Masks values of secret-looking env vars and API-key-shaped tokens. */
-function makeRedactor(env = process.env) {
+function makeRedactor(env = process.env, extraSecrets = () => []) {
   const secrets = Object.entries(env)
     .filter(
       ([k, v]) => /KEY|TOKEN|SECRET|PASSWORD/i.test(k) && typeof v === "string" && v.length >= 8,
@@ -175,8 +175,10 @@ function makeRedactor(env = process.env) {
     .map(([, v]) => v);
   return (line) => {
     let out = line;
-    for (const s of secrets) out = out.split(s).join("[redacted]");
-    return out.replace(/\b(sk|sk-ant|sk-proj)-[A-Za-z0-9_-]{8,}/g, "[redacted]");
+    for (const s of [...secrets, ...extraSecrets()]) out = out.split(s).join("[redacted]");
+    // Key-shaped tokens, including providers' own partially-masked echoes
+    // (e.g. "sk-proj-****abcd" in an authentication error).
+    return out.replace(/\b(sk|sk-ant|sk-proj)-[A-Za-z0-9_*-]{6,}/g, "[redacted]");
   };
 }
 
@@ -201,8 +203,13 @@ class WorkerSupervisor {
     this.stopGraceMs = opts.stopGraceMs ?? DEFAULT_STOP_GRACE_MS;
     this.env = opts.env ?? process.env;
     this.spawnImpl = opts.spawnImpl ?? spawn;
+    /** Extra worker environment (API keys) resolved at every spawn — values
+     * only ever go into the child's env, never its argv, and are masked in
+     * every log line and error this supervisor produces. */
+    this.credentials = opts.credentials ?? (async () => ({}));
+    this.extraSecrets = [];
     this.log = opts.log ?? ((line) => console.log(`[worker] ${line}`));
-    this.redact = makeRedactor(this.env);
+    this.redact = makeRedactor(this.env, () => this.extraSecrets);
 
     /** @type {"idle" | "starting" | "ready" | "error" | "stopped"} */
     this.state = "idle";
@@ -216,6 +223,14 @@ class WorkerSupervisor {
 
   get url() {
     return `http://${this.host}:${this.port}`;
+  }
+
+  /** Registers values that must never appear in any log line or error. */
+  addSecrets(values) {
+    for (const v of values) {
+      if (typeof v === "string" && v.length >= 8 && !this.extraSecrets.includes(v))
+        this.extraSecrets.push(v);
+    }
   }
 
   /** Renderer-safe snapshot (no env, no secrets). */
@@ -300,6 +315,16 @@ class WorkerSupervisor {
     }
 
     const spec = this.launch();
+    let credentialEnv = {};
+    if (spec.ok) {
+      try {
+        credentialEnv = (await this.credentials()) || {};
+        this.addSecrets(Object.values(credentialEnv));
+      } catch (err) {
+        // Start without keys rather than not at all; AI steps report "not set".
+        this.log(`could not read provider credentials: ${this.redact(String(err && err.message))}`);
+      }
+    }
     if (!spec.ok) return this.fail(spec.kind, spec.message);
     this.log(`starting: ${spec.description}`);
 
@@ -315,6 +340,7 @@ class WorkerSupervisor {
         env: {
           ...this.env,
           ...spec.env,
+          ...credentialEnv,
           PYTHONUNBUFFERED: "1",
           // worker/server.py exits on its own if this process disappears
           // without a clean quit, so a crash can't leave an orphan behind.

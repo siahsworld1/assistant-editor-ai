@@ -6,6 +6,13 @@ const { DesktopCapabilities, handleDesktopAction } = require("./desktop-capabili
 const { PremiereBridge } = require("./premiere-bridge.cjs");
 const { WorkerSupervisor, resolveWorkerLaunch } = require("./worker-supervisor.cjs");
 const {
+  CredentialService,
+  KeychainCredentialStore,
+  MemoryCredentialStore,
+  redactSecrets,
+  shouldInjectKeychainCredentials,
+} = require("./credential-store.cjs");
+const {
   registerMediaProtocolPrivileges,
   createMediaProtocolHandler,
 } = require("./media-protocol.cjs");
@@ -23,8 +30,20 @@ const DEFAULT_TIMEOUT_MS = 8000;
 const embedded = new EmbeddedRenderer();
 /** Loopback contract server for the Premiere Pro UXP panel (v0.4.0). */
 const premiere = new PremiereBridge();
+/**
+ * Provider API keys live in the macOS Keychain and reach only the worker's
+ * environment. Packaged builds always inject them; development keeps using
+ * the repository .env unless ASSISTANT_EDITOR_DEV_USE_KEYCHAIN=1 opts in
+ * (Keychain values would otherwise silently override the .env ones).
+ */
+const injectKeychainCredentials = shouldInjectKeychainCredentials({ isPackaged: app.isPackaged });
+const credentialStore =
+  process.platform === "darwin" ? new KeychainCredentialStore() : new MemoryCredentialStore();
+/** @type {CredentialService} */
+let credentialService;
 /** The local engine (worker/server.py in dev). Started at launch, stopped on quit. */
 const worker = new WorkerSupervisor({
+  credentials: () => credentialService.workerEnv(),
   launch: () =>
     resolveWorkerLaunch({
       isPackaged: app.isPackaged,
@@ -173,6 +192,27 @@ ipcMain.handle("assistant-editor:premiere", async (_event, payload) => {
       : { ok: false, error: result.error };
   }
   return { ok: false, error: `Unknown Premiere action: ${action || "(none)"}` };
+});
+
+credentialService = new CredentialService({
+  store: credentialStore,
+  supervisor: worker,
+  injectIntoWorker: injectKeychainCredentials,
+});
+
+// AI-provider credentials for the renderer: status, save, remove. Nothing on
+// this channel ever returns a stored key; errors are scrubbed of the key.
+ipcMain.handle("assistant-editor:credentials", async (_event, payload) => {
+  const action = typeof payload?.action === "string" ? payload.action : "";
+  const submitted = typeof payload?.key === "string" ? payload.key : "";
+  try {
+    if (action === "status") return await credentialService.status();
+    if (action === "save") return await credentialService.save(payload?.provider, submitted);
+    if (action === "remove") return await credentialService.remove(payload?.provider);
+    return { ok: false, error: `Unknown credential action: ${action || "(none)"}` };
+  } catch (err) {
+    return { ok: false, error: redactSecrets(err && err.message, [submitted]) };
+  }
 });
 
 // Worker lifecycle for the renderer: read status, wait for startup to settle,

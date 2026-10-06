@@ -74,3 +74,22 @@ contextBridge.exposeInMainWorld("assistantEditorWorker", {
   waitUntilReady: () => ipcRenderer.invoke("assistant-editor:worker", { action: "waitUntilReady" }),
   restart: () => ipcRenderer.invoke("assistant-editor:worker", { action: "restart" }),
 });
+
+// AI-provider API keys (electron/credential-store.cjs). The renderer can check
+// whether a provider is configured, save a new key, or remove one — there is
+// deliberately no way to read a stored key back.
+contextBridge.exposeInMainWorld("assistantEditorCredentials", {
+  available: true,
+  status: () => ipcRenderer.invoke("assistant-editor:credentials", { action: "status" }),
+  save: (provider, key) =>
+    ipcRenderer.invoke("assistant-editor:credentials", {
+      action: "save",
+      provider: typeof provider === "string" ? provider : "",
+      key: typeof key === "string" ? key : "",
+    }),
+  remove: (provider) =>
+    ipcRenderer.invoke("assistant-editor:credentials", {
+      action: "remove",
+      provider: typeof provider === "string" ? provider : "",
+    }),
+});

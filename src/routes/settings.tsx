@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Cloud, HardDrive, Lock, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { PageHeader } from "@/components/ae/AppShell";
+import { ProviderCredentials } from "@/components/ae/ProviderCredentials";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -105,6 +106,13 @@ function SettingsPage() {
       />
 
       <div className="grid gap-4 px-6 py-5 2xl:grid-cols-2">
+        <Section
+          title="AI providers"
+          description="API keys for transcription and analysis. Stored in the macOS Keychain — never in project files or app settings."
+        >
+          <ProviderCredentials onEngineRestarted={retryConnection} />
+        </Section>
+
         <Section
           title="Media processing"
           description="Where transcription, vision analysis and story reasoning are executed."
