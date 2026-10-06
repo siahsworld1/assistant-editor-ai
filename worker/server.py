@@ -206,15 +206,30 @@ def _selftest() -> int:
     needs at runtime and reports which ffmpeg/ffprobe it would run — without
     binding the port. Used by scripts/build-worker.sh after PyInstaller."""
     import importlib
+    import importlib.metadata
     import json
+    import platform
+    import re
     import sys
     import warnings
 
     import media
 
-    report = {"python": sys.version.split()[0], "frozen": bool(getattr(sys, "frozen", False)), "modules": {}}
+    report = {
+        "python": platform.python_version(),
+        "arch": platform.machine(),
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "modules": {},
+        # Every installed distribution and its version — build-worker.sh checks
+        # these against worker/requirements.lock.
+        "distributions": {
+            re.sub(r"[-_.]+", "-", d.metadata["Name"] or "").lower(): d.version
+            for d in importlib.metadata.distributions()
+        },
+    }
     ok = True
     for name in ("flask", "werkzeug", "dotenv", "numpy", "openai", "anthropic", "httpx", "certifi",
+                 "pydantic", "pydantic_core", "jiter",
                  "providers.anthropic_provider", "providers.openai_provider", "pipeline", "reasoning"):
         try:
             mod = importlib.import_module(name)

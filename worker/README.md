@@ -53,12 +53,14 @@ SDK at all — see `worker/tests/test_reasoning.py` and the
    ```sh
    brew install ffmpeg
    ```
-2. From this `worker/` folder, create a virtual environment and install dependencies:
+2. From the project root, create the worker's environment — the pinned Python 3.12
+   and the hash-locked `requirements.lock`, the same versions the packaged app ships:
    ```sh
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
+   scripts/worker-python.sh dev     # creates worker/.venv
    ```
+   Don't `pip install` into it by hand. To change a dependency, edit
+   `requirements.txt` and run `scripts/worker-python.sh lock`, then `dev` again.
+   Run the worker tests with it: `.venv/bin/python -m unittest discover -s tests -v`.
 3. Copy `.env.example` to `.env` and fill in your API keys:
    ```sh
    cp .env.example .env

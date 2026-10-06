@@ -15,10 +15,8 @@ video/audio clips.
 Same as `worker/README.md`'s setup section:
 
 ```sh
+scripts/worker-python.sh dev   # pinned Python 3.12 + locked deps -> worker/.venv
 cd worker
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 cp .env.example .env   # fill in your API keys
 brew install ffmpeg    # if you don't already have it
 ```

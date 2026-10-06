@@ -1,11 +1,37 @@
-flask>=3.0,<4
-python-dotenv>=1.0,<2
-numpy>=1.26,<3
+# Worker production dependencies — the human-maintained INPUT to the lock.
+#
+# Never installed directly. scripts/worker-python.sh compiles this into the
+# hash-pinned worker/requirements.lock (Python 3.12, macOS arm64) and installs
+# ONLY from that lock — for the dev worker (worker/.venv), the worker tests and
+# the packaged worker alike. After editing this file:
+#
+#     scripts/worker-python.sh lock
+#
+# Versions are chosen deliberately, not "latest":
+#   - The AI SDKs, and the httpx/pydantic they run on, are pinned to the exact
+#     versions the real six-clip end-to-end validation passed with.
+#   - Flask/Werkzeug and the network plumbing take the newest patch release of
+#     the same minor version, for security fixes.
+#   - python-dotenv and numpy stay at the versions the packaged worker already
+#     shipped with (numpy is used for one FFT in media.detect_hum).
+
+flask==3.1.3
+werkzeug==3.1.9
+python-dotenv==1.2.1
+numpy==2.0.2
 
 # Vendor SDKs for the built-in providers (worker/providers/). Every worker module
 # that isn't a provider itself imports these lazily/never, so a provider you're not
 # using can in principle be uninstalled — but both ship by default since the
 # out-of-the-box config (ASSISTANT_EDITOR_TRANSCRIPTION_PROVIDER=openai,
 # ASSISTANT_EDITOR_REASONING_PROVIDER=anthropic) uses one of each.
-openai>=1.40,<2
-anthropic>=0.34,<1
+openai==2.48.0
+anthropic==0.122.0
+httpx==0.27.2
+pydantic==2.9.2
+
+# Security floors for transitive dependencies (request smuggling in h11 < 0.16;
+# Jinja2 sandbox fixes in 3.1.5/3.1.6).
+h11>=0.16
+httpcore>=1.0.9
+jinja2>=3.1.6
