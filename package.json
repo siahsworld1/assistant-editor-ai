@@ -148,6 +148,7 @@
         }
       ],
       "category": "public.app-category.video",
+      "icon": "assets/icon/AssistantEditorAI.icns",
       "minimumSystemVersion": "14.0",
       "bundleShortVersion": "1.0.0",
       "bundleVersion": "1",
@@ -162,7 +163,23 @@
     },
     "dmg": {
       "artifactName": "${productName}-${version}-${arch}.${ext}",
-      "title": "${productName} ${version}"
+      "title": "${productName} ${version}",
+      "background": "assets/dmg/background.tiff",
+      "iconSize": 96,
+      "iconTextSize": 13,
+      "contents": [
+        {
+          "x": 242,
+          "y": 264,
+          "type": "file"
+        },
+        {
+          "x": 527,
+          "y": 264,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
     },
     "win": {
       "target": [
