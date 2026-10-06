@@ -17,7 +17,7 @@
 // checked every animation frame instead of on `timeupdate` (~4 Hz).
 //
 // Framework-free and driven through a tiny media interface, so the timing
-// logic is unit-tested deterministically (tests/sequence-buffer.test.ts).
+// logic is unit-tested deterministically (tests/playback-transitions.test.ts).
 import type { PlayableSegment } from "./timeline-playback";
 
 /** The slice of HTMLMediaElement this controller uses. */
