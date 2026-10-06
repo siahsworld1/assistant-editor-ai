@@ -624,5 +624,30 @@ class TestFfprobeTimeoutRetry(unittest.TestCase):
         self.assertIn("Invalid data found", info["probeError"])
 
 
+class TestProxyEncoder(unittest.TestCase):
+    """The shipped FFmpeg is LGPL-only (no libx264), so proxies must be encoded
+    with Apple VideoToolbox — and switching encoders must not invalidate the
+    proxies/thumbnails projects already have cached."""
+
+    def test_proxies_are_encoded_with_videotoolbox_never_libx264(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(media, "ffmpeg_available", return_value=True), \
+                patch.object(media.subprocess, "run") as run:
+            media.generate_proxy(Path(tmp) / "src.mov", Path(tmp) / "out.mp4")
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("-c:v") + 1], "h264_videotoolbox")
+        self.assertNotIn("libx264", args)
+        self.assertEqual(args[args.index("-allow_sw") + 1], "1")  # works without a hardware encoder
+        self.assertEqual(args[args.index("-pix_fmt") + 1], "yuv420p")
+        self.assertEqual(args[args.index("-c:a") + 1], "aac")
+        self.assertIn("scale='min(960,iw)':-2", args)
+        self.assertIn("+faststart", args)
+
+    def test_existing_cached_proxies_stay_valid(self):
+        # Proxies made with libx264 are still H.264 and are reused: the cache
+        # key version is NOT bumped for the encoder change.
+        self.assertEqual(media.CACHE_KEY_VERSION, "ae-media-cache-v1")
+
+
 if __name__ == "__main__":
     unittest.main()

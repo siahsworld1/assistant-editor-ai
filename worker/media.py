@@ -391,6 +391,17 @@ def _partial_path(dest: Path) -> Path:
 
 PROXY_MAX_WIDTH = 960
 PROXY_DIR_NAME = ".ae_proxies"
+# H.264 via Apple VideoToolbox — the FFmpeg the app ships is LGPL-only, with no
+# libx264 (scripts/prepare-ffmpeg.py). VideoToolbox has no CRF, so a fixed
+# bitrate sized for a <=960px proxy (1.5 Mbps measured higher quality than the
+# old libx264 CRF 23 proxies on real 4K footage) and a keyframe every 48 frames
+# for responsive scrubbing; allow_sw lets macOS fall back to its own
+# software H.264 encoder where there is no hardware encoder (e.g. a VM).
+# Proxies made earlier with libx264 are equally valid H.264 and are kept.
+PROXY_VIDEO_ARGS = (
+    "-c:v", "h264_videotoolbox", "-allow_sw", "1", "-realtime", "0",
+    "-profile:v", "high", "-b:v", "1500k", "-g", "48",
+)
 
 
 def generate_proxy(src: Path, dest: Path, max_width: int = PROXY_MAX_WIDTH) -> bool:
@@ -421,7 +432,7 @@ def generate_proxy(src: Path, dest: Path, max_width: int = PROXY_MAX_WIDTH) -> b
             [
                 ffmpeg_bin(), "-y", "-i", str(src),
                 "-vf", scale_filter,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                *PROXY_VIDEO_ARGS,
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart",
