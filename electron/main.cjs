@@ -4,6 +4,7 @@ const { validateRequest, sanitizeHeaders } = require("./allowlist.cjs");
 const { EmbeddedRenderer } = require("./renderer-server.cjs");
 const { DesktopCapabilities, handleDesktopAction } = require("./desktop-capabilities.cjs");
 const { PremiereBridge } = require("./premiere-bridge.cjs");
+const { WorkerSupervisor, resolveWorkerLaunch } = require("./worker-supervisor.cjs");
 const {
   registerMediaProtocolPrivileges,
   createMediaProtocolHandler,
@@ -22,6 +23,10 @@ const DEFAULT_TIMEOUT_MS = 8000;
 const embedded = new EmbeddedRenderer();
 /** Loopback contract server for the Premiere Pro UXP panel (v0.4.0). */
 const premiere = new PremiereBridge();
+/** The local engine (worker/server.py in dev). Started at launch, stopped on quit. */
+const worker = new WorkerSupervisor({
+  launch: () => resolveWorkerLaunch({ isPackaged: app.isPackaged, appPath: app.getAppPath() }),
+});
 /** Project persistence + user-gated media indexing. Created after app ready. */
 let capabilities = null;
 /** Resolved at boot: dev server URL, or the embedded renderer's loopback URL. */
@@ -165,6 +170,22 @@ ipcMain.handle("assistant-editor:premiere", async (_event, payload) => {
   return { ok: false, error: `Unknown Premiere action: ${action || "(none)"}` };
 });
 
+// Worker lifecycle for the renderer: read status, wait for startup to settle,
+// or restart after a failure. Never exposes paths, env or the child process.
+ipcMain.handle("assistant-editor:worker", async (_event, payload) => {
+  const action = typeof payload?.action === "string" ? payload.action : "";
+  if (action === "status") return worker.status();
+  if (action === "waitUntilReady") return worker.waitUntilReady();
+  if (action === "restart") return worker.restart();
+  return {
+    state: "error",
+    owned: false,
+    pid: null,
+    url: worker.url,
+    error: { kind: "bad-request", message: `Unknown worker action: ${action || "(none)"}` },
+  };
+});
+
 ipcMain.handle("assistant-editor:request", async (_event, payload) => {
   const check = validateRequest(payload?.method, payload?.path);
   if (!check.ok) {
@@ -259,6 +280,9 @@ app.whenReady().then(() => {
   void premiere.start().then((res) => {
     if (!res.ok) console.warn(`[assistant-editor] ${res.error}`);
   });
+  // Started in parallel with the window; the renderer waits on it via the
+  // assistant-editor:worker IPC before treating the engine as available.
+  void worker.start();
   void boot();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) void boot();
@@ -269,9 +293,17 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => {
+let workerStopped = false;
+app.on("before-quit", (event) => {
   embedded.stop();
   premiere.stop();
+  // Give the worker we own its graceful SIGTERM (bounded by the supervisor's
+  // grace period + SIGKILL) before the app actually exits.
+  if (!workerStopped) {
+    event.preventDefault();
+    workerStopped = true;
+    void worker.stop().finally(() => app.quit());
+  }
 });
 app.on("quit", () => {
   embedded.stop();
@@ -280,10 +312,16 @@ app.on("quit", () => {
 process.on("exit", () => {
   embedded.stop();
   premiere.stop();
+  worker.killNow();
 });
+// Ctrl+C / `concurrently -k` in dev: go through the normal quit path so the
+// worker is stopped gracefully (its parent watchdog covers a hard kill).
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => app.quit());
+}
 
 app.on("web-contents-created", (_e, contents) => {
   contents.on("will-attach-webview", (event) => event.preventDefault());
 });
 
-module.exports = { embedded, premiere };
+module.exports = { embedded, premiere, worker };

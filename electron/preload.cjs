@@ -65,3 +65,12 @@ contextBridge.exposeInMainWorld("assistantEditorPremiere", {
       payload: { type: typeof type === "string" ? type : "", payload },
     }),
 });
+
+// Local engine lifecycle (electron/worker-supervisor.cjs): status only — the
+// renderer can wait for startup or ask for a restart, nothing more.
+contextBridge.exposeInMainWorld("assistantEditorWorker", {
+  available: true,
+  status: () => ipcRenderer.invoke("assistant-editor:worker", { action: "status" }),
+  waitUntilReady: () => ipcRenderer.invoke("assistant-editor:worker", { action: "waitUntilReady" }),
+  restart: () => ipcRenderer.invoke("assistant-editor:worker", { action: "restart" }),
+});

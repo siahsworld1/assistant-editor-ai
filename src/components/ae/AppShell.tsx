@@ -72,6 +72,7 @@ const CONNECTION_LABEL: Record<string, string> = {
   connecting: "Probing local engine…",
   degraded: "Engine degraded — reconnecting",
   "bridge-required": "Desktop Bridge Required",
+  offline: "Local engine offline",
   demo: "Demo Mode — fixture data",
 };
 
@@ -83,6 +84,7 @@ function StatusBar() {
     connection,
     health,
     connectionError,
+    engineStartupError,
     blockedReason,
     transportLabel,
     retryConnection,
@@ -97,7 +99,9 @@ function StatusBar() {
         ? "animate-pulse bg-warning"
         : connection === "degraded"
           ? "animate-pulse bg-warning"
-          : "bg-warning";
+          : connection === "offline"
+            ? "bg-destructive"
+            : "bg-warning";
 
   return (
     <header className="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3 border-b border-border bg-surface px-5 py-2.5">
@@ -180,9 +184,17 @@ function StatusBar() {
         </div>
       )}
 
-      {connectionError && connection === "demo" && (
-        <div className="w-full text-[11px] text-warning">
-          {connectionError} — showing labeled demo fixtures; every action is simulated.
+      {connection === "offline" && (
+        <div className="w-full rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">
+          <div className="font-medium">
+            {connectionError ?? "The local engine is unavailable."} No data is shown until it
+            reconnects — use Reconnect after fixing the cause.
+          </div>
+          {engineStartupError?.logTail && engineStartupError.logTail.length > 0 && (
+            <pre className="mt-1.5 max-h-28 overflow-auto whitespace-pre-wrap font-tc text-[10px] text-destructive/80">
+              {engineStartupError.logTail.join("\n")}
+            </pre>
+          )}
         </div>
       )}
     </header>

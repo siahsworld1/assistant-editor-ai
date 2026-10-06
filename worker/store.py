@@ -5,6 +5,7 @@ fine: "Analyze" re-derives everything from the media folder.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -133,6 +134,11 @@ class ProjectStore:
         with self._lock:
             return {
                 "ok": True,
+                # Lets the desktop app tell this worker apart from any other
+                # program on the port, and confirm the process answering is the
+                # one it started (electron/worker-supervisor.cjs).
+                "service": "assistant-editor-worker",
+                "pid": os.getpid(),
                 "version": "0.1.0-real-engine",
                 "uptimeSeconds": round(time.time() - self.started_at),
                 "gpu": "cloud (OpenAI Whisper + Claude)",

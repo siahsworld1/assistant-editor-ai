@@ -117,7 +117,27 @@ def handle_error(exc):
     return jsonify({"error": "The engine hit an unexpected error handling that request."}), 500
 
 
+def _exit_when_parent_dies(parent_pid: int) -> None:
+    """When the desktop app starts this worker it passes its own pid. If that
+    process goes away without a clean quit (crash, force-quit, Ctrl+C in dev),
+    we're reparented and getppid() changes — exit instead of lingering as an
+    orphan holding port 32145."""
+    import os
+    import time
+
+    def watch():
+        while True:
+            if os.getppid() != parent_pid:
+                log.warning("parent process %s is gone — shutting down", parent_pid)
+                os._exit(0)
+            time.sleep(1.0)
+
+    threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
+
+
 if __name__ == "__main__":
+    import os
+
     import media
     from providers.base import ProviderError
     from providers.registry import get_reasoning_provider, get_transcription_provider
@@ -141,6 +161,10 @@ if __name__ == "__main__":
         log.info("Reasoning provider: %s", reasoning_provider.name)
     except ProviderError as exc:
         log.warning("Reasoning provider unavailable — selects/stories/build reasoning will be skipped. %s", exc)
+
+    parent_pid = os.environ.get("ASSISTANT_EDITOR_PARENT_PID", "")
+    if parent_pid.isdigit():
+        _exit_when_parent_dies(int(parent_pid))
 
     log.info("Assistant Editor AI worker listening on http://%s:%s", HOST, PORT)
     app.run(host=HOST, port=PORT, threaded=True)

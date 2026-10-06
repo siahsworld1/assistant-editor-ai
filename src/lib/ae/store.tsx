@@ -11,6 +11,7 @@ import {
 import { EngineClient, resolveTransport } from "./service";
 import type { BuildResult } from "./service";
 import type { HostContext } from "./transport";
+import type { WorkerStatus } from "@/types/bridge";
 import type {
   AppMode,
   EditingProfile,
@@ -138,6 +139,9 @@ interface AEContextValue {
   diagnostics: DiagnosticsMap;
   lastHealthAt: number | null;
   connectionError: string | null;
+  /** Why the desktop-owned worker isn't running (startup failure / crash),
+   * including its last log lines. Null when healthy or not on desktop. */
+  engineStartupError: WorkerStatus["error"];
   loading: boolean;
   project: ProjectBrain | null;
   nle: NLEStatus[];
@@ -294,6 +298,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsMap>(() => initialDiagnostics());
   const [lastHealthAt, setLastHealthAt] = useState<number | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [engineStartupError, setEngineStartupError] = useState<WorkerStatus["error"]>(null);
   const [loading, setLoading] = useState(true);
 
   const [project, setProject] = useState<ProjectBrain | null>(null);
@@ -562,6 +567,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     setLoading(true);
     setConnectionError(null);
+    setEngineStartupError(null);
 
     if (mode === "demo") {
       setConnection("demo");
@@ -600,8 +606,42 @@ export function AEProvider({ children }: { children: ReactNode }) {
     const client = new EngineClient(transport, report);
     clientRef.current = client;
 
+    /** The engine is unavailable: an explicit error state with the real
+     * reason. Never fixture data — Demo Mode is only entered via setMode. */
+    const goOffline = (message: string, startup: WorkerStatus["error"] = null) => {
+      clientRef.current = null;
+      setConnection("offline");
+      setConnectionError(message);
+      setEngineStartupError(startup);
+      setProject(
+        activeRef.current.record
+          ? brainFromRecord(activeRef.current.record, activeRef.current.index)
+          : null,
+      );
+      setSelects([]);
+      setStories([]);
+      setNle(unreportedNle());
+      setNleReported(false);
+      setVersions([baselineVersion(targetSeconds)]);
+      setActiveVersionId("v1");
+      setHealth(null);
+      setCapabilities(null);
+    };
+
     (async () => {
       try {
+        // In the desktop app, Electron owns the worker: wait for its startup
+        // to settle (health-gated, bounded — electron/worker-supervisor.cjs)
+        // instead of racing a cold Python start with a single probe.
+        const worker = typeof window === "undefined" ? undefined : window.assistantEditorWorker;
+        if (worker?.available) {
+          const status = await worker.waitUntilReady();
+          if (cancelled) return;
+          if (status.state !== "ready") {
+            goOffline(status.error?.message ?? "The local engine did not start.", status.error);
+            return;
+          }
+        }
         const { health: h, capabilities: caps } = await client.health();
         if (cancelled) return;
         setHealth(h);
@@ -637,13 +677,12 @@ export function AEProvider({ children }: { children: ReactNode }) {
         }
       } catch (err) {
         if (cancelled) return;
-        // Engine was never reachable on this boot → fall back to explicit Demo Mode.
-        clientRef.current = null;
-        setConnection("demo");
-        setConnectionError(
+        // Engine unreachable on this boot → explicit offline error state. This
+        // used to silently load Demo Mode fixtures, which made a dead engine
+        // look like a working project full of fake data.
+        goOffline(
           err instanceof Error ? err.message : "Local engine unreachable on 127.0.0.1:32145",
         );
-        loadDemo();
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -725,10 +764,22 @@ export function AEProvider({ children }: { children: ReactNode }) {
 
   const analyze = useCallback(() => {
     const client = clientRef.current;
+    if (!client && modeRef.current !== "demo") {
+      setProject((p) =>
+        p
+          ? {
+              ...p,
+              analysisState: "error",
+              analysisError: "The local engine is offline — Reconnect, then analyze again.",
+            }
+          : p,
+      );
+      return;
+    }
     setProject((p) =>
       p ? { ...p, analysisState: "running", analysisProgress: 2, analysisError: null } : p,
     );
-    if (!client) return; // demo: simulated below
+    if (!client) return; // explicit Demo Mode: simulated below
     void (async () => {
       try {
         // POST /analyze only *starts* a background job on a real engine (see
@@ -832,9 +883,14 @@ export function AEProvider({ children }: { children: ReactNode }) {
             command,
           });
           pushVersion(command, prev.id, result);
-        } else {
+        } else if (modeRef.current === "demo") {
           const { summary, changes, timeline } = commandResult(command, prev);
           pushVersion(command, prev.id, { summary, changes, timeline });
+        } else {
+          // No engine: never fabricate an edit outside explicit Demo Mode.
+          setConnectionError(
+            "The local engine is offline — nothing was built. Reconnect and try again.",
+          );
         }
       } catch (err) {
         setConnectionError(
@@ -846,6 +902,18 @@ export function AEProvider({ children }: { children: ReactNode }) {
     },
     [versions, activeVersionId, chosenStoryId, stories, targetSeconds, pushVersion],
   );
+
+  const retryConnection = useCallback(() => {
+    void (async () => {
+      const worker = typeof window === "undefined" ? undefined : window.assistantEditorWorker;
+      if (worker?.available && modeRef.current !== "demo") {
+        setConnection("connecting");
+        const status = await worker.status();
+        if (status.state === "error" || status.state === "stopped") await worker.restart();
+      }
+      setNonce((n) => n + 1);
+    })();
+  }, []);
 
   const setMode = useCallback((next: AppMode) => {
     clientRef.current = null;
@@ -866,6 +934,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       diagnostics,
       lastHealthAt,
       connectionError,
+      engineStartupError,
       loading,
       project,
       nle,
@@ -892,7 +961,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       openProject,
       deleteProject,
       importMedia,
-      retryConnection: () => setNonce((n) => n + 1),
+      retryConnection,
       setMode,
       analyze,
       chooseStory: (id: string) => setChosenStoryId(id),
@@ -917,6 +986,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
       diagnostics,
       lastHealthAt,
       connectionError,
+      engineStartupError,
+      retryConnection,
       loading,
       project,
       nle,

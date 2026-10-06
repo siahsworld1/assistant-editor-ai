@@ -1,7 +1,8 @@
 # Assistant Editor AI — local worker
 
-This is the local "engine" the desktop app talks to at `http://127.0.0.1:32145`. It is
-a separate process you run alongside the app — it is not started automatically.
+This is the local "engine" the desktop app talks to at `http://127.0.0.1:32145`. The
+desktop app (`npm run dev:desktop`) starts it automatically and stops it on quit —
+see "Running" below for running it on its own.
 
 It does real work:
 
@@ -72,6 +73,10 @@ SDK at all — see `worker/tests/test_reasoning.py` and the
 
 ## Running
 
+`npm run dev:desktop` (from the project root) starts this worker for you — no separate
+terminal needed. To run it standalone instead (e.g. with `npm run dev:web`, or to watch
+its logs on their own), stop the desktop app first, then:
+
 ```sh
 source .venv/bin/activate   # if not already active
 python server.py
@@ -83,9 +88,8 @@ You should see:
 Assistant Editor AI worker listening on http://127.0.0.1:32145
 ```
 
-Leave this running in its own terminal tab. Then launch the app as usual
-(`npm run dev:desktop` from the project root) — it polls `/health` and should switch
-from "Demo Mode" to "Live" within a few seconds.
+If the desktop app is launched while this standalone worker is running, it reuses it
+(and leaves it running on quit) instead of starting a second one.
 
 ## Using it
 

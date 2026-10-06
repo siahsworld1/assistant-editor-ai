@@ -69,9 +69,12 @@ function ChatPage() {
         <div className="flex min-h-0 flex-col">
           <div className="flex-1 space-y-4 overflow-y-auto pr-1">
             <div className="panel p-4 text-sm text-muted-foreground">
-              Director Mode is connected to{" "}
-              {connection === "live" ? "the local engine" : "Demo Mode fixtures"}. Commands are
-              non-destructive: each one branches from the version you have selected.
+              {connection === "demo"
+                ? "Director Mode is running on Demo Mode fixtures — every command is simulated."
+                : connection === "live" || connection === "degraded"
+                  ? "Director Mode is connected to the local engine."
+                  : "The local engine is offline — commands can't run until it reconnects."}{" "}
+              Commands are non-destructive: each one branches from the version you have selected.
             </div>
 
             {versions.map((v, i) => (

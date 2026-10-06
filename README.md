@@ -87,10 +87,19 @@ are packaged — no source, screenshots, `.env` files or dev tooling.
 
 ### Pointing at the worker
 
-Run the Assistant Editor local worker so it listens on `127.0.0.1:32145`. That
-origin is hard-coded in `electron/allowlist.cjs` and is the only host the bridge
-will ever contact. Health is polled every ~10s; a failed poll shows
-Degraded / Reconnecting and never silently drops to Demo Mode.
+The desktop app starts and stops the local worker itself
+(`electron/worker-supervisor.cjs`): `npm run dev:desktop` launches Vite, Electron
+and `python3 worker/server.py` (preferring `worker/.venv` if present, or
+`$ASSISTANT_EDITOR_PYTHON`). Electron waits for a healthy `GET /health` on
+`127.0.0.1:32145` (bounded, with backoff) before the UI treats the engine as live,
+and stops the worker it started on quit. A healthy Assistant Editor worker that is
+already running is reused and left running; anything else on port 32145 is reported
+as a startup error and never killed. That origin is hard-coded in
+`electron/allowlist.cjs` and is the only host the bridge will ever contact.
+
+If the engine can't start or becomes unreachable, the app shows an explicit
+"Local engine offline" error with the cause and the worker's last log lines — it
+never substitutes Demo Mode fixtures. Demo Mode is only entered deliberately.
 
 ### How the bridge works
 

@@ -195,6 +195,10 @@ export type ConnectionState =
   | "degraded"
   /** Hosted HTTPS origin cannot reach loopback; the desktop companion is required. */
   | "bridge-required"
+  /** The real engine is unavailable (failed to start, crashed, unreachable).
+   * An explicit error state — never silently replaced by fixture data. */
+  | "offline"
+  /** Fixture data — only ever entered deliberately via setMode("demo"). */
   | "demo";
 
 /** How the app chose its data source. "auto" probes the engine; "demo" is explicit. */

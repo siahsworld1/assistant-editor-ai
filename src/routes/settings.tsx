@@ -269,9 +269,11 @@ function SettingsPage() {
                     ? "degraded — reconnecting"
                     : connection === "bridge-required"
                       ? "desktop bridge required"
-                      : connection === "demo"
-                        ? "Demo Mode"
-                        : "probing"}
+                      : connection === "offline"
+                        ? "offline — engine unavailable"
+                        : connection === "demo"
+                          ? "Demo Mode"
+                          : "probing"}
               </p>
               {connectionError && (
                 <p className="mt-1 text-[11px] text-warning">{connectionError}</p>
