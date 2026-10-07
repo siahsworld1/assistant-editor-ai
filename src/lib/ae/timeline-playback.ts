@@ -73,6 +73,22 @@ export function overlayAt(
   return null;
 }
 
+/** The exact end of the cut (its last event's end). `totalSeconds` is a
+ * whole-second figure for display; the playhead needs the real end. */
+export function sequenceEndSeconds(timeline: UniversalTimeline): number {
+  const end = timeline.decisions.reduce(
+    (a, d) => Math.max(a, d.timelineStartSeconds + d.durationSeconds),
+    0,
+  );
+  return end > 0 ? end : timeline.totalSeconds;
+}
+
+/** Where the playhead stays when the sequence changes: the same position,
+ * clamped to the new sequence length. */
+export function keptPlayhead(playheadSeconds: number, totalSeconds: number): number {
+  return Math.max(0, Math.min(playheadSeconds, Math.max(0, totalSeconds)));
+}
+
 export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) {
   const plan = useMemo(() => buildPlaybackPlan(timeline, clips), [timeline, clips]);
   const segments = plan.sequence;
@@ -89,9 +105,17 @@ export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) 
   if (!bufferRef.current) bufferRef.current = new SequenceBuffer(setState);
   const buffer = bufferRef.current;
 
+  // A new plan (an edit, undo/redo, another version) stops playback and
+  // rebuilds the buffer — but keeps the playhead where it was on the sequence,
+  // clamped to the new length. Playback resumes only on an explicit Play.
+  const playheadRef = useRef(state.playheadSeconds);
+  playheadRef.current = state.playheadSeconds;
+  const endSeconds = useMemo(() => sequenceEndSeconds(timeline), [timeline]);
   useEffect(() => {
-    buffer.setSequence(segments, timeline.totalSeconds);
-  }, [buffer, segments, timeline.totalSeconds]);
+    const keep = keptPlayhead(playheadRef.current, endSeconds);
+    buffer.setSequence(segments, endSeconds);
+    if (keep > 0) buffer.seek(keep);
+  }, [buffer, segments, endSeconds]);
 
   // Edit points are checked every animation frame (not on ~4 Hz timeupdate).
   useEffect(() => {

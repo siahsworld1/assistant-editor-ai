@@ -5,11 +5,11 @@ import { SequencePlayer } from "@/components/ae/SequencePlayer";
 import { useState } from "react";
 import {
   CutawayOverlay,
-  Filmstrip,
   SourcePreviewDialog,
   type PreviewTarget,
 } from "@/components/ae/SourceVisuals";
-import { decisionSourceRange, timelineScale } from "@/lib/ae/source-range";
+import { TimelineEditor } from "@/components/ae/TimelineEditor";
+import { decisionSourceRange } from "@/lib/ae/source-range";
 import { PageHeader } from "@/components/ae/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -61,15 +61,11 @@ function CutPage() {
     chosenStoryId,
     project,
     desktopCapabilities,
+    editor,
   } = useAE();
 
   const version = versions.find((v) => v.id === activeVersionId) ?? versions[0]!;
   const timeline = version.timeline;
-  // Scale to THIS version (its own length and the target it was built to) —
-  // not the slider, which sets the target for the next build. With a 360s
-  // slider default, a 30-second cut used to fill ~8% of the track.
-  const versionTarget = timeline.targetSeconds || targetSeconds;
-  const scale = timelineScale(timeline.totalSeconds, versionTarget);
   const story = stories.find((s) => s.id === chosenStoryId);
   const clips = project?.clips ?? [];
   const mediaRoot = project?.mediaRoot ?? "";
@@ -94,24 +90,6 @@ function CutPage() {
         subtitle: `${d.lane} · timeline ${d.timelineStartSeconds.toFixed(1)}s`,
       });
   };
-  // Tracks top-to-bottom like an NLE: V2 cutaways over V1 interview; A1 is the
-  // interview's own sync audio (what the XMEML export puts on A1, linked to V1);
-  // A2 only exists when the cut has standalone audio events.
-  const hasA2 = timeline.decisions.some((d) => d.lane === "audio");
-  const trackRows: Array<{
-    id: string;
-    label: string;
-    lane: EditDecisionLane;
-    kind: "video" | "sync-audio" | "audio";
-  }> = [
-    { id: "V2", label: laneMeta["b-roll"].label, lane: "b-roll", kind: "video" },
-    { id: "V1", label: laneMeta.interview.label, lane: "interview", kind: "video" },
-    { id: "A1", label: "A1 · Interview audio", lane: "interview", kind: "sync-audio" },
-    ...(hasA2
-      ? [{ id: "A2", label: laneMeta.audio.label, lane: "audio" as const, kind: "audio" as const }]
-      : []),
-  ];
-
   type ExportFormat = "edl" | "xmeml" | "fcpxml";
   const FORMAT_LABEL: Record<ExportFormat, string> = {
     edl: "CMX3600 EDL",
@@ -273,125 +251,7 @@ function CutPage() {
                 </div>
               </div>
 
-              <div className="relative mt-5 space-y-2">
-                <div className="relative h-5 border-b border-border">
-                  {Array.from({ length: 9 }).map((_, i) => (
-                    <span
-                      key={i}
-                      className="absolute top-0 font-tc text-[10px] text-muted-foreground"
-                      style={{ left: `${(i / 8) * 100}%` }}
-                    >
-                      {formatDuration((scale / 8) * i)}
-                    </span>
-                  ))}
-                </div>
-
-                {/* Scrub target, aligned to the track columns (112px label + 12px gap-3
-                    before each lane's track div starts) so its coordinate space matches
-                    the `left: pct%` math each lane item below already uses. */}
-                {desktopCapabilities && (
-                  <div
-                    className="absolute inset-y-0 left-[124px] right-0 z-10 cursor-pointer"
-                    onPointerDown={(e) => {
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const seekFromClientX = (clientX: number) => {
-                        const pct = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-                        playback.seek(pct * scale);
-                      };
-                      seekFromClientX(e.clientX);
-                      const onMove = (ev: PointerEvent) => seekFromClientX(ev.clientX);
-                      const onUp = () => {
-                        window.removeEventListener("pointermove", onMove);
-                        window.removeEventListener("pointerup", onUp);
-                      };
-                      window.addEventListener("pointermove", onMove);
-                      window.addEventListener("pointerup", onUp);
-                    }}
-                  >
-                    <div
-                      className="pointer-events-none absolute inset-y-0 w-px bg-warning"
-                      style={{ left: `${Math.min(100, (playback.playheadSeconds / scale) * 100)}%` }}
-                    />
-                  </div>
-                )}
-
-                {trackRows.map((row) => {
-                  const items = timeline.decisions.filter((d) => d.lane === row.lane);
-                  return (
-                    <div key={row.id} className="flex items-stretch gap-3">
-                      <div className="w-[112px] shrink-0 pt-3 font-tc text-[11px] text-muted-foreground">
-                        {row.label}
-                      </div>
-                      <div
-                        className={cn(
-                          "hairline-grid relative flex-1 rounded border border-border bg-surface",
-                          row.kind === "video" ? "h-14" : "h-9",
-                        )}
-                      >
-                        {items.map((d) => {
-                          const { clip, inSeconds, outSeconds } = sourceRange(d);
-                          const widthPct = (d.durationSeconds / scale) * 100;
-                          return (
-                            <div
-                              key={`${row.id}-${d.id}`}
-                              data-testid={`track-${row.id}-event`}
-                              title={`${clip?.filename ?? d.clipId} · ${d.sourceInTc}–${d.sourceOutTc} · ${d.durationSeconds.toFixed(2)}s`}
-                              className={cn(
-                                "absolute inset-y-1 overflow-hidden rounded-sm border-x-2 border-y border-black/50",
-                                row.kind === "video"
-                                  ? "bg-black"
-                                  : laneMeta[row.lane === "audio" ? "audio" : "interview"].color,
-                                row.kind === "sync-audio" && "opacity-60",
-                              )}
-                              style={{
-                                left: `${(d.timelineStartSeconds / scale) * 100}%`,
-                                width: `${widthPct}%`,
-                              }}
-                            >
-                              {row.kind === "video" && (
-                                <Filmstrip
-                                  clip={clip}
-                                  inSeconds={inSeconds}
-                                  outSeconds={outSeconds}
-                                  count={Math.max(1, Math.min(6, Math.round(widthPct / 6)))}
-                                  className="absolute inset-0 opacity-80"
-                                />
-                              )}
-                              <span
-                                className={cn(
-                                  "relative block truncate px-1.5 pt-0.5 text-[10px] font-medium",
-                                  row.kind === "video" ? "text-white drop-shadow" : "text-black/85",
-                                )}
-                              >
-                                {clip?.filename ?? d.label}
-                                {row.kind === "sync-audio" && clip?.audioChannels
-                                  ? ` · ${clip.audioChannels}ch`
-                                  : ""}
-                              </span>
-                              <span
-                                className={cn(
-                                  "relative block truncate px-1.5 font-tc text-[9px]",
-                                  row.kind === "video"
-                                    ? "text-white/80 drop-shadow"
-                                    : "text-black/60",
-                                )}
-                              >
-                                {d.sourceInTc} · {d.durationSeconds.toFixed(1)}s
-                              </span>
-                            </div>
-                          );
-                        })}
-                        {versionTarget < scale && (
-                          <div
-                            className="absolute inset-y-0 w-px bg-primary"
-                            style={{ left: `${(versionTarget / scale) * 100}%` }}
-                          />
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              <TimelineEditor className="mt-5" editor={editor} playback={playback} clips={clips} />
             </div>
 
             <div className="panel">
