@@ -164,15 +164,26 @@ class DesktopCapabilities {
     if (!key) return { ok: false, error: "Missing project id." };
     const projects = (await this.readAll()).filter((p) => p.id !== key);
     await this.writeAll(projects);
-    if (PROJECT_ID_RE.test(key)) await fsp.rm(this.editStatePath(key), { force: true });
+    if (PROJECT_ID_RE.test(key)) {
+      await fsp.rm(this.editStatePath(key), { force: true });
+      await fsp.rm(this.editStateV2Path(key), { force: true });
+    }
     return { ok: true, projects };
   }
 
+  /** Write-then-rename: `file` is either its previous contents or the new
+   * ones, never a partial write. A failed write leaves the previous file as it
+   * was, removes its own partial file, and rethrows. */
   async writeAtomic(file, text) {
     await fsp.mkdir(path.dirname(file), { recursive: true });
     const partial = `${file}.partial`;
-    await fsp.writeFile(partial, text, "utf8");
-    await fsp.rename(partial, file);
+    try {
+      await fsp.writeFile(partial, text, "utf8");
+      await fsp.rename(partial, file);
+    } catch (err) {
+      await fsp.rm(partial, { force: true }).catch(() => {});
+      throw err;
+    }
   }
 
   async getActiveProject() {
@@ -203,6 +214,41 @@ class DesktopCapabilities {
 
   editStatePath(id) {
     return path.join(this.userDataDir, EDIT_STATE_DIR, `${id}.json`);
+  }
+
+  /** Schema-2 editor state (1.1+). A separate file, so the schema-1 file that
+   * beta.1 reads is never rewritten by a newer version. */
+  editStateV2Path(id) {
+    return path.join(this.userDataDir, EDIT_STATE_DIR, `${id}.v2.json`);
+  }
+
+  async loadEditStateV2(id) {
+    if (!(typeof id === "string" && PROJECT_ID_RE.test(id)))
+      return { ok: false, error: "Invalid project id." };
+    try {
+      const raw = await fsp.readFile(this.editStateV2Path(id), "utf8");
+      const state = JSON.parse(raw);
+      return { ok: true, state: state && typeof state === "object" ? state : null };
+    } catch {
+      return { ok: true, state: null };
+    }
+  }
+
+  async saveEditStateV2(id, state) {
+    if (!(typeof id === "string" && PROJECT_ID_RE.test(id)))
+      return { ok: false, error: "Invalid project id." };
+    if (!state || typeof state !== "object" || Array.isArray(state) || state.schema !== 2)
+      return { ok: false, code: "invalid", error: "Invalid edit state." };
+    const text = JSON.stringify(state);
+    // Checked before anything touches the disk: the previous file stays as it is.
+    if (Buffer.byteLength(text, "utf8") > MAX_EDIT_STATE_BYTES)
+      return { ok: false, code: "too-large", error: "Edit state is too large to save." };
+    try {
+      await this.writeAtomic(this.editStateV2Path(id), text);
+    } catch {
+      return { ok: false, code: "write-failed", error: "The edit state could not be written." };
+    }
+    return { ok: true };
   }
 
   async loadEditState(id) {
@@ -352,6 +398,8 @@ const ACTIONS = new Set([
   "setActiveProject",
   "loadEditState",
   "saveEditState",
+  "loadEditStateV2",
+  "saveEditStateV2",
 ]);
 
 /** Dispatcher used by the IPC handler. Rejects anything outside the action list. */
@@ -383,6 +431,10 @@ async function handleDesktopAction(caps, action, payload) {
         return await caps.loadEditState(payload?.id);
       case "saveEditState":
         return await caps.saveEditState(payload?.id, payload?.state);
+      case "loadEditStateV2":
+        return await caps.loadEditStateV2(payload?.id);
+      case "saveEditStateV2":
+        return await caps.saveEditStateV2(payload?.id, payload?.state);
       default:
         return { ok: false, error: "Unsupported action" };
     }

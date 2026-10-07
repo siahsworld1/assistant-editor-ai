@@ -62,6 +62,7 @@ export function trimEdit(seq: Sequence, p: TrimEditParams, ctx: CommandContext):
       sourceOutFrame,
       item.mediaRate,
       seq.rate,
+      item.sourceTcProvenance,
     );
     const startFrame = p.edge === "in" ? endFrame(item) - durationFrames : item.startFrame;
     if (startFrame < 0)

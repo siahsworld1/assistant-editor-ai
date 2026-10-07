@@ -174,6 +174,10 @@ export interface EditVersion {
   changes: string[];
   timeline: UniversalTimeline;
   parentId?: string | undefined;
+  /** "director" (default; immutable, built by the Director) or "edited" (a
+   * manual working version forked from `parentId`; its timeline is derived
+   * from the schema-2 Sequence in the editor workspace, never edited itself). */
+  kind?: "director" | "edited" | undefined;
 }
 
 export interface AnalysisSummary {

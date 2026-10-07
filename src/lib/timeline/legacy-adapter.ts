@@ -18,14 +18,25 @@
 //     cannot express is reported in `warnings`, never silently changed.
 import type { Clip, EditDecision, EditDecisionLane, UniversalTimeline } from "@/lib/ae/types";
 import { stableId } from "./ids";
-import { frameToTc, framesToSeconds, fpsOf, rateFromFps, secondsToFrames, tcToFrame } from "./time";
+import {
+  frameToTcPreferring,
+  framesToSeconds,
+  fpsOf,
+  rateFromFps,
+  secondsToFrames,
+  tcClockSeconds,
+  tcToFrame,
+} from "./time";
+import { tcToSeconds } from "@/lib/nle/timecode";
 import {
   SEQUENCE_SCHEMA,
   UNPROTECTED,
   type ClipItem,
+  type FrameRate,
   type ItemFingerprint,
   type Origin,
   type Sequence,
+  type TcLabelHint,
   type Track,
   type TrackRole,
 } from "./types";
@@ -149,6 +160,8 @@ export function legacyToSequence(
       origin,
       protection: { ...UNPROTECTED },
     };
+    const tcProvenance = sourceTcProvenance(d, sourceInFrame, sourceOutFrame, mediaRate);
+    if (tcProvenance) item.sourceTcProvenance = tcProvenance;
     item.legacy = { decision: structuredClone(d), fingerprint: fingerprintOf(item) };
     items[id] = item;
     decisionOrder.push(id);
@@ -206,14 +219,46 @@ function alignedCompanion(seq: Sequence, audio: ClipItem): ClipItem | null {
   return null;
 }
 
+/**
+ * The imported endpoint labels that `frameToTc` would NOT reproduce — the
+ * second of two timecodes sharing one frame — recorded so the length rule and
+ * the export can still read that endpoint as imported while its frame is
+ * unchanged. Recorded only when it matters (otherwise undefined), and only
+ * for a label that really names the frame.
+ */
+function sourceTcProvenance(
+  d: EditDecision,
+  sourceInFrame: number,
+  sourceOutFrame: number,
+  mediaRate: FrameRate,
+): ClipItem["sourceTcProvenance"] {
+  const fps = fpsOf(mediaRate);
+  const hint = (tc: string, frame: number): TcLabelHint | null =>
+    tcToFrame(tc, mediaRate) === frame && tcToSeconds(tc, fps) !== tcClockSeconds(frame, mediaRate)
+      ? { frame, tc }
+      : null;
+  const hintIn = hint(d.sourceInTc, sourceInFrame);
+  const hintOut = hint(d.sourceOutTc, sourceOutFrame);
+  return hintIn || hintOut ? { in: hintIn, out: hintOut } : undefined;
+}
+
 function decisionFromFrames(seq: Sequence, item: ClipItem, lane: EditDecisionLane): EditDecision {
   return {
     id: item.legacy?.decision.id ?? item.id,
     lane,
     clipId: item.mediaClipId,
     label: item.label,
-    sourceInTc: frameToTc(item.sourceInFrame, item.mediaRate),
-    sourceOutTc: frameToTc(item.sourceOutFrame, item.mediaRate),
+    // An endpoint still at its imported frame keeps its imported label.
+    sourceInTc: frameToTcPreferring(
+      item.sourceInFrame,
+      item.mediaRate,
+      item.sourceTcProvenance?.in,
+    ),
+    sourceOutTc: frameToTcPreferring(
+      item.sourceOutFrame,
+      item.mediaRate,
+      item.sourceTcProvenance?.out,
+    ),
     timelineStartSeconds: framesToSeconds(item.startFrame, seq.rate),
     // Exactly durationFrames on the sequence: every schema-1 consumer places
     // an item as round(durationSeconds × sequence fps), which returns it.

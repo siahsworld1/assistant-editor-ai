@@ -18,6 +18,7 @@ export const ID_PREFIX = {
   link: "lnk",
   transaction: "txn",
   command: "cmd",
+  version: "ver",
 } as const;
 
 export type IdKind = keyof typeof ID_PREFIX;

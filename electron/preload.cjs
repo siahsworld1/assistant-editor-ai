@@ -70,6 +70,17 @@ contextBridge.exposeInMainWorld("assistantEditorDesktop", {
       action: "saveEditState",
       payload: { id: typeof id === "string" ? id : "", state },
     }),
+  // Schema-2 editor state (separate file; the schema-1 file above is left as is).
+  loadEditStateV2: (id) =>
+    ipcRenderer.invoke("assistant-editor:desktop", {
+      action: "loadEditStateV2",
+      payload: { id: typeof id === "string" ? id : "" },
+    }),
+  saveEditStateV2: (id, state) =>
+    ipcRenderer.invoke("assistant-editor:desktop", {
+      action: "saveEditStateV2",
+      payload: { id: typeof id === "string" ? id : "", state },
+    }),
 });
 
 // Premiere Pro (UXP) integration status + a fixed command vocabulary.

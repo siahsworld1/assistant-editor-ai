@@ -53,7 +53,17 @@ export interface DesktopCapabilitiesApi {
   setActiveProject(id: string | null): Promise<{ ok: boolean; error?: string }>;
   /** Per-project editor state (versions, active cut, chosen story). */
   loadEditState(id: string): Promise<{ ok: boolean; state?: unknown; error?: string }>;
-  saveEditState(id: string, state: unknown): Promise<{ ok: boolean; error?: string }>;
+  saveEditState(
+    id: string,
+    state: unknown,
+  ): Promise<{ ok: boolean; error?: string; code?: string }>;
+  /** Schema-2 editor state (1.1+), kept in its own file so the schema-1 file
+   * above stays exactly as beta.1 wrote it. Optional: older bridges lack it. */
+  loadEditStateV2?(id: string): Promise<{ ok: boolean; state?: unknown; error?: string }>;
+  saveEditStateV2?(
+    id: string,
+    state: unknown,
+  ): Promise<{ ok: boolean; error?: string; code?: string }>;
 }
 
 /** Snapshot from electron/worker-supervisor.cjs::WorkerSupervisor.status(). */

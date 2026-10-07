@@ -7,7 +7,10 @@
 //     in the original link, right pieces in a new one.
 // The split point `s` is the source frame whose position on the timecode clock
 // gives the left piece exactly `at − start` sequence frames under the schema-2
-// rule (or, if no source frame does, the nearest).
+// rule (or, if no source frame does, the nearest); among those, one that also
+// gives the right piece exactly `end − at` is preferred. Both pieces keep the
+// item's read-only source-label provenance (it only ever applies to an
+// endpoint still at its imported frame: the left piece's in, the right's out).
 import { endFrame, linkedIds } from "../selectors";
 import { rescaleFrames, sequenceDurationFrames } from "../time";
 import type { ClipItem, LinkGroup, Sequence } from "../types";
@@ -25,17 +28,32 @@ import {
 /** The source frame at `offset` sequence frames into `item` (deterministic). */
 export function splitSourceFrame(item: ClipItem, offset: number, seq: Sequence): number {
   const guess = item.sourceInFrame + rescaleFrames(offset, seq.rate, item.mediaRate);
+  const hints = item.sourceTcProvenance;
+  const rightLength = item.durationFrames - offset;
   let best = guess;
-  let bestErr = Infinity;
+  let bestKey: [number, number, number] = [Infinity, Infinity, Infinity];
   for (let d = -3; d <= 3; d += 1) {
     const s = guess + d;
     if (s <= item.sourceInFrame || s >= item.sourceOutFrame) continue;
-    const err = Math.abs(
-      sequenceDurationFrames(item.sourceInFrame, s, item.mediaRate, seq.rate) - offset,
-    );
-    if (err < bestErr || (err === bestErr && Math.abs(d) < Math.abs(best - guess))) {
+    const left = sequenceDurationFrames(item.sourceInFrame, s, item.mediaRate, seq.rate, {
+      in: hints?.in,
+    });
+    const right = sequenceDurationFrames(s, item.sourceOutFrame, item.mediaRate, seq.rate, {
+      out: hints?.out,
+    });
+    // Left piece exact first, then right piece exact, then nearest the guess.
+    const key: [number, number, number] = [
+      Math.abs(left - offset),
+      Math.abs(right - rightLength),
+      Math.abs(d),
+    ];
+    if (
+      key[0] < bestKey[0] ||
+      (key[0] === bestKey[0] &&
+        (key[1] < bestKey[1] || (key[1] === bestKey[1] && key[2] < bestKey[2])))
+    ) {
       best = s;
-      bestErr = err;
+      bestKey = key;
     }
   }
   return best;

@@ -12,8 +12,24 @@ import { EngineClient, resolveTransport } from "./service";
 import type { BuildResult, SourceFrame } from "./service";
 import type { HostContext } from "./transport";
 import type { WorkerStatus } from "@/types/bridge";
+import type { History } from "@/lib/timeline/history";
+import { randomIds, type IdGenerator } from "@/lib/timeline/ids";
+import type { MediaInventory } from "@/lib/timeline/invariants";
+import type { Sequence, Transaction } from "@/lib/timeline/types";
+import {
+  dispatchTransaction as dispatchToWorkspace,
+  editorStatus,
+  parseSavedEditStateV2,
+  redoIn,
+  sequenceOf,
+  serializeWorkspace,
+  undoIn,
+  type DispatchOutcome,
+  type Workspace,
+} from "@/lib/timeline/workspace";
 import type {
   AppMode,
+  Clip,
   EditingProfile,
   ConnectionState,
   DiagnosticsMap,
@@ -267,6 +283,8 @@ interface AEContextValue {
   toggleStorySelect: (id: string) => void;
   runCommand: (command: string) => Promise<void>;
   setActiveVersion: (id: string) => void;
+  /** The canonical schema-2 editor for the active version (see EditorApi). */
+  editor: EditorApi;
   setTargetSeconds: (s: number) => void;
   updateSettings: (patch: Partial<SettingsState>) => void;
   /** Real frames of a clip at source times, aligned with `times` (null = unavailable). */
@@ -275,6 +293,58 @@ interface AEContextValue {
     times: number[],
     width?: 160 | 240 | 320,
   ) => Promise<Array<SourceFrame | null>>;
+}
+
+/**
+ * The one editable timeline for the active version. All timeline semantics
+ * live in src/lib/timeline/; this only routes transactions to the workspace
+ * and exposes the result. `sequence` is the canonical schema-2 Sequence: the
+ * working Sequence of an edited version, or the (immutable) imported Sequence
+ * of a Director version — a transaction against a Director version forks an
+ * edited working version and makes it active.
+ */
+export interface EditorApi {
+  sequence: Sequence | null;
+  /** Generates ids for new commands/transactions (once, at build time). */
+  ids: IdGenerator;
+  dispatchTransaction: (txn: Transaction) => DispatchOutcome;
+  undo: () => void;
+  redo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
+  nextUndoLabel: string | null;
+  nextRedoLabel: string | null;
+  /** True when the active version is a manual working version. */
+  edited: boolean;
+  /** Whether the editor state on screen is safely on disk. */
+  persistence: EditorPersistence;
+  /** Tries the last failed save again (any further edit also retries). */
+  retrySave: () => void;
+}
+
+/**
+ * Save status of the project's editor state. A failed save is never silent:
+ * the edit stays in memory, the previous file on disk is left as it was, and
+ * the status stays "error" (with a message safe to show) until a later save
+ * succeeds.
+ */
+export type EditorSaveStatus = "saved" | "saving" | "error";
+export interface EditorPersistence {
+  status: EditorSaveStatus;
+  message: string | null;
+}
+
+const SAVED: EditorPersistence = { status: "saved", message: null };
+const SAVING: EditorPersistence = { status: "saving", message: null };
+
+/** A user-facing message for a failed save. Never echoes what the desktop
+ * side reported (paths, system errors) — only its error code is read. */
+function saveErrorMessage(code: string | undefined): string {
+  if (code === "too-large")
+    return "Your latest edits are too large to save. They are still open here, but are not saved.";
+  if (code === "unsupported")
+    return "This version of the desktop app cannot save edited timelines. Your edits are still open here, but are not saved.";
+  return "Your latest edits could not be saved. They are still open here — try saving again.";
 }
 
 const AEContext = createContext<AEContextValue | null>(null);
@@ -289,6 +359,33 @@ const defaultSettings: SettingsState = {
   proxyMedia: true,
   profile: "documentary",
 };
+
+interface EditSelections {
+  activeVersionId: string;
+  chosenStoryId: string | null;
+  targetSeconds: number;
+  storyboardSelectIds: string[];
+}
+
+/** The persisted selections, in one fixed shape and key order. */
+function editSelections(s: EditSelections): EditSelections {
+  return {
+    activeVersionId: s.activeVersionId,
+    chosenStoryId: s.chosenStoryId,
+    targetSeconds: s.targetSeconds,
+    storyboardSelectIds: s.storyboardSelectIds,
+  };
+}
+
+/** The schema-1 state, unstamped — built the same way for saving and for
+ * recognising an unchanged state after loading. */
+function schema1State(
+  analysisId: string,
+  versions: EditVersion[],
+  sel: EditSelections,
+): SavedEditState {
+  return { schema: EDIT_STATE_SCHEMA, analysisId, versions, ...editSelections(sel), savedAt: "" };
+}
 
 function nextVersionLabel(count: number) {
   return `v1.${count}`;
@@ -393,6 +490,10 @@ export function AEProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   const [project, setProject] = useState<ProjectBrain | null>(null);
+  // The project's clips, readable from async callbacks (their rates rebuild a
+  // Director version's import when a saved edited version refers to it).
+  const projectClipsRef = useRef<readonly Clip[]>([]);
+  projectClipsRef.current = project?.clips ?? [];
   const [nle, setNle] = useState<NLEStatus[]>(unreportedNle());
   const [nleReported, setNleReported] = useState(false);
   const [selects, setSelects] = useState<Select[]>([]);
@@ -401,6 +502,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
   const [auditionId, setAuditionId] = useState<string | null>(null);
   const [storyboardSelectIds, setStoryboardSelectIds] = useState<string[]>([]);
   const [versions, setVersions] = useState<EditVersion[]>([baselineVersion(360)]);
+  /** Working version id → transaction history (src/lib/timeline/history). */
+  const [histories, setHistories] = useState<Record<string, History>>({});
   const [activeVersionId, setActiveVersionId] = useState("v1");
   const [settings, setSettings] = useState<SettingsState>(defaultSettings);
   const [targetSeconds, setTargetSeconds] = useState(360);
@@ -439,6 +542,19 @@ export function AEProvider({ children }: { children: ReactNode }) {
    * loaded (or found absent). Saving is blocked until then, so a fresh baseline
    * can never overwrite a saved cut before it has been restored. */
   const hydratedKeyRef = useRef<string | null>(null);
+  /** Saves go to the schema-2 file once the project has one (or an edit
+   * needs one); until then beta.1's schema-1 file is used, as before. */
+  const schema2Ref = useRef(false);
+  /** What was last loaded or saved, minus its timestamp: an unchanged state is
+   * never written back (opening a project must not rewrite its files). */
+  const persistedRef = useRef<string | null>(null);
+  const [persistence, setPersistence] = useState<EditorPersistence>(SAVED);
+  /** Bumped by retrySave() to run the save effect again. */
+  const [saveRetry, setSaveRetry] = useState(0);
+  /** Writes run one at a time, in order (never two writes to one file at once). */
+  const saveChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  /** Only the newest write's outcome sets the status. */
+  const saveAttemptRef = useRef(0);
   /** Set below once the engine-sync helpers exist (they're declared later). */
   const projectSwitchedRef = useRef<(record: ProjectRecord | null) => void>(() => {});
   const targetSecondsRef = useRef(targetSeconds);
@@ -644,6 +760,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
     setSelects(structuredClone(demoSelects));
     setStories(structuredClone(demoStories));
     setChosenStoryId("story-01");
+    setHistories({});
     setVersions(structuredClone(demoVersions));
     setActiveVersionId("v1");
     setTargetSeconds(demoTimeline.targetSeconds);
@@ -671,29 +788,63 @@ export function AEProvider({ children }: { children: ReactNode }) {
   }, []);
 
   /** Applies a project's saved edit state if it belongs to this analysis. */
-  const hydrateEditState = useCallback(async (projectId: string, analysisId: string) => {
-    const key = `${projectId}:${analysisId}`;
-    if (hydratedKeyRef.current === key) return;
-    const desktop = typeof window === "undefined" ? undefined : window.assistantEditorDesktop;
-    let saved: SavedEditState | null = null;
-    if (desktop?.available) {
-      try {
-        const res = await desktop.loadEditState(projectId);
-        saved = parseSavedEditState(res.state, analysisId);
-      } catch {
-        saved = null;
+  const hydrateEditState = useCallback(
+    async (projectId: string, analysisId: string, clips: readonly Clip[]) => {
+      const key = `${projectId}:${analysisId}`;
+      if (hydratedKeyRef.current === key) return;
+      const desktop = typeof window === "undefined" ? undefined : window.assistantEditorDesktop;
+      // Schema 2 (1.1+) first; otherwise beta.1's schema 1, read without being
+      // rewritten. Schema 1 converts to Sequences in memory, on demand.
+      let v2: ReturnType<typeof parseSavedEditStateV2> = null;
+      let saved: SavedEditState | null = null;
+      if (desktop?.available) {
+        if (desktop.loadEditStateV2) {
+          try {
+            v2 = parseSavedEditStateV2(
+              (await desktop.loadEditStateV2(projectId)).state,
+              analysisId,
+              clips,
+            );
+          } catch {
+            v2 = null;
+          }
+        }
+        if (!v2) {
+          try {
+            const res = await desktop.loadEditState(projectId);
+            saved = parseSavedEditState(res.state, analysisId);
+          } catch {
+            saved = null;
+          }
+        }
       }
-    }
-    if (activeRef.current.record?.id !== projectId) return; // switched meanwhile
-    if (saved) {
-      setVersions(saved.versions);
-      setActiveVersionId(saved.activeVersionId);
-      setChosenStoryId(saved.chosenStoryId);
-      setTargetSeconds(saved.targetSeconds);
-      setStoryboardSelectIds(saved.storyboardSelectIds);
-    }
-    hydratedKeyRef.current = key;
-  }, []);
+      if (activeRef.current.record?.id !== projectId) return; // switched meanwhile
+      schema2Ref.current = !!v2;
+      persistedRef.current = null;
+      setPersistence(SAVED); // what is on screen is what is on disk
+      if (v2) {
+        setVersions(v2.workspace.versions);
+        setHistories(v2.workspace.histories);
+        setActiveVersionId(v2.activeVersionId);
+        setChosenStoryId(v2.chosenStoryId);
+        setTargetSeconds(v2.targetSeconds);
+        setStoryboardSelectIds(v2.storyboardSelectIds);
+        persistedRef.current = JSON.stringify(
+          serializeWorkspace(v2.workspace, editSelections(v2), analysisId, "", clips),
+        );
+      } else if (saved) {
+        setHistories({});
+        setVersions(saved.versions);
+        setActiveVersionId(saved.activeVersionId);
+        setChosenStoryId(saved.chosenStoryId);
+        setTargetSeconds(saved.targetSeconds);
+        setStoryboardSelectIds(saved.storyboardSelectIds);
+        persistedRef.current = JSON.stringify(schema1State(analysisId, saved.versions, saved));
+      }
+      hydratedKeyRef.current = key;
+    },
+    [],
+  );
 
   /**
    * Brings the engine and the editor back to where a project was left: reloads
@@ -721,7 +872,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       setProject((p) => (p ? { ...p, ...patch } : p));
       if (patch.analysisState === "complete" && patch.analysisId) {
         await refreshEvidence(client);
-        await hydrateEditState(record.id, patch.analysisId);
+        await hydrateEditState(record.id, patch.analysisId, patch.clips ?? projectClipsRef.current);
       }
     },
     [refreshEvidence, hydrateEditState],
@@ -730,10 +881,13 @@ export function AEProvider({ children }: { children: ReactNode }) {
   /** Clears editor state when switching projects, before the new one syncs. */
   const resetEditor = useCallback(() => {
     hydratedKeyRef.current = null;
+    saveAttemptRef.current += 1; // a write still in flight no longer reports here
+    setPersistence(SAVED);
     setSelects([]);
     setStories([]);
     setChosenStoryId(null);
     setStoryboardSelectIds([]);
+    setHistories({});
     setVersions([baselineVersion(targetSecondsRef.current)]);
     setActiveVersionId("v1");
   }, []);
@@ -771,7 +925,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
     const projectId = activeProject?.id;
     const analysisId = project?.analysisId;
     if (!desktop?.available || !projectId || !analysisId) return;
-    if (hydratedKeyRef.current !== `${projectId}:${analysisId}`) return;
+    const key = `${projectId}:${analysisId}`;
+    if (hydratedKeyRef.current !== key) return;
     // Nothing the user made yet (one empty version, default story, no picks):
     // don't save it — writing it would replace a previously saved cut history
     // with an untouched baseline (e.g. right after a re-analysis).
@@ -780,24 +935,69 @@ export function AEProvider({ children }: { children: ReactNode }) {
       versions[0]!.timeline.decisions.length === 0 &&
       storyboardSelectIds.length === 0 &&
       (chosenStoryId === null || chosenStoryId === stories[0]?.id);
-    if (pristine) return;
-    const state: SavedEditState = {
-      schema: EDIT_STATE_SCHEMA,
-      analysisId,
-      versions,
+    const selections = editSelections({
       activeVersionId,
       chosenStoryId,
       targetSeconds,
       storyboardSelectIds,
-      savedAt: new Date().toISOString(),
-    };
-    const t = setTimeout(() => void desktop.saveEditState(projectId, state).catch(() => {}), 300);
+    });
+    const useV2 = schema2Ref.current || Object.keys(histories).length > 0;
+    if (useV2 && !desktop.saveEditStateV2) {
+      // An old bridge: never fall back to schema 1 — and never pretend it saved.
+      setPersistence({ status: "error", message: saveErrorMessage("unsupported") });
+      return;
+    }
+    if (pristine && !useV2) return;
+    const state = useV2
+      ? serializeWorkspace(
+          { versions, histories },
+          selections,
+          analysisId,
+          "",
+          projectClipsRef.current,
+        )
+      : schema1State(analysisId, versions, selections);
+    const fingerprint = JSON.stringify(state);
+    if (fingerprint === persistedRef.current) {
+      // Unchanged since load/save — e.g. undone back to what is on disk.
+      saveAttemptRef.current += 1;
+      setPersistence((p) => (p.status === "saved" ? p : SAVED));
+      return;
+    }
+    setPersistence((p) => (p.status === "saving" ? p : SAVING));
+    const t = setTimeout(() => {
+      const attempt = (saveAttemptRef.current += 1);
+      const stamped = { ...state, savedAt: new Date().toISOString() };
+      const write = () =>
+        useV2
+          ? desktop.saveEditStateV2!(projectId, stamped)
+          : desktop.saveEditState(projectId, stamped);
+      const done = saveChainRef.current.then(write).then(
+        (res) => ({ ok: !!res?.ok, code: res?.ok ? undefined : res?.code }),
+        () => ({ ok: false, code: undefined }),
+      );
+      saveChainRef.current = done;
+      void done.then(({ ok, code }) => {
+        if (hydratedKeyRef.current !== key) return; // project switched meanwhile
+        if (ok) {
+          persistedRef.current = fingerprint;
+          if (useV2) schema2Ref.current = true;
+        }
+        if (attempt !== saveAttemptRef.current) return; // a newer save will report
+        // On failure nothing else changes: the edit stays in memory, the
+        // last good file stays on disk, and the next change (or retrySave)
+        // writes again.
+        setPersistence(ok ? SAVED : { status: "error", message: saveErrorMessage(code) });
+      });
+    }, 300);
     return () => clearTimeout(t);
   }, [
+    saveRetry,
     mode,
     activeProject?.id,
     project?.analysisId,
     versions,
+    histories,
     activeVersionId,
     chosenStoryId,
     targetSeconds,
@@ -838,6 +1038,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       setStories([]);
       setNle(unreportedNle());
       setNleReported(false);
+      setHistories({});
       setVersions([baselineVersion(targetSeconds)]);
       setActiveVersionId("v1");
       setHealth(null);
@@ -865,6 +1066,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       setStories([]);
       setNle(unreportedNle());
       setNleReported(false);
+      setHistories({});
       setVersions([baselineVersion(targetSeconds)]);
       setActiveVersionId("v1");
       setHealth(null);
@@ -900,6 +1102,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
         setStories([]);
         setNle(unreportedNle());
         setNleReported(false);
+        setHistories({});
         setVersions([baselineVersion(targetSeconds)]);
         setActiveVersionId("v1");
 
@@ -1001,6 +1204,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
           const record = activeRef.current.record;
           const key = record && patch.analysisId ? `${record.id}:${patch.analysisId}` : null;
           if (key && hydratedKeyRef.current !== key) {
+            setHistories({});
             setVersions([baselineVersion(targetSecondsRef.current)]);
             setActiveVersionId("v1");
             setChosenStoryId(null);
@@ -1231,6 +1435,77 @@ export function AEProvider({ children }: { children: ReactNode }) {
     setNonce((n) => n + 1);
   }, []);
 
+  // ---- Canonical editor (schema 2). Semantics live in src/lib/timeline/. ----
+  const editorClips = useMemo(() => project?.clips ?? [], [project?.clips]);
+  const editorMedia = useMemo<MediaInventory>(
+    () => new Map(editorClips.map((c) => [c.id, { durationSeconds: c.durationSeconds }])),
+    [editorClips],
+  );
+  // The latest workspace, readable synchronously so back-to-back gestures in
+  // one tick each see the result of the previous one.
+  const workspaceRef = useRef<{ ws: Workspace; active: string }>({
+    ws: { versions, histories },
+    active: activeVersionId,
+  });
+  workspaceRef.current = { ws: { versions, histories }, active: activeVersionId };
+
+  const publishWorkspace = useCallback((ws: Workspace, active: string) => {
+    workspaceRef.current = { ws, active };
+    setVersions(ws.versions);
+    setHistories(ws.histories);
+    setActiveVersionId(active);
+  }, []);
+
+  const dispatchEditorTransaction = useCallback(
+    (txn: Transaction): DispatchOutcome => {
+      const { ws, active } = workspaceRef.current;
+      const out = dispatchToWorkspace(ws, active, txn, {
+        clips: editorClips,
+        media: editorMedia,
+        ids: randomIds,
+      });
+      if (out.ok) publishWorkspace(out.workspace, out.activeVersionId);
+      return out;
+    },
+    [editorClips, editorMedia, publishWorkspace],
+  );
+  const undoEditor = useCallback(() => {
+    const { ws, active } = workspaceRef.current;
+    const next = undoIn(ws, active);
+    if (next !== ws) publishWorkspace(next, active);
+  }, [publishWorkspace]);
+  const redoEditor = useCallback(() => {
+    const { ws, active } = workspaceRef.current;
+    const next = redoIn(ws, active);
+    if (next !== ws) publishWorkspace(next, active);
+  }, [publishWorkspace]);
+
+  const retrySave = useCallback(() => setSaveRetry((n) => n + 1), []);
+
+  const editor = useMemo<EditorApi>(() => {
+    const ws: Workspace = { versions, histories };
+    return {
+      sequence: sequenceOf(ws, activeVersionId, editorClips),
+      ids: randomIds,
+      dispatchTransaction: dispatchEditorTransaction,
+      undo: undoEditor,
+      redo: redoEditor,
+      ...editorStatus(ws, activeVersionId),
+      persistence,
+      retrySave,
+    };
+  }, [
+    versions,
+    histories,
+    activeVersionId,
+    editorClips,
+    dispatchEditorTransaction,
+    undoEditor,
+    redoEditor,
+    persistence,
+    retrySave,
+  ]);
+
   const value = useMemo<AEContextValue>(
     () => ({
       appVersion: APP_VERSION,
@@ -1284,6 +1559,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
         ),
       runCommand,
       setActiveVersion: (id: string) => setActiveVersionId(id),
+      editor,
       setTargetSeconds,
       updateSettings: (patch: Partial<SettingsState>) => setSettings((s) => ({ ...s, ...patch })),
       fetchFrames,
@@ -1312,6 +1588,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       storyboardSelectIds,
       versions,
       activeVersionId,
+      editor,
       settings,
       targetSeconds,
       building,

@@ -100,6 +100,17 @@ export interface ClipItem {
   protection: Protection;
   /** Read-only import provenance; see the file header. */
   legacy?: LegacyItemProvenance | undefined;
+  /** Read-only: the timecode labels the source endpoints were imported with.
+   * Consulted ONLY while an endpoint's frame still equals its imported frame,
+   * to tell apart two timecodes that share that frame (see time.ts). Never
+   * edited; carried unchanged through moves, trims and splits. */
+  sourceTcProvenance?: { in: TcLabelHint | null; out: TcLabelHint | null } | undefined;
+}
+
+/** A source frame and the timecode it was imported as. */
+export interface TcLabelHint {
+  frame: number;
+  tc: string;
 }
 
 /** Linked items (picture + sync audio). Linked items stay aligned unless a

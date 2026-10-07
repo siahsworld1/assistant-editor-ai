@@ -21,7 +21,7 @@
 //
 // Conversions round the way the exporters do (framesForSeconds = Math.round).
 import { framesForSeconds, secondsToTc, tcToSeconds } from "@/lib/nle/timecode";
-import type { FrameRate } from "./types";
+import type { FrameRate, TcLabelHint } from "./types";
 
 const DEFAULT_FPS = 24;
 
@@ -119,6 +119,43 @@ export function tcClockSeconds(frame: number, rate: FrameRate): number {
   return tcToSeconds(frameToTc(frame, rate), fpsOf(rate))!;
 }
 
+/** Does `hint` name exactly this frame? (A hint for any other frame — an
+ * endpoint that has since moved — is ignored.) */
+function hintFor(
+  frame: number,
+  rate: FrameRate,
+  hint: TcLabelHint | null | undefined,
+): string | null {
+  return hint && hint.frame === frame && tcToFrame(hint.tc, rate) === frame ? hint.tc : null;
+}
+
+/**
+ * The timecode for a frame, preferring the label it was imported with.
+ *
+ * At a fractional rate about one wall-clock second in 42 has two timecodes
+ * for the same frame ("00:00:20:23" and "00:00:21:00"); `frameToTc` alone
+ * returns the first. While an endpoint is still at its imported frame, the
+ * imported label (read-only provenance) says which one it was. Once the frame
+ * changes the hint no longer names it and normal conversion applies, so a
+ * genuinely changed range is never hidden.
+ */
+export function frameToTcPreferring(
+  frame: number,
+  rate: FrameRate,
+  hint: TcLabelHint | null | undefined,
+): string {
+  return hintFor(frame, rate, hint) ?? frameToTc(frame, rate);
+}
+
+/** `tcClockSeconds`, honouring an imported label for this exact frame. */
+export function tcClockSecondsAt(
+  frame: number,
+  rate: FrameRate,
+  hint: TcLabelHint | null | undefined,
+): number {
+  return tcToSeconds(frameToTcPreferring(frame, rate, hint), fpsOf(rate))!;
+}
+
 /**
  * THE source-range → sequence-length rule. Every item's `durationFrames` comes
  * from here whenever its source range is set or changed; nothing else may
@@ -137,14 +174,25 @@ export function tcClockSeconds(frame: number, rate: FrameRate): number {
  * media has 24 timecode labels per wall-clock second, the same number of source
  * frames can measure one sequence frame longer or shorter depending on where
  * the range sits; equal ranges always give equal results. Never less than 1.
+ *
+ * The one input besides frames: an endpoint that is still exactly at the frame
+ * it was imported at is read with the timecode label it was imported with
+ * (`hints`), because two labels can share that frame and the legacy length was
+ * measured from the label. That provenance is read-only and frame-gated — it
+ * never applies to a moved endpoint — so editing, then editing exactly back,
+ * restores the original length.
  */
 export function sequenceDurationFrames(
   sourceInFrame: number,
   sourceOutFrame: number,
   mediaRate: FrameRate,
   sequenceRate: FrameRate,
+  /** Imported labels of the endpoints (read-only provenance), if any. Each
+   * applies only while its endpoint is still exactly at its imported frame. */
+  hints: { in?: TcLabelHint | null | undefined; out?: TcLabelHint | null | undefined } = {},
 ): number {
   const seconds =
-    tcClockSeconds(sourceOutFrame, mediaRate) - tcClockSeconds(sourceInFrame, mediaRate);
+    tcClockSecondsAt(sourceOutFrame, mediaRate, hints.out) -
+    tcClockSecondsAt(sourceInFrame, mediaRate, hints.in);
   return Math.max(1, secondsToFrames(seconds, sequenceRate));
 }
