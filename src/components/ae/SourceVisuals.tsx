@@ -294,7 +294,9 @@ export function CutawayOverlay({
       playsInline
       preload="auto"
       data-testid="cutaway-overlay"
-      className="pointer-events-none absolute inset-x-0 top-0 aspect-video w-full rounded-md bg-black object-contain"
+      // z-[2]: above SequencePlayer's visible V1 video (z-[1]); both share the
+      // CUT preview wrapper's stacking context.
+      className="pointer-events-none absolute inset-x-0 top-0 z-[2] aspect-video w-full rounded-md bg-black object-contain"
       onLoadedMetadata={(e) => {
         e.currentTarget.currentTime = expected;
         if (playing) void e.currentTarget.play().catch(() => {});
