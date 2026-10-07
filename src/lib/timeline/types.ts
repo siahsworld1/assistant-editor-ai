@@ -30,8 +30,15 @@ export interface FrameRate {
 
 export const SEQUENCE_SCHEMA = 2 as const;
 
-/** Who produced an item (or the last change to it). */
+/** Who produced an item: a Director build, its deterministic fallback, or
+ * manual editing. (The transaction that last changed it is
+ * `ClipItem.originTransactionId`.) */
 export type Origin = "director" | "manual" | "fallback";
+
+/** Who issued a transaction. `director` is any AI-issued change and is bound by
+ * `aiLocked`; `system` is the app itself (e.g. migrations) and, like `manual`,
+ * is bound only by `locked`. */
+export type TransactionOrigin = "manual" | "director" | "system";
 
 /**
  * What may change an item or a track.
@@ -153,18 +160,22 @@ export interface LegacySequenceProvenance {
 /* ------------------------- transactions & commands ------------------------ */
 // Declared now so every layer shares one shape; behaviour lands in later steps.
 
-export type CommandType =
-  | "MoveEdit"
-  | "TrimEdit"
-  | "SplitEdit"
-  | "DeleteEdit"
-  | "RippleDelete"
-  | "InsertEdit"
-  | "ReplaceAssembly"
+/** Implemented in Phase 1. */
+export type CoreCommandType =
+  "MoveEdit" | "TrimEdit" | "SplitEdit" | "DeleteEdit" | "RippleDelete" | "ReplaceAssembly";
+
+/** Reserved: declared and routed by the engine, rejected as not implemented. */
+export type FutureCommandType =
+  | "RippleTrim"
   | "RollEdit"
   | "SlipEdit"
   | "SlideEdit"
-  | "SetProtection";
+  | "InsertEdit"
+  | "SetTrackState"
+  | "LinkItems"
+  | "UnlinkItems";
+
+export type CommandType = CoreCommandType | FutureCommandType;
 
 /** One deterministic timeline operation. Any ids it creates are generated
  * once, when the command is built, and recorded in `params`, so redo/replay
@@ -179,7 +190,7 @@ export interface Command<P = Record<string, unknown>> {
 export interface Transaction {
   id: string;
   label: string;
-  origin: Origin;
+  origin: TransactionOrigin;
   commands: Command[];
   createdAt: string;
 }

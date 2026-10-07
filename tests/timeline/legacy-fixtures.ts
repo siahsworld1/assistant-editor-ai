@@ -112,7 +112,7 @@ export const refinedCut: UniversalTimeline = {
       "sel-02",
     ),
     d("event-5", "b-roll", "clip-003", "00:00:06:23", "00:00:11:15", 22.383, 4.666333),
-    d("cutaway-1", "b-roll", "clip-005", "00:00:01:16", "00:00:04:04", 13.46, 2.5),
+    d("cutaway-1", "b-roll", "clip-005", "00:00:01:16", "00:00:04:04", 31.46, 2.5), // clear of the other V2 cutaways
   ],
 };
 
