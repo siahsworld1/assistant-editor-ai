@@ -54,14 +54,20 @@ class TranscriptSegment:
     end_seconds: float
     text: str
     confidence: float
+    # Whisper's no_speech_prob (0..1) when the provider reports one; None
+    # otherwise (and for every analysis saved before it was recorded).
+    no_speech_prob: float | None = None
 
     def to_json(self) -> dict:
-        return {
+        out = {
             "startSeconds": self.start_seconds,
             "endSeconds": self.end_seconds,
             "text": self.text,
             "confidence": self.confidence,
         }
+        if self.no_speech_prob is not None:
+            out["noSpeechProb"] = self.no_speech_prob
+        return out
 
 
 class TranscriptionProvider(ABC):

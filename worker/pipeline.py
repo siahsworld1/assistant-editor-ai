@@ -24,6 +24,8 @@ import traceback
 from pathlib import Path
 
 import ai_status
+import dialogue
+import editorial
 import media
 import persistence
 import reasoning
@@ -350,6 +352,7 @@ def _transcribe_clip(
                     "endTc": media.seconds_to_tc(seg["endSeconds"], clip.fps),
                     "text": seg["text"],
                     "confidence": seg.get("confidence", 0.7),
+                    **({"noSpeechProb": seg["noSpeechProb"]} if seg.get("noSpeechProb") is not None else {}),
                 }
             )
         clip.has_transcript = any(t["clipId"] == clip.id for t in STORE.transcript)
@@ -450,6 +453,8 @@ def _generate_selects(reasoning_provider: ReasoningProvider | None = None):
             lines.append(f"- {c.id}: {c.filename} (speaker: {', '.join(c.speakers) or 'unknown'})")
     lines.append("\nTRANSCRIPT (clipId | speaker | startTc | endTc | text):")
     for t in STORE.transcript:
+        if dialogue.is_suspect(t):
+            continue  # transcription filler/noise (e.g. a hallucinated outro), not dialogue
         lines.append(f"{t['clipId']} | {t['speaker']} | {t['startTc']} | {t['endTc']} | {t['text']}")
     if STORE.visual_evidence:
         lines.append("\nVISUAL EVIDENCE (clipId | kind | label | atTc):")
@@ -699,6 +704,8 @@ def _clip_material_lines() -> list[str]:
     by_clip: dict[str, list[dict]] = {}
     for v in STORE.visual_evidence:
         by_clip.setdefault(v.get("clipId", ""), []).append(v)
+    assessment = dialogue.assess_project(clips, STORE.transcript, STORE.visual_evidence)
+    speech = {dialogue.DIALOGUE: "yes", dialogue.NON_DIALOGUE: "no (likely B-roll)", dialogue.UNCERTAIN: "uncertain"}
     lines = ["\nCLIP MATERIAL (clipId | file | durationSeconds | dialogue | visual moments at source timecode):"]
     for c in clips.values():
         if c.state != "analyzed":
@@ -707,9 +714,34 @@ def _clip_material_lines() -> list[str]:
             f"{v['atTc']} {v['kind']}: {v['label']}" for v in by_clip.get(c.id, [])[:MAX_VISUAL_MOMENTS_PER_CLIP]
         )
         lines.append(
-            f"{c.id} | {c.filename} | {c.duration_seconds} | {'yes' if c.has_transcript else 'no'} | {moments or '—'}"
+            f"{c.id} | {c.filename} | {c.duration_seconds} | {speech[assessment[c.id]['status']]} | {moments or '—'}"
         )
     return lines
+
+
+def _select_phrase_lines(select: dict) -> list[str]:
+    """The select's transcript phrases with their real timecodes — the only
+    places a dialogue edit should start or end."""
+    clip = STORE.clips.get(select["clipId"])
+    if not clip:
+        return []
+    fps = clip.fps or 24.0
+    a, b = media.tc_to_seconds(select["startTc"], fps), media.tc_to_seconds(select["endTc"], fps)
+    if a is None or b is None:
+        return []
+    return [
+        f"    phrase {g.start_tc}–{g.end_tc} \"{g.text}\""
+        for g in editorial.clip_segments(clip.id, STORE.transcript, fps)
+        if g.end > a + editorial.EDGE_TOLERANCE and g.start < b - editorial.EDGE_TOLERANCE
+    ]
+
+
+def _refine(decisions: list, clips: dict) -> tuple[list, list[str]]:
+    """Phrase-boundary editing and jump-cut coverage (worker/editorial.py),
+    then the same validation gate again as a guard."""
+    refined, notes, _ = editorial.refine(decisions, clips, STORE.transcript, STORE.visual_evidence)
+    checked, warnings = _validate_decisions(refined, clips)
+    return checked, notes + warnings
 
 
 def analysis_readiness() -> dict:
@@ -780,11 +812,15 @@ def build_timeline(
     lines.append("\nBEATS:")
     for b in story["beats"]:
         lines.append(f"- {b['label']} ({b['intent']}): selects {b['selectIds']}")
-    lines.append("\nAVAILABLE SELECTS (id | clipId | startTc | endTc | durationSeconds | excerpt):")
+    lines.append(
+        "\nAVAILABLE SELECTS (id | clipId | startTc | endTc | durationSeconds | excerpt), each followed by its "
+        "transcript phrases (startTc–endTc \"text\") — the only places a dialogue edit may start or end:"
+    )
     for s in STORE.selects:
         lines.append(
             f"{s['id']} | {s['clipId']} | {s['startTc']} | {s['endTc']} | {s['durationSeconds']} | \"{s['transcriptExcerpt']}\""
         )
+        lines.extend(_select_phrase_lines(s))
     lines.extend(_clip_material_lines())
     brief = "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
@@ -801,7 +837,8 @@ def build_timeline(
     if result and isinstance(result.get("decisions"), list) and result["decisions"]:
         validated, warnings = _validate_decisions(result["decisions"], clips)
         if validated:
-            changes = caveat + [str(c) for c in result.get("changes", [])] + warnings
+            validated, edit_notes = _refine(validated, clips)
+            changes = caveat + [str(c) for c in result.get("changes", [])] + warnings + edit_notes
             return {
                 "status": "built",
                 "analysis": readiness,
@@ -835,6 +872,8 @@ def build_timeline(
             }
         )
     validated, warnings = _validate_decisions(decisions, clips)
+    validated, edit_notes = _refine(validated, clips)
+    warnings = warnings + edit_notes
     why = (
         f"the Director {director['message']}"
         if director["status"] == "failed"

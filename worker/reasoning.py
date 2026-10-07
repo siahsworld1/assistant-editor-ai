@@ -110,17 +110,27 @@ fences):
 {"summary": "<1-2 sentence summary of what this assembly does>", \
 "changes": ["<short change note>", ...], \
 "decisions": [{"lane": "interview"|"b-roll"|"audio", "clipId": "<clip id>", "label": "<short label>", \
-"sourceInTc": "<HH:MM:SS:FF from the select's startTc>", "sourceOutTc": "<HH:MM:SS:FF from the select's endTc>", \
+"sourceInTc": "<HH:MM:SS:FF>", "sourceOutTc": "<HH:MM:SS:FF>", \
 "timelineStartSeconds": <number>, "durationSeconds": <number>, "selectId": "<select id or omit>"}]}
 Only use clipIds and selectIds that were given to you. Keep timelineStartSeconds/durationSeconds \
 internally consistent: interview events play back-to-back (each starts where the previous one ends).
+CUT POINTS: an interview event's sourceInTc must be the startTc of one of the select's listed \
+phrases and its sourceOutTc the endTc of one — never a time inside a phrase. To shorten a select, \
+keep a run of whole phrases rather than cutting words off. Prefer starting where a sentence starts \
+and ending where one ends, so each event is a complete thought; it is better to run somewhat over \
+the target duration than to cut a thought in half. Don't start on an interviewer's question (a \
+phrase ending in "?" just before the answer) unless the question is needed.
 B-ROLL: when CLIP MATERIAL lists visual moments that support what is being said, you may add \
 "b-roll" lane events — cutaways laid OVER the interview (the interview audio keeps playing \
 underneath). For each, pick a clip and a source range around one of its listed visual moments \
 (sourceInTc/sourceOutTc inside that clip's durationSeconds), and set timelineStartSeconds so it \
-sits within the span of the interview event it covers. B-roll does not advance the interview \
-timeline. Prefer clips without dialogue, and never cover the first words of a key statement. Only \
-use visual moments that are listed — never invent footage."""
+sits over the interview. B-roll does not advance the interview timeline, and b-roll events must \
+not overlap each other. Prefer clips whose dialogue is "no (likely B-roll)".
+JUMP CUTS: two consecutive interview events from the same clip are a jump cut (same camera and \
+framing, the picture visibly jumps). Cover each with b-roll that starts about 1 second before the \
+cut and runs at least 1 second after it — covering the start of the next statement is fine and \
+expected here. Elsewhere, keep the speaker on camera for the most emotional moments. Only use \
+visual moments that are listed — never invent footage."""
 
 
 def build_timeline(provider: ReasoningProvider, build_brief: str) -> dict | None:

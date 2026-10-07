@@ -16,6 +16,8 @@ sandbox, which has no network access to PyPI).
 
 from __future__ import annotations
 
+import math
+
 import base64
 import os
 from pathlib import Path
@@ -65,12 +67,18 @@ class OpenAIWhisperTranscriptionProvider(TranscriptionProvider):
             # closest signal it does expose, converted into an approximate 0..1 score.
             avg_logprob = seg_dict.get("avg_logprob", -0.2)
             confidence = max(0.0, min(1.0, 1.0 + (avg_logprob / 2.0)))
+            nsp = seg_dict.get("no_speech_prob")
             out.append(
                 TranscriptSegment(
                     start_seconds=float(seg_dict.get("start", 0.0)),
                     end_seconds=float(seg_dict.get("end", 0.0)),
                     text=str(seg_dict.get("text", "")).strip(),
                     confidence=round(confidence, 2),
+                    no_speech_prob=(
+                        round(max(0.0, min(1.0, float(nsp))), 3)
+                        if isinstance(nsp, (int, float)) and not isinstance(nsp, bool) and math.isfinite(nsp)
+                        else None
+                    ),
                 )
             )
         if not out:

@@ -222,7 +222,8 @@ class TestBrollMaterialReachesTheBuild(_MediaFolderCase):
         pipeline.build_timeline("proj-rc", "story-01", 30, "use b-roll", reasoning_provider=fake)
         brief = fake.calls[0][1][0].text
         self.assertIn("CLIP MATERIAL", brief)
-        self.assertIn("clip-002 | b.mov | 3.0 | no | 00:00:01:00 b-roll: Hands planting seedlings", brief)
+        # No transcript → judged non-dialogue (worker/dialogue.py), labelled for the Director.
+        self.assertIn("clip-002 | b.mov | 3.0 | no (likely B-roll) | 00:00:01:00 b-roll: Hands planting seedlings", brief)
         self.assertIn("clip-001 | a.mov | 3.0 | yes | —", brief)
 
     def test_b_roll_decisions_from_the_model_survive_validation_on_their_own_lane(self):
