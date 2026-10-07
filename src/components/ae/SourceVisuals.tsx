@@ -251,10 +251,21 @@ export function SourcePreviewDialog({
   );
 }
 
+const HAVE_CURRENT_DATA = 2;
+/** A decoded frame this close to the cutaway's expected source time counts as
+ * ready (CutawayOverlay's drift correction re-seeks beyond 0.25 s). */
+const CUTAWAY_READY_TOLERANCE = 0.5;
+
 /**
  * CUT's V2 layer: the b-roll cutaway that is on screen at the playhead, drawn
  * over the V1 player. Picture only (muted) — the interview's sync audio keeps
  * playing from V1 underneath, exactly as in the exported sequence.
+ *
+ * A cutaway stays transparent until it has a decoded frame at its own
+ * position, so V1's picture shows through while it loads and seeks — the same
+ * rule as the V1 double-buffer: never cover a valid frame with an unready
+ * (black) element. Readiness is the media element's own state, reset for every
+ * new cutaway.
  */
 export function CutawayOverlay({
   overlay,
@@ -269,6 +280,28 @@ export function CutawayOverlay({
   const expected = overlay
     ? overlay.sourceInSeconds + Math.max(0, playheadSeconds - overlay.decision.timelineStartSeconds)
     : 0;
+  const expectedRef = useRef(expected);
+  expectedRef.current = expected;
+  const cutawayId = overlay?.decision.id ?? null;
+  // The cutaway whose frame is decoded; any other (or none) is not ready yet.
+  const [readyId, setReadyId] = useState<string | null>(null);
+  // Every change of active cutaway — including leaving one and coming back to
+  // it, which mounts a fresh <video> — starts unready.
+  const [activeId, setActiveId] = useState<string | null>(cutawayId);
+  if (activeId !== cutawayId) {
+    setActiveId(cutawayId);
+    setReadyId(null);
+  }
+  const ready = cutawayId !== null && activeId === cutawayId && readyId === cutawayId;
+  const revealWhenDecoded = (v: HTMLVideoElement) => {
+    if (
+      v.readyState >= HAVE_CURRENT_DATA &&
+      !v.seeking &&
+      Math.abs(v.currentTime - expectedRef.current) <= CUTAWAY_READY_TOLERANCE
+    ) {
+      setReadyId(cutawayId);
+    }
+  };
 
   useEffect(() => {
     const v = videoRef.current;
@@ -294,13 +327,22 @@ export function CutawayOverlay({
       playsInline
       preload="auto"
       data-testid="cutaway-overlay"
+      data-ready={ready ? "true" : "false"}
       // z-[2]: above SequencePlayer's visible V1 video (z-[1]); both share the
-      // CUT preview wrapper's stacking context.
-      className="pointer-events-none absolute inset-x-0 top-0 z-[2] aspect-video w-full rounded-md bg-black object-contain"
+      // CUT preview wrapper's stacking context. Until its frame is decoded it
+      // is fully transparent (no black backing), so V1 stays visible.
+      className={cn(
+        "pointer-events-none absolute inset-x-0 top-0 z-[2] aspect-video w-full rounded-md object-contain",
+        ready ? "bg-black opacity-100" : "opacity-0",
+      )}
       onLoadedMetadata={(e) => {
         e.currentTarget.currentTime = expected;
         if (playing) void e.currentTarget.play().catch(() => {});
+        revealWhenDecoded(e.currentTarget);
       }}
+      onLoadedData={(e) => revealWhenDecoded(e.currentTarget)}
+      onCanPlay={(e) => revealWhenDecoded(e.currentTarget)}
+      onSeeked={(e) => revealWhenDecoded(e.currentTarget)}
     />
   );
 }
