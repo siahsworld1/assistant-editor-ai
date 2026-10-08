@@ -134,6 +134,9 @@ export interface DispatchOptions {
   /** Used only to name a new working version when the transaction forks one. */
   ids: IdGenerator;
   now?: string;
+  /** How a fork made by this transaction describes itself (default: a manual
+   * edit). An accepted Director proposal names its instruction here. */
+  fork?: { command: string; summary: string } | undefined;
 }
 
 export type DispatchOutcome =
@@ -189,8 +192,8 @@ export function dispatchTransaction(
       id,
       label: `${parent.label}${suffix}`,
       version: `${parent.version}${suffix}`,
-      command: "Manual edit",
-      summary: `Manual edits to ${parent.version}.`,
+      command: options.fork?.command ?? "Manual edit",
+      summary: options.fork?.summary ?? `Manual edits to ${parent.version}.`,
       createdAt:
         options.now ?? new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       changes: [],
