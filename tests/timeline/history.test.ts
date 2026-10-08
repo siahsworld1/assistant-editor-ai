@@ -193,11 +193,18 @@ describe("undo / redo", () => {
     const ids = seededIds("origins");
     let h = createHistory(seq);
     const origins: TransactionOrigin[] = ["manual", "director", "system"];
+    // Each moves its own clip: since durable ownership, a Director
+    // transaction may not change a clip someone edited by hand.
+    const clipFor: Record<TransactionOrigin, string> = {
+      manual: "event-6",
+      director: "event-4",
+      system: "event-7",
+    };
     origins.forEach((origin, n) => {
       h = committed(
         h,
         makeTransaction(ids, `by ${origin}`, origin, [
-          commands.move(ids, [item(seq, "event-6").id], n + 1),
+          commands.move(ids, [item(seq, clipFor[origin]).id], n + 1),
         ]),
       );
     });
@@ -221,7 +228,8 @@ describe("deterministic replay", () => {
       makeTransaction(ids, "Ripple", "manual", [
         commands.rippleDelete(ids, [item(seq, "event-1").id]),
       ]),
-      makeTransaction(ids, "Lift", "director", [commands.delete(ids, [item(seq, "event-7").id])]),
+      // (Manual: the ripple above made every later clip the filmmaker's.)
+      makeTransaction(ids, "Lift", "manual", [commands.delete(ids, [item(seq, "event-7").id])]),
     ];
     const a = replay(seq, log, { media });
     const b = replay(seq, log, { media });

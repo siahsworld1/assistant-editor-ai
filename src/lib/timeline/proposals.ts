@@ -31,9 +31,9 @@ import type { History } from "./history";
 import type { IdGenerator } from "./ids";
 import { seededIds } from "./ids";
 import type { MediaInventory } from "./invariants";
-import { expandLinked, isProtectedFrom } from "./selectors";
+import { expandLinked, isLockedFrom } from "./selectors";
 import { applyTransaction, makeTransaction } from "./transactions";
-import type { Command, Sequence, Transaction } from "./types";
+import type { ClipItem, Command, Sequence, Transaction } from "./types";
 import {
   dispatchTransaction,
   importedSequence,
@@ -362,53 +362,68 @@ export function sequenceRevision(seq: Sequence): string {
 export type Ownership = "director" | "manual" | "unknown";
 
 /**
- * Who last shaped each item of a version — for deciding what a proposal may
- * touch. A Director version is the Director's own import. For a working
- * version the transaction history decides: anything a non-Director
- * transaction ever touched is manual; anything never changed since import is
- * the Director's; anything else is the Director's only if the history reaches
- * all the way back to the import — otherwise its owner is unknown.
+ * Who has shaped each item of a version — for deciding what a proposal may
+ * touch. Durable ownership (`ClipItem.editedBy`, stamped by every command and
+ * stored in the Sequence) decides first; the retained transaction history is
+ * consulted as well, and is the only source for items edited before durable
+ * ownership existed. Fail closed throughout:
+ *   - manual if ownership says so, OR the history shows a non-Director
+ *     transaction changing the item's content (protection changes aside), OR
+ *     the transaction that last stamped it was not the Director's;
+ *   - unknown if ownership says so, or for a pre-ownership item whose history
+ *     doesn't reach back to the import (trimmed by the cap, or lost);
+ *   - the Director's only when it is untouched since import, or provably
+ *     changed by the Director alone.
  */
 export function ownershipOf(
   ws: Workspace,
   versionId: string,
   clips: ReadonlyArray<Pick<Clip, "id" | "fps">>,
 ): (itemId: string) => Ownership {
+  const seq = sequenceOf(ws, versionId, clips);
   const history: History | undefined = ws.histories[versionId];
-  if (!history) return () => "director";
-  const version = ws.versions.find((v) => v.id === versionId);
-  const parent = version?.parentId ? ws.versions.find((v) => v.id === version.parentId) : undefined;
-  const imported = parent && parent.kind !== "edited" ? importedSequence(parent, clips) : null;
-  const first = history.past[0]?.before ?? history.present;
-  const complete =
-    !!imported && (first === imported || sequenceRevision(first) === sequenceRevision(imported));
-  // Manual = touched by any non-Director transaction in the retained history.
-  // Determined three ways, so no single source (a command's changedIds) can
-  // let a manual edit pass as the Director's: the ids each transaction
-  // reported, every item that actually differs before → after it, and the
-  // origin of the transaction that last stamped the item.
   const manual = new Set<string>();
   const originOf = new Map<string, string>();
-  for (const e of history.past) {
-    originOf.set(e.transaction.id, e.transaction.origin);
-    if (e.transaction.origin === "director") continue;
-    for (const id of e.changedIds) manual.add(id);
-    for (const id of new Set([...Object.keys(e.before.items), ...Object.keys(e.after.items)])) {
-      if (e.before.items[id] !== e.after.items[id]) manual.add(id);
+  let complete = !history; // a Director version is its own, untouched import
+  if (history) {
+    const version = ws.versions.find((v) => v.id === versionId);
+    const parent = version?.parentId
+      ? ws.versions.find((v) => v.id === version.parentId)
+      : undefined;
+    const imported = parent && parent.kind !== "edited" ? importedSequence(parent, clips) : null;
+    const first = history.past[0]?.before ?? history.present;
+    complete =
+      !!imported && (first === imported || sequenceRevision(first) === sequenceRevision(imported));
+    for (const e of history.past) {
+      originOf.set(e.transaction.id, e.transaction.origin);
+      if (e.transaction.origin === "director") continue;
+      for (const id of new Set([...Object.keys(e.before.items), ...Object.keys(e.after.items)])) {
+        const a = e.before.items[id];
+        const b = e.after.items[id];
+        if (a !== b && !(a && b && sameContent(a, b))) manual.add(id);
+      }
     }
   }
   return (itemId) => {
-    if (manual.has(itemId)) return "manual";
-    const item = history.present.items[itemId];
+    const item = seq?.items[itemId];
     if (!item) return "unknown";
+    if (item.editedBy === "manual" || manual.has(itemId)) return "manual";
+    if (item.editedBy === "unknown") return "unknown";
     if (!item.originTransactionId) return "director"; // untouched since import
     const stampedBy = originOf.get(item.originTransactionId);
     if (stampedBy !== undefined && stampedBy !== "director") return "manual";
-    // Stamped by a Director transaction we can see — the Director's only if the
-    // history reaches back to the import (an earlier manual edit could
-    // otherwise have been trimmed away). Anything else: unknown.
+    if (item.editedBy === "director") return "director"; // durable: Director-only
+    // Edited before durable ownership: the Director's only if the history we
+    // have reaches the import and shows the Director stamping it.
     return complete && stampedBy === "director" ? "director" : "unknown";
   };
+}
+
+/** Same item content, ignoring protection (locking isn't an edit). */
+function sameContent(a: ClipItem, b: ClipItem): boolean {
+  const { protection: _a, ...ra } = a;
+  const { protection: _b, ...rb } = b;
+  return canonicalJson(ra) === canonicalJson(rb);
 }
 
 /* ---------------------------------- review --------------------------------- */
@@ -535,7 +550,8 @@ export function reviewProposal(raw: unknown, ctx: ProposalContext): Review {
   // 4. Protection and ownership of what the proposal names (with partners).
   const owner = ownershipOf(ctx.workspace, ctx.activeVersionId, ctx.clips);
   const named = expandLinked(seq, [...new Set(referenced)]);
-  const protectedIds = named.filter((id) => isProtectedFrom(seq, seq.items[id]!, "director"));
+  // Locks here; ownership just below, with its own, more precise reasons.
+  const protectedIds = named.filter((id) => isLockedFrom(seq, seq.items[id]!, "director"));
   if (protectedIds.length)
     issues.push({
       code: "protected",
@@ -549,7 +565,19 @@ export function reviewProposal(raw: unknown, ctx: ProposalContext): Review {
   const run = applyTransaction(seq, transactionFor(p, seededIds(`preview:${p.id}`), "preview"), {
     media: ctx.media,
   });
-  if (!run.ok) return fail([engineIssue(run.error)]);
+  if (!run.ok) {
+    // The engine refuses a Director change to manual / unknown-owned material
+    // on its own (e.g. a ripple shifting a hand-edited clip). Say which, and why.
+    if (run.error.code === "protected" || run.error.code === "invariant") {
+      const flagged = [
+        ...(run.error.itemIds ?? []),
+        ...(run.error.violations ?? []).flatMap((v) => v.ids),
+      ].filter((id) => seq.items[id]);
+      ownershipIssues([...new Set(flagged)], owner, issues);
+      if (issues.length) return fail(issues);
+    }
+    return fail([engineIssue(run.error)]);
+  }
 
   // 6. Ownership of everything it would actually change (ripples shift
   //    items the proposal never named).

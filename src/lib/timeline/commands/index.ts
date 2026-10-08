@@ -7,6 +7,7 @@ import { linkedIds } from "../selectors";
 import type { Command, CommandType, Sequence } from "../types";
 import { deleteEdit } from "./delete";
 import { moveEdit } from "./move";
+import { setProtection } from "./protection";
 import { replaceAssembly } from "./replace-assembly";
 import { rippleDelete } from "./ripple-delete";
 import { splitEdit } from "./split";
@@ -30,6 +31,7 @@ const HANDLERS: Record<CommandType, Handler> = {
   DeleteEdit: deleteEdit as Handler,
   RippleDelete: rippleDelete as Handler,
   ReplaceAssembly: replaceAssembly as Handler,
+  SetProtection: setProtection as Handler,
   RippleTrim: notYet("RippleTrim"),
   RollEdit: notYet("RollEdit"),
   SlipEdit: notYet("SlipEdit"),
@@ -81,6 +83,17 @@ export const commands = {
     make(ids, "RippleDelete", { itemIds: [...itemIds] }),
   replaceAssembly: (ids: IdGenerator, params: CommandParamsByType["ReplaceAssembly"]) =>
     make(ids, "ReplaceAssembly", params),
+  /** Lock / unlock, AI-protect / open to AI (filmmaker transactions only). */
+  setProtection: (
+    ids: IdGenerator,
+    itemIds: string[],
+    protection: { locked?: boolean; aiLocked?: boolean },
+  ) =>
+    make(ids, "SetProtection", {
+      itemIds: [...itemIds],
+      ...(protection.locked !== undefined ? { locked: protection.locked } : {}),
+      ...(protection.aiLocked !== undefined ? { aiLocked: protection.aiLocked } : {}),
+    }),
   /** For the reserved commands (routed, rejected as not implemented). */
   reserved: <T extends keyof CommandParamsByType>(
     ids: IdGenerator,

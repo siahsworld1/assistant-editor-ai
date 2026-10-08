@@ -168,8 +168,11 @@ export function findViolations(seq: Sequence, ctx: ValidationContext = {}): Viol
   return out;
 }
 
-function sameItem(a: ClipItem, b: ClipItem): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+function sameItem(a: ClipItem, b: ClipItem, ignoreProtection = false): boolean {
+  if (!ignoreProtection) return JSON.stringify(a) === JSON.stringify(b);
+  const { protection: _a, ...ra } = a;
+  const { protection: _b, ...rb } = b;
+  return JSON.stringify(ra) === JSON.stringify(rb);
 }
 
 /** Changes `origin` was not allowed to make between `before` and `after`. */
@@ -182,7 +185,9 @@ export function protectionViolations(
   for (const item of Object.values(before.items)) {
     if (!isProtectedFrom(before, item, origin)) continue;
     const now = after.items[item.id];
-    if (!now || !sameItem(item, now)) {
+    // The filmmaker may change a protected item's PROTECTION (that is how it
+    // gets unlocked) — nothing else about it. The Director never may.
+    if (!now || !sameItem(item, now, origin === "manual")) {
       out.push(
         v("protected-change", `"${item.label}" is protected from ${origin} changes`, [item.id]),
       );

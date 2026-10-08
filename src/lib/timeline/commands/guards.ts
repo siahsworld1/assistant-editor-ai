@@ -1,7 +1,7 @@
 // Checks shared by the commands, so each rejects with a precise, typed reason
 // instead of leaving it to the transaction-level invariant check (which still
 // runs afterwards as the safety net).
-import { isProtectedFrom, overlapsOnTrack } from "../selectors";
+import { isLockedFrom, isProtectedFrom, overlapsOnTrack } from "../selectors";
 import type { Sequence } from "../types";
 import { fail, type CommandContext, type CommandOutcome } from "./types";
 
@@ -21,6 +21,14 @@ export function requireEditable(
 ): CommandOutcome | null {
   const blocked = ids.filter((id) => isProtectedFrom(seq, seq.items[id]!, ctx.origin));
   if (!blocked.length) return null;
+  const owned = blocked.filter((id) => !isLockedFrom(seq, seq.items[id]!, ctx.origin));
+  if (ctx.origin === "director" && owned.length) {
+    return fail(
+      "protected",
+      `${owned.map((id) => `"${seq.items[id]!.label}"`).join(", ")} ${owned.length > 1 ? "were" : "was"} edited by hand (or can't be verified) — the Director never changes the filmmaker's edits.`,
+      blocked,
+    );
+  }
   const who = ctx.origin === "director" ? "the Director" : "editing";
   return fail(
     "protected",

@@ -41,6 +41,22 @@ export type Origin = "director" | "manual" | "fallback";
 export type TransactionOrigin = "manual" | "director" | "system";
 
 /**
+ * Durable edit ownership of an item — who has shaped it since it was imported.
+ * Stamped by every command that changes the item (including linked partners
+ * and clips a ripple shifts), stored in the Sequence itself, so it survives
+ * save/reload, undo/redo and history truncation.
+ * - absent: never changed since import (the Director's original material) —
+ *   or, if the item has an `originTransactionId`, edited before durable
+ *   ownership existed (resolved from history where possible, else unknown);
+ * - "director": changed only by Director transactions;
+ * - "manual": changed by the filmmaker at least once (sticky: a later
+ *   Director change does not make it the Director's again);
+ * - "unknown": changed by the Director after an edit whose owner can't be
+ *   established — never treated as the Director's.
+ */
+export type EditOwner = "director" | "manual" | "unknown";
+
+/**
  * What may change an item or a track.
  * - `locked`: nothing may modify it (the user must unlock it first).
  * - `aiLocked`: the Director / any AI-issued command must not modify it; manual
@@ -97,6 +113,8 @@ export interface ClipItem {
   origin: Origin;
   /** The transaction that created or last changed this item, when known. */
   originTransactionId?: string | undefined;
+  /** Durable edit ownership (see EditOwner). Absent on untouched imports. */
+  editedBy?: EditOwner | undefined;
   protection: Protection;
   /** Read-only import provenance; see the file header. */
   legacy?: LegacyItemProvenance | undefined;
@@ -173,7 +191,13 @@ export interface LegacySequenceProvenance {
 
 /** Implemented in Phase 1. */
 export type CoreCommandType =
-  "MoveEdit" | "TrimEdit" | "SplitEdit" | "DeleteEdit" | "RippleDelete" | "ReplaceAssembly";
+  | "MoveEdit"
+  | "TrimEdit"
+  | "SplitEdit"
+  | "DeleteEdit"
+  | "RippleDelete"
+  | "ReplaceAssembly"
+  | "SetProtection";
 
 /** Reserved: declared and routed by the engine, rejected as not implemented. */
 export type FutureCommandType =

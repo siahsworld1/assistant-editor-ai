@@ -260,6 +260,10 @@ export interface PersistedHistory {
   /** Content digest of the parent import the references were written
    * against; references are resolved only against an identical import. */
   parentDigest?: string | undefined;
+  /** 1 once items carry durable edit ownership (`ClipItem.editedBy`). A
+   * history saved before that has none: it is replayed with ownership
+   * derived, and checked against the saved present ignoring ownership. */
+  provenance?: 1 | undefined;
 }
 
 /** A version as stored: an edited version's derived `timeline` is omitted. */
@@ -347,6 +351,7 @@ export function serializeHistory(h: History, parent: Sequence | null = null): Pe
     future: h.future.map((e) => e.transaction),
     cap: h.cap,
     ...(parent ? { parentDigest: digestOf(parent) } : {}),
+    provenance: 1,
   };
 }
 
@@ -449,7 +454,15 @@ export function restoreHistory(
     if (!c.ok) return presentOnly;
     h = c.history;
   }
-  if (!deepEqual(h.present, present)) return presentOnly;
+  // A history saved before durable ownership replays WITH ownership; the saved
+  // present has none, so only ownership may differ. The replay wins: it is the
+  // same edit, now with its ownership recorded (anything older than the
+  // retained history stays unknown — see proposals.ts).
+  const matches =
+    p["provenance"] === 1
+      ? deepEqual(h.present, present)
+      : deepEqual(withoutOwnership(h.present), withoutOwnership(present));
+  if (!matches) return presentOnly;
   const future: HistoryEntry[] = [];
   let cur = h.present;
   for (const txn of p["future"] as Transaction[]) {
@@ -465,6 +478,16 @@ export function restoreHistory(
     cur = out.sequence;
   }
   return { history: { ...h, future }, lost: future.length !== (p["future"] as unknown[]).length };
+}
+
+/** `seq` without durable ownership, for comparing with pre-ownership saves. */
+function withoutOwnership(seq: Sequence): Sequence {
+  const items: Record<string, ClipItem> = {};
+  for (const [id, item] of Object.entries(seq.items)) {
+    const { editedBy: _owner, ...rest } = item;
+    items[id] = rest;
+  }
+  return { ...seq, items };
 }
 
 export interface RestoredEditState extends EditorSelections {

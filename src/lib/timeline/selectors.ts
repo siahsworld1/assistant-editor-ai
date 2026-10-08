@@ -51,12 +51,35 @@ export function sequenceEndFrame(seq: Sequence): number {
   return Object.values(seq.items).reduce((m, i) => Math.max(m, endFrame(i)), 0);
 }
 
-/** May a transaction from `origin` change this item? `locked` (item or track)
- * stops everyone; `aiLocked` (item or track) stops the Director only. */
-export function isProtectedFrom(seq: Sequence, item: ClipItem, origin: TransactionOrigin): boolean {
+/** Is this item shaped by the filmmaker — or by someone we can't verify?
+ * Manual or unknown ownership, or an item changed before ownership was
+ * recorded (stamped by a transaction, no ownership): never the Director's. */
+export function isOwnedAgainstDirector(item: ClipItem): boolean {
+  return (
+    item.editedBy === "manual" ||
+    item.editedBy === "unknown" ||
+    (item.editedBy === undefined && !!item.originTransactionId)
+  );
+}
+
+/** The lock rules alone: `locked` (item or track) stops everyone; `aiLocked`
+ * (item or track) stops the Director only. */
+export function isLockedFrom(seq: Sequence, item: ClipItem, origin: TransactionOrigin): boolean {
   const track = trackOf(seq, item);
   if (item.protection.locked || track?.protection.locked) return true;
   return origin === "director" && (item.protection.aiLocked || !!track?.protection.aiLocked);
+}
+
+/**
+ * May a transaction from `origin` change this item? The ONE predicate every
+ * command guard, the transaction-level protection check and ReplaceAssembly's
+ * keep-list consult. Locks as above — and a Director transaction may never
+ * change anything the filmmaker shaped or whose ownership can't be verified
+ * (directly, through linked audio, a ripple shift, a split or an assembly
+ * replacement). There is no override.
+ */
+export function isProtectedFrom(seq: Sequence, item: ClipItem, origin: TransactionOrigin): boolean {
+  return isLockedFrom(seq, item, origin) || (origin === "director" && isOwnedAgainstDirector(item));
 }
 
 /** May a transaction from `origin` add or remove items on this track? */

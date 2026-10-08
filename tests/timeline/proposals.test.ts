@@ -113,6 +113,58 @@ function sansStamps(seq: Sequence) {
   return { ...seq, items };
 }
 
+/** n Director transactions nudging `decisionId` back and forth. */
+function directorNudges(ws: Workspace, active: string, decisionId: string, n: number) {
+  const g = seededIds(`dn-${decisionId}-${n}-${active}`);
+  for (let k = 0; k < n; k += 1) {
+    const s = seqOf(ws, active);
+    const out = dispatchTransaction(
+      ws,
+      active,
+      makeTransaction(g, "Director nudge", "director", [
+        commands.move(g, [itemIdOf(s, decisionId)], k % 2 ? 1 : -1),
+      ]),
+      { clips: projectClips, media, ids: g },
+    );
+    if (!out.ok) throw new Error(out.error.message);
+    ws = out.workspace;
+    active = out.activeVersionId;
+  }
+  return { ws, active };
+}
+
+/**
+ * Save → reload, as a project saved BEFORE durable ownership would be: no
+ * `editedBy` on any item and no provenance marker (unless `keepOwnership`).
+ * `loseHistory` damages the undo log so only the present survives.
+ */
+function asPreOwnership(
+  ws: Workspace,
+  active: string,
+  opts: { loseHistory?: boolean; keepOwnership?: boolean } = {},
+): Workspace {
+  const saved = JSON.parse(
+    JSON.stringify(
+      serializeWorkspace(ws, { ...SEL, activeVersionId: active }, "a", "", projectClips),
+    ),
+  );
+  const h = saved.histories[active];
+  if (!opts.keepOwnership) {
+    delete h.provenance;
+    const strip = (seq: { items: Record<string, unknown> } | string) => {
+      if (typeof seq === "string") return;
+      for (const it of Object.values(seq.items))
+        if (it && typeof it === "object") delete (it as { editedBy?: unknown }).editedBy;
+    };
+    strip(h.present);
+    strip(h.base);
+  }
+  if (opts.loseHistory) h.past[0].commands[0].params.deltaFrames = 999_999;
+  const back = parseSavedEditStateV2(saved, "a", projectClips);
+  if (!back) throw new Error("did not reload");
+  return back.workspace;
+}
+
 describe("schema: strict validation", () => {
   const s = () => importedSequence(director, projectClips);
 
@@ -552,90 +604,55 @@ describe("protection and manual edits (fail closed)", () => {
     ]);
   });
 
-  it("fails closed when the edit history is incomplete: past the 200-entry cap", () => {
-    let ws: Workspace = fresh();
-    let active = "v2";
-    const g = seededIds("cap");
-    // 201 Director transactions on event 4: the cap drops the oldest, so the
-    // history no longer reaches the import.
-    for (let n = 0; n < 201; n += 1) {
-      const s = seqOf(ws, active);
-      const out = dispatchTransaction(
-        ws,
-        active,
-        makeTransaction(g, "Director nudge", "director", [
-          commands.move(g, [itemIdOf(s, "event-4")], n % 2 ? 1 : -1),
-        ]),
-        { clips: projectClips, media, ids: g },
-      );
-      if (!out.ok) throw new Error(out.error.message);
-      ws = out.workspace;
-      active = out.activeVersionId;
-    }
-    const s = seqOf(ws, active);
-    const own = ownershipOf(ws, active, projectClips);
-    expect(own(itemIdOf(s, "event-4"))).toBe("unknown");
-    expect(own(itemIdOf(s, "event-1"))).toBe("director"); // never changed since import
+  it("past the 200-entry cap, durable ownership still knows: Director-only stays the Director's, manual stays manual", () => {
+    const one = directorNudges(fresh(), "v2", "event-4", 1);
+    const capped = directorNudges(one.ws, one.active, "event-7", 200); // event 4's edit leaves the history
+    const s = seqOf(capped.ws, capped.active);
+    const own = ownershipOf(capped.ws, capped.active, projectClips);
+    expect(own(itemIdOf(s, "event-4"))).toBe("director");
+    expect(own(itemIdOf(s, "event-1"))).toBe("director"); // untouched
+    const ok = reviewProposal(
+      proposal(capped.active, s, [
+        { op: "move", itemIds: [itemIdOf(s, "event-4")], deltaFrames: -2 },
+      ]),
+      ctxFor(capped.ws, capped.active),
+    );
+    expect(ok.ok).toBe(true);
+  });
+
+  it("fails closed for a pre-ownership project whose history no longer reaches its edits", () => {
+    const one = directorNudges(fresh(), "v2", "event-4", 1);
+    const capped = directorNudges(one.ws, one.active, "event-7", 200);
+    const old = asPreOwnership(capped.ws, capped.active);
+    const s = seqOf(old, capped.active);
+    expect(ownershipOf(old, capped.active, projectClips)(itemIdOf(s, "event-4"))).toBe("unknown");
     const r = reviewProposal(
-      proposal(active, s, [{ op: "move", itemIds: [itemIdOf(s, "event-4")], deltaFrames: -2 }]),
-      ctxFor(ws, active),
+      proposal(capped.active, s, [
+        { op: "move", itemIds: [itemIdOf(s, "event-4")], deltaFrames: -2 },
+      ]),
+      ctxFor(old, capped.active),
     );
     expect(codes(r)).toEqual(["ownership-unknown"]);
   });
 
-  it("fails closed when the edit history was lost on reload", () => {
-    const ws = fresh();
-    const g = seededIds("lost");
-    const s0 = seqOf(ws, "v2");
-    const out = dispatchTransaction(
-      ws,
-      "v2",
-      makeTransaction(g, "Director nudge", "director", [
-        commands.move(g, [itemIdOf(s0, "event-4")], -2),
-      ]),
-      { clips: projectClips, media, ids: g },
-    );
-    if (!out.ok) throw new Error(out.error.message);
-    const w = out.activeVersionId;
-    const saved = JSON.parse(
-      JSON.stringify(
-        serializeWorkspace(out.workspace, { ...SEL, activeVersionId: w }, "a", "", projectClips),
-      ),
-    );
-    saved.histories[w].past[0].commands[0].params.deltaFrames = 999; // damaged undo log
-    const back = parseSavedEditStateV2(saved, "a", projectClips)!;
-    expect(back.warnings.join(" ")).toMatch(/could not be fully restored/);
-    const s = seqOf(back.workspace, w);
+  it("fails closed for a pre-ownership project whose history was lost on reload", () => {
+    const once = directorNudges(fresh(), "v2", "event-4", 1);
+    const lost = asPreOwnership(once.ws, once.active, { loseHistory: true });
+    const s = seqOf(lost, once.active);
     const r = reviewProposal(
-      proposal(w, s, [{ op: "move", itemIds: [itemIdOf(s, "event-4")], deltaFrames: 2 }]),
-      ctxFor(back.workspace, w),
+      proposal(once.active, s, [{ op: "move", itemIds: [itemIdOf(s, "event-4")], deltaFrames: 2 }]),
+      ctxFor(lost, once.active),
     );
     expect(codes(r)).toEqual(["ownership-unknown"]);
     // Untouched material stays usable.
-    expect(reviewProposal(trimOut(w, s), ctxFor(back.workspace, w)).ok).toBe(true);
+    expect(reviewProposal(trimOut(once.active, s), ctxFor(lost, once.active)).ok).toBe(true);
+    // The same project saved WITH ownership keeps it, even with its history lost.
+    const kept = asPreOwnership(once.ws, once.active, { loseHistory: true, keepOwnership: true });
+    expect(ownershipOf(kept, once.active, projectClips)(itemIdOf(s, "event-4"))).toBe("director");
   });
 });
 
-describe("Phase 1 approval gate", () => {
-  /** n Director transactions nudging `decisionId` back and forth. */
-  function directorNudges(ws: Workspace, active: string, decisionId: string, n: number) {
-    const g = seededIds(`dn-${decisionId}-${n}`);
-    for (let k = 0; k < n; k += 1) {
-      const s = seqOf(ws, active);
-      const out = dispatchTransaction(
-        ws,
-        active,
-        makeTransaction(g, "Director nudge", "director", [
-          commands.move(g, [itemIdOf(s, decisionId)], k % 2 ? 1 : -1),
-        ]),
-        { clips: projectClips, media, ids: g },
-      );
-      if (!out.ok) throw new Error(out.error.message);
-      ws = out.workspace;
-      active = out.activeVersionId;
-    }
-    return { ws, active };
-  }
+describe("Phase 1 approval gate (re-run with durable ownership)", () => {
   const allOps = (s: Sequence, decisionId: string): unknown[][] => {
     const id = itemIdOf(s, decisionId);
     return [
@@ -647,36 +664,30 @@ describe("Phase 1 approval gate", () => {
   };
 
   it("1. unknown ownership always blocks — every operation, at review and at accept", () => {
-    // (a) history trimmed by the cap, (b) history lost on reload, (c) parent missing.
-    const capped = directorNudges(fresh(), "v2", "event-4", 201);
-    const lost = (() => {
-      const once = directorNudges(fresh(), "v2", "event-4", 1);
-      const saved = JSON.parse(
-        JSON.stringify(
-          serializeWorkspace(
-            once.ws,
-            { ...SEL, activeVersionId: once.active },
-            "a",
-            "",
-            projectClips,
-          ),
-        ),
-      );
-      saved.histories[once.active].past[0].commands[0].params.deltaFrames = 999;
-      return {
-        ws: parseSavedEditStateV2(saved, "a", projectClips)!.workspace,
-        active: once.active,
-      };
+    // Unknown can now only arise for edits made before durable ownership:
+    // (a) history trimmed by the cap, (b) history lost, (c) parent missing.
+    const one = directorNudges(fresh(), "v2", "event-4", 1);
+    const capped = (() => {
+      const c = directorNudges(one.ws, one.active, "event-7", 200);
+      return { ws: asPreOwnership(c.ws, c.active), active: c.active };
     })();
+    const lost = {
+      ws: asPreOwnership(one.ws, one.active, { loseHistory: true }),
+      active: one.active,
+    };
     const orphan = (() => {
-      const once = directorNudges(fresh(), "v2", "event-4", 1);
-      const ws = {
-        ...once.ws,
-        versions: once.ws.versions.map((v) =>
-          v.id === once.active ? { ...v, parentId: "v-missing" } : v,
-        ),
+      // (Reloading a pre-ownership project with its history intact replays it
+      // and recovers provable ownership; an orphan only matters without it.)
+      const ws = asPreOwnership(one.ws, one.active, { loseHistory: true });
+      return {
+        ws: {
+          ...ws,
+          versions: ws.versions.map((v) =>
+            v.id === one.active ? { ...v, parentId: "v-missing" } : v,
+          ),
+        },
+        active: one.active,
       };
-      return { ws, active: once.active };
     })();
     for (const [name, { ws, active }] of Object.entries({ capped, lost, orphan })) {
       const s = seqOf(ws, active);
@@ -692,44 +703,32 @@ describe("Phase 1 approval gate", () => {
   });
 
   it("2. a manual edit can never be laundered into 'safe' by a missing or trimmed history", () => {
-    // Manual edit on event 7, then a Director change ON THE SAME clip (it is
-    // re-stamped by a Director transaction), then 200 more Director
-    // transactions elsewhere push the manual edit out of the history.
+    // Manual edit on event 7. A Director change to the same clip is refused by
+    // the engine itself; 200 Director transactions elsewhere then push the
+    // manual edit out of the history.
     const m = manualMove(fresh(), "v2", "event-7", 2);
     let { ws, active } = { ws: m.workspace, active: m.activeVersionId };
-    ({ ws, active } = directorNudges(ws, active, "event-7", 1));
-    expect(ownershipOf(ws, active, projectClips)(itemIdOf(seqOf(ws, active), "event-7"))).toBe(
-      "manual",
-    );
+    expect(() => directorNudges(ws, active, "event-7", 1)).toThrow(/edited by hand/);
     ({ ws, active } = directorNudges(ws, active, "event-4", 200));
-    const h = ws.histories[active]!;
-    expect(h.past.some((e) => e.transaction.origin === "manual")).toBe(false); // the manual edit is gone
+    expect(ws.histories[active]!.past.some((e) => e.transaction.origin === "manual")).toBe(false);
     const s = seqOf(ws, active);
-    expect(ownershipOf(ws, active, projectClips)(itemIdOf(s, "event-7"))).toBe("unknown");
+    // Durable ownership: still manual — not merely unknown.
+    expect(ownershipOf(ws, active, projectClips)(itemIdOf(s, "event-7"))).toBe("manual");
     expect(codes(reviewProposal(moveCutaway(active, s), ctxFor(ws, active)))).toEqual([
-      "ownership-unknown",
+      "manual-conflict",
     ]);
-
-    // Same, but the history is lost on reload instead of trimmed.
-    const saved = JSON.parse(
-      JSON.stringify(
-        serializeWorkspace(
-          m.workspace,
-          { ...SEL, activeVersionId: m.activeVersionId },
-          "a",
-          "",
-          projectClips,
-        ),
-      ),
-    );
-    saved.histories[m.activeVersionId].past[0].commands[0].params.deltaFrames = 999;
-    const back = parseSavedEditStateV2(saved, "a", projectClips)!.workspace;
-    expect(ownershipOf(back, m.activeVersionId, projectClips)(itemIdOf(s, "event-7"))).toBe(
-      "unknown",
-    );
-
-    // A history entry that under-reports what it changed still marks it
-    // manual (by diff and by the transaction that stamped the item).
+    // …and after save → reload, and with the history lost.
+    for (const opts of [{}, { loseHistory: true }]) {
+      const back = asPreOwnership(ws, active, { ...opts, keepOwnership: true });
+      expect(
+        ownershipOf(back, active, projectClips)(itemIdOf(s, "event-7")),
+        JSON.stringify(opts),
+      ).toBe("manual");
+    }
+    // A pre-ownership project in the same state: unknown — still refused.
+    const old = asPreOwnership(ws, active);
+    expect(ownershipOf(old, active, projectClips)(itemIdOf(s, "event-7"))).toBe("unknown");
+    // A history entry that under-reports what it changed still marks it manual.
     const entry = m.workspace.histories[m.activeVersionId]!.past[0]!;
     const faulty = {
       ...m.workspace,
@@ -740,13 +739,13 @@ describe("Phase 1 approval gate", () => {
         },
       },
     };
-    const own = ownershipOf(faulty, m.activeVersionId, projectClips);
-    const s7 = seqOf(faulty, m.activeVersionId);
-    expect(own(itemIdOf(s7, "event-7"))).toBe("manual");
+    expect(ownershipOf(faulty, m.activeVersionId, projectClips)(itemIdOf(s, "event-7"))).toBe(
+      "manual",
+    );
   });
 
   it("3. indirect effects get the same checks: linked audio and ripple-shifted clips", () => {
-    // A manual move of V1 event 6 also moved its A1. Naming only the A1 is refused.
+    // A manual move of V1 event 6 also moved its A1 — both are manual.
     const m = manualMove(fresh(), "v2", "event-6", 4);
     const w = m.activeVersionId;
     const s = seqOf(m.workspace, w);
@@ -754,13 +753,13 @@ describe("Phase 1 approval gate", () => {
     const a6 = Object.values(s.items).find(
       (i) => i.linkGroupId === v6.linkGroupId && i.id !== v6.id,
     )!;
+    expect([v6.editedBy, a6.editedBy]).toEqual(["manual", "manual"]);
     const viaAudio = reviewProposal(
       proposal(w, s, [{ op: "trim", itemId: a6.id, edge: "in", deltaSourceFrames: 2 }]),
       ctxFor(m.workspace, w),
     );
     expect(codes(viaAudio)).toEqual(["manual-conflict"]);
     if (!viaAudio.ok) expect(new Set(viaAudio.issues[0]!.itemIds)).toEqual(new Set([v6.id, a6.id]));
-    // A ripple elsewhere that would shift event 6 (and its A1) is refused too.
     const viaRipple = reviewProposal(
       proposal(w, s, [{ op: "remove", itemIds: [itemIdOf(s, "event-5")], ripple: true }]),
       ctxFor(m.workspace, w),
@@ -768,14 +767,16 @@ describe("Phase 1 approval gate", () => {
     expect(codes(viaRipple)).toEqual(["manual-conflict"]);
     if (!viaRipple.ok)
       expect(viaRipple.issues[0]!.itemIds).toEqual(expect.arrayContaining([v6.id, a6.id]));
-    // And a ripple that would shift a clip of UNKNOWN ownership is refused.
-    const capped = directorNudges(fresh(), "v2", "event-7", 201);
-    const cs = seqOf(capped.ws, capped.active);
+    // A ripple that would shift a clip of UNKNOWN ownership (pre-ownership project).
+    const one = directorNudges(fresh(), "v2", "event-7", 1);
+    const capped = directorNudges(one.ws, one.active, "event-4", 200);
+    const old = asPreOwnership(capped.ws, capped.active);
+    const cs = seqOf(old, capped.active);
     const r = reviewProposal(
       proposal(capped.active, cs, [
         { op: "remove", itemIds: [itemIdOf(cs, "event-5")], ripple: true },
       ]),
-      ctxFor(capped.ws, capped.active),
+      ctxFor(old, capped.active),
     );
     expect(codes(r)).toEqual(["ownership-unknown"]);
     if (!r.ok) expect(r.issues[0]!.itemIds).toEqual([itemIdOf(cs, "event-7")]);

@@ -3,7 +3,14 @@
 // that never mutates its input and, on rejection, returns a typed error and
 // no sequence at all — so the caller's sequence is untouched by definition.
 import type { MediaInventory } from "../invariants";
-import type { ClipItem, Command, LinkGroup, Sequence, TransactionOrigin } from "../types";
+import type {
+  ClipItem,
+  Command,
+  EditOwner,
+  LinkGroup,
+  Sequence,
+  TransactionOrigin,
+} from "../types";
 
 export interface CommandContext {
   origin: TransactionOrigin;
@@ -84,6 +91,14 @@ export interface ReplaceAssemblyParams {
   links: LinkGroup[];
 }
 
+/** Lock / unlock items, or turn AI protection on / off (filmmaker only).
+ * Applies to every linked partner too. Fields left out are unchanged. */
+export interface SetProtectionParams {
+  itemIds: string[];
+  locked?: boolean | undefined;
+  aiLocked?: boolean | undefined;
+}
+
 export interface CommandParamsByType {
   MoveEdit: MoveEditParams;
   TrimEdit: TrimEditParams;
@@ -91,6 +106,7 @@ export interface CommandParamsByType {
   DeleteEdit: DeleteEditParams;
   RippleDelete: RippleDeleteParams;
   ReplaceAssembly: ReplaceAssemblyParams;
+  SetProtection: SetProtectionParams;
   // Reserved — routed by the engine, rejected as not implemented.
   RippleTrim: { itemId: string; edge: "in" | "out"; deltaSourceFrames: number };
   RollEdit: { leftItemId: string; rightItemId: string; deltaFrames: number };
@@ -137,8 +153,28 @@ export function withChanges(
  * An item that leaves its imported state keeps its provenance record (so it
  * keeps its legacy decision id) — the adapter ignores provenance whose
  * fingerprint no longer matches. */
+/**
+ * The item after a command changed it: stamped with the transaction and with
+ * durable ownership (types.ts EditOwner). Every command changes items through
+ * here — including linked partners and ripple-shifted clips — so ownership
+ * can never miss an indirect change. Manual is sticky; anything not issued by
+ * the Director counts as manual (fail closed).
+ */
 export function changed(item: ClipItem, ctx: CommandContext, patch: Partial<ClipItem>): ClipItem {
-  return { ...item, ...patch, originTransactionId: ctx.transactionId };
+  return {
+    ...item,
+    ...patch,
+    originTransactionId: ctx.transactionId,
+    editedBy: nextOwner(item, ctx.origin),
+  };
+}
+
+export function nextOwner(item: ClipItem, origin: CommandContext["origin"]): EditOwner {
+  if (origin !== "director") return "manual";
+  // Before this command, who owned it? An item stamped by a transaction but
+  // carrying no ownership was edited before ownership was tracked: unknown.
+  const before = item.editedBy ?? (item.originTransactionId ? "unknown" : "director");
+  return before === "manual" ? "manual" : before === "unknown" ? "unknown" : "director";
 }
 
 export function isInt(n: unknown): n is number {
