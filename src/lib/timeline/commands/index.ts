@@ -8,6 +8,7 @@ import type { Command, CommandType, Sequence } from "../types";
 import { deleteEdit } from "./delete";
 import { moveEdit } from "./move";
 import { setProtection } from "./protection";
+import { reorderEdit } from "./reorder";
 import { replaceAssembly } from "./replace-assembly";
 import { rippleDelete } from "./ripple-delete";
 import { splitEdit } from "./split";
@@ -30,6 +31,7 @@ const HANDLERS: Record<CommandType, Handler> = {
   SplitEdit: splitEdit as Handler,
   DeleteEdit: deleteEdit as Handler,
   RippleDelete: rippleDelete as Handler,
+  ReorderEdit: reorderEdit as Handler,
   ReplaceAssembly: replaceAssembly as Handler,
   SetProtection: setProtection as Handler,
   RippleTrim: notYet("RippleTrim"),
@@ -81,6 +83,9 @@ export const commands = {
     make(ids, "DeleteEdit", { itemIds: [...itemIds] }),
   rippleDelete: (ids: IdGenerator, itemIds: string[]) =>
     make(ids, "RippleDelete", { itemIds: [...itemIds] }),
+  /** `itemIds`: a back-to-back run on one track, in its NEW order. */
+  reorder: (ids: IdGenerator, itemIds: string[]) =>
+    make(ids, "ReorderEdit", { itemIds: [...itemIds] }),
   replaceAssembly: (ids: IdGenerator, params: CommandParamsByType["ReplaceAssembly"]) =>
     make(ids, "ReplaceAssembly", params),
   /** Lock / unlock, AI-protect / open to AI (filmmaker transactions only). */

@@ -196,6 +196,7 @@ export type CoreCommandType =
   | "SplitEdit"
   | "DeleteEdit"
   | "RippleDelete"
+  | "ReorderEdit"
   | "ReplaceAssembly"
   | "SetProtection";
 

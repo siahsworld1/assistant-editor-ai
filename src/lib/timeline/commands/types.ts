@@ -29,6 +29,7 @@ export type TimelineErrorCode =
   | "invalid-range"
   | "would-break-link"
   | "ripple-blocked"
+  | "reorder-blocked"
   | "not-implemented"
   | "invariant";
 
@@ -83,6 +84,12 @@ export interface RippleDeleteParams {
   itemIds: string[];
 }
 
+/** Put a back-to-back run of items on one track into a new order (the
+ * run's items, listed in their NEW order). See commands/reorder.ts. */
+export interface ReorderEditParams {
+  itemIds: string[];
+}
+
 /** Replace the cut's unprotected content with a complete assembly. */
 export interface ReplaceAssemblyParams {
   /** Items to insert; ids generated once when the command is built, and
@@ -105,6 +112,7 @@ export interface CommandParamsByType {
   SplitEdit: SplitEditParams;
   DeleteEdit: DeleteEditParams;
   RippleDelete: RippleDeleteParams;
+  ReorderEdit: ReorderEditParams;
   ReplaceAssembly: ReplaceAssemblyParams;
   SetProtection: SetProtectionParams;
   // Reserved — routed by the engine, rejected as not implemented.
