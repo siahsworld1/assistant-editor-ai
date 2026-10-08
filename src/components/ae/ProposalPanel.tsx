@@ -56,6 +56,8 @@ function plainReason(issue: ProposalIssue): string {
         return "Closing this gap would affect overlapping footage on another track.";
       if (issue.engineCode === "overlap")
         return "That would overlap another clip on the same track.";
+      if (issue.engineCode === "reorder-blocked")
+        return `${issue.message.replace(/ Nothing was changed\.$/, "")} The Director never removes or repositions that footage itself — nothing was changed.`;
       return issue.message;
     case "invalid-range":
       return `That edit isn't possible: ${issue.message}`;
@@ -297,6 +299,9 @@ export function ProposalPanel({
                 {proposal.operations.map((op, i) => (
                   <li key={i}>
                     {describeOperation(op, editor.sequence)}
+                    {op.op === "reorder" && (
+                      <ReorderDetail order={op.itemIds} seq={editor.sequence} />
+                    )}
                     {proposal.rationale
                       ?.filter((r) => r.opIndex === i)
                       .map((r, j) => (
@@ -379,6 +384,43 @@ export function ProposalPanel({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Original vs proposed order of a reorder, by clip name. */
+function ReorderDetail({ order, seq }: { order: string[]; seq: EditorApi["sequence"] }) {
+  const name = (id: string) => seq?.items[id]?.label ?? id;
+  const original = [...order].sort(
+    (a, b) => (seq?.items[a]?.startFrame ?? 0) - (seq?.items[b]?.startFrame ?? 0),
+  );
+  const list = (ids: string[], testId: string, title: string) => (
+    <div className="min-w-0 flex-1">
+      <span className="text-[11px] uppercase tracking-wide text-muted-foreground">{title}</span>
+      <ol className="list-decimal pl-4 text-[11px]" data-testid={testId}>
+        {ids.map((id) => (
+          <li
+            key={id}
+            data-item-id={id}
+            data-moved={
+              title === "Proposed" && original.indexOf(id) !== order.indexOf(id)
+                ? "true"
+                : undefined
+            }
+            className={cn(
+              title === "Proposed" && original.indexOf(id) !== order.indexOf(id) && "text-primary",
+            )}
+          >
+            {name(id)}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+  return (
+    <div className="mt-1 flex gap-4" data-testid="reorder-detail">
+      {list(original, "reorder-original", "Original")}
+      {list(order, "reorder-proposed", "Proposed")}
     </div>
   );
 }

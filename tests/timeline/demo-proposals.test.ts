@@ -38,9 +38,14 @@ const ctxOf = (ws: Workspace, active: string): ProposalContext => ({
 });
 
 describe("developer demo proposals", () => {
-  it("are labeled as demos and the valid three pass review on a Director cut", () => {
+  it("are labeled as demos and the valid four pass review on a Director cut", () => {
     const ws = workspaceFromVersions([director]);
-    for (const kind of ["move-broll", "trim-interview", "ripple-remove"] as const) {
+    for (const kind of [
+      "move-broll",
+      "trim-interview",
+      "ripple-remove",
+      "reorder-interview",
+    ] as const) {
       const r = demoProposal(kind, ctxOf(ws, "v2"));
       expect(r.ok, kind).toBe(true);
       if (!r.ok) continue;
@@ -48,7 +53,7 @@ describe("developer demo proposals", () => {
       expect(String(r.proposal["id"])).toMatch(/^prp_demo_/);
       expect(reviewProposal(r.proposal, ctxOf(ws, "v2")).ok, kind).toBe(true);
     }
-    expect(DEMO_KINDS.map((d) => d.kind)).toHaveLength(5);
+    expect(DEMO_KINDS.map((d) => d.kind)).toHaveLength(6);
   });
 
   it("conflict demos explain when there is nothing to conflict with — and are refused when there is", () => {

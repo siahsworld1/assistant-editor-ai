@@ -72,6 +72,10 @@ export function describeOperation(op: ProposalOp, seq: Sequence | null): string 
       const who = op.itemIds.map((id) => clipName(seq, id)).join(", ");
       return op.ripple ? `Remove ${who} and close the gap` : `Remove ${who}, leaving the gap`;
     }
+    case "reorder": {
+      const linked = op.itemIds.some((id) => seq?.items[id]?.linkGroupId);
+      return `Reorder ${op.itemIds.length} clips: ${op.itemIds.map((id) => clipName(seq, id)).join(", ")}${linked ? " (linked audio follows)" : ""}`;
+    }
   }
 }
 

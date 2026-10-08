@@ -242,7 +242,7 @@ describe("schema: strict validation", () => {
       "rebuild",
       "split",
       "insert",
-      "reorder",
+      "rippleTrim", // ("reorder" is supported since Phase 6 — see proposals-reorder.test.ts)
       "setProtection",
       "teleport",
     ]) {

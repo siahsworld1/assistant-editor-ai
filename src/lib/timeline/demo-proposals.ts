@@ -5,7 +5,9 @@
 // AI-provider call. Each proposal is clearly labeled as a demo. The three
 // "valid" demos search for an edit the engine accepts (dry-run review); the
 // two "conflict" demos deliberately target hand-edited or protected material,
-// so the review refuses them.
+// so the review refuses them. The reorder demo swaps two adjacent interview
+// clips where the engine allows it — and where it doesn't (a cutaway across
+// every cut), proposes the swap anyway so the refusal and its reason show.
 import {
   ownershipOf,
   PROPOSAL_SCHEMA,
@@ -19,12 +21,18 @@ import type { ClipItem, Sequence } from "./types";
 import { sequenceOf } from "./workspace";
 
 export type DemoKind =
-  "move-broll" | "trim-interview" | "ripple-remove" | "manual-conflict" | "protected-conflict";
+  | "move-broll"
+  | "trim-interview"
+  | "ripple-remove"
+  | "reorder-interview"
+  | "manual-conflict"
+  | "protected-conflict";
 
 export const DEMO_KINDS: ReadonlyArray<{ kind: DemoKind; label: string }> = [
   { kind: "move-broll", label: "Move a B-roll clip" },
   { kind: "trim-interview", label: "Trim an interview clip" },
   { kind: "ripple-remove", label: "Remove a section" },
+  { kind: "reorder-interview", label: "Reorder interview clips" },
   { kind: "manual-conflict", label: "Touch a hand-edited clip" },
   { kind: "protected-conflict", label: "Touch a protected clip" },
 ];
@@ -130,6 +138,25 @@ export function demoProposal(kind: DemoKind, ctx: ProposalContext): DemoResult {
           ),
         ),
       );
+    }
+    case "reorder-interview": {
+      const v1 = onTrack(seq, "V1").filter(free);
+      const swaps = v1
+        .slice(1)
+        .map((b, n) => [v1[n]!, b] as const)
+        .filter(([a, b]) => endFrame(a) === b.startFrame)
+        .map(([a, b]) =>
+          make(
+            [{ op: "reorder", itemIds: [b.id, a.id] }],
+            `Play "${b.label}" before "${a.label}"`,
+            "Swaps two adjacent interview clips; their sync audio, and any cutaway wholly inside one of them, go with them.",
+            "Demonstration: reordering interview clips.",
+          ),
+        );
+      if (!swaps.length)
+        return { ok: false, reason: "There are no two adjacent interview clips to reorder." };
+      const valid = firstValid(swaps);
+      return valid.ok ? valid : { ok: true, proposal: swaps[0]! };
     }
     case "manual-conflict": {
       const target = Object.values(seq.items).find((i) => owner(i.id) === "manual");

@@ -53,14 +53,17 @@ export type SourceRef =
   | { kind: "transcript"; id: string }
   | { kind: "visual"; id: string };
 
-/** The operations Phase 1 supports, each compiled 1:1 to an existing command. */
+/** The operations proposals support, each compiled 1:1 to an existing command. */
 export type ProposalOp =
   /** MoveEdit: move items (linked partners follow) by whole sequence frames. */
   | { op: "move"; itemIds: string[]; deltaFrames: number }
   /** TrimEdit: move one edge of an item (linked partners follow) in source frames. */
   | { op: "trim"; itemId: string; edge: "in" | "out"; deltaSourceFrames: number }
   /** DeleteEdit (lift, gap stays) or RippleDelete (close the gap, conservative). */
-  | { op: "remove"; itemIds: string[]; ripple: boolean };
+  | { op: "remove"; itemIds: string[]; ripple: boolean }
+  /** ReorderEdit: a back-to-back run on one track, listed in its NEW order
+   * (linked audio follows; footage across a cut in the run refuses it). */
+  | { op: "reorder"; itemIds: string[] };
 
 export interface EditProposal {
   schema: typeof PROPOSAL_SCHEMA;
@@ -112,7 +115,6 @@ const KNOWN_UNSUPPORTED = new Set([
   "replaceSource",
   "replaceAssembly",
   "rebuild",
-  "reorder",
   "slip",
   "slide",
   "roll",
@@ -309,6 +311,11 @@ function parseOp(
     keys(["op", "itemIds", "ripple"]);
     itemList("itemIds");
     if (typeof op["ripple"] !== "boolean") bad(`${path}.ripple`, "ripple must be true or false.");
+  } else if (kind === "reorder") {
+    keys(["op", "itemIds"]);
+    itemList("itemIds");
+    if (Array.isArray(op["itemIds"]) && op["itemIds"].length === 1)
+      bad(`${path}.itemIds`, "A reorder lists at least two clips, in their new order.");
   } else {
     bad(
       `${path}.op`,
@@ -471,6 +478,8 @@ function compile(p: EditProposal, ids: IdGenerator): TypedCommand[] {
         return op.ripple
           ? commands.rippleDelete(ids, op.itemIds)
           : commands.delete(ids, op.itemIds);
+      case "reorder":
+        return commands.reorder(ids, op.itemIds);
     }
   });
 }
