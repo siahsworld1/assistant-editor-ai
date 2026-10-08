@@ -64,6 +64,7 @@ function CutPage() {
     project,
     desktopCapabilities,
     editor,
+    askDirector,
   } = useAE();
 
   const version = versions.find((v) => v.id === activeVersionId) ?? versions[0]!;
@@ -243,6 +244,7 @@ function CutPage() {
               editor={editor}
               preview={proposals}
               selection={selection}
+              askDirector={askDirector}
               onBeforeChange={playback.pause}
               demo={import.meta.env.DEV}
             />

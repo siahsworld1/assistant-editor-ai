@@ -148,6 +148,14 @@ export function useProposalPreview(editor: EditorApi) {
     setNotice({ kind: "error", message, issues: [] });
   }, []);
 
+  /** Forgets any proposal and notice without a message (e.g. while the AI
+   * Director is working on a new one). Nothing in the project changes. */
+  const clear = useCallback(() => {
+    setPending(null);
+    setInterpretation(null);
+    setNotice(null);
+  }, []);
+
   const reject = useCallback(() => {
     if (pending === null) return;
     setPending(null);
@@ -169,6 +177,7 @@ export function useProposalPreview(editor: EditorApi) {
     accept,
     reject,
     inform,
+    clear,
   };
 }
 

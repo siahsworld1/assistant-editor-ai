@@ -6,7 +6,7 @@ const ENGINE_ORIGIN = "http://127.0.0.1:32145";
 /** method -> allowed paths. Nothing else may ever be proxied. */
 const ALLOWED_ROUTES = {
   GET: ["/health", "/selects", "/stories", "/project", "/nle"],
-  POST: ["/analyze", "/analyze/retry-ai", "/build", "/restore", "/frames"],
+  POST: ["/analyze", "/analyze/retry-ai", "/build", "/propose", "/restore", "/frames"],
 };
 
 const OPTIONAL_ROUTES = ["/project", "/nle"];

@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { EngineClient, resolveTransport } from "./service";
-import type { BuildResult, SourceFrame } from "./service";
+import type { BuildResult, DirectorProposalResult, SourceFrame } from "./service";
 import type { HostContext } from "./transport";
 import type { WorkerStatus } from "@/types/bridge";
 import type { History } from "@/lib/timeline/history";
@@ -20,7 +20,13 @@ import {
   type AcceptOutcome,
   type AnalysisInventory,
   type ProposalContext,
+  sequenceRevision,
 } from "@/lib/timeline/proposals";
+import {
+  bindDirectorProposal,
+  buildSequenceContext,
+  type DirectorBinding,
+} from "@/lib/timeline/ai-context";
 import type { Sequence, Transaction } from "@/lib/timeline/types";
 import {
   dispatchTransaction as dispatchToWorkspace,
@@ -288,6 +294,13 @@ interface AEContextValue {
   audition: (id: string | null) => void;
   toggleStorySelect: (id: string) => void;
   runCommand: (command: string) => Promise<void>;
+  /** Asks the AI Director for an edit proposal against the cut on screen.
+   * The result is only a proposal: it is validated and previewed by the
+   * proposal engine, and applied only if the filmmaker accepts it. */
+  askDirector: (
+    instruction: string,
+    selection: readonly string[],
+  ) => Promise<DirectorProposalResult>;
   setActiveVersion: (id: string) => void;
   /** The canonical schema-2 editor for the active version (see EditorApi). */
   editor: EditorApi;
@@ -1513,6 +1526,54 @@ export function AEProvider({ children }: { children: ReactNode }) {
     }),
     [editorClips, editorMedia, analysisInventory],
   );
+  const askDirector = useCallback(
+    async (instruction: string, selection: readonly string[]): Promise<DirectorProposalResult> => {
+      const client = clientRef.current;
+      if (!client || modeRef.current === "demo")
+        return {
+          status: "failed",
+          message: "the AI Director needs the local engine — reconnect and try again",
+          retryable: true,
+        };
+      const context = buildSequenceContext(
+        proposalContext(),
+        selection,
+        {
+          selects,
+          transcript: project?.transcript ?? [],
+          visualEvidence: project?.visualEvidence ?? [],
+        },
+        editorClips,
+      );
+      if (!context) return { status: "refused", reason: "There is no cut to edit yet." };
+      // The exact cut this request describes. The reply is bound to it by the
+      // app — never by the reply — and refused if the project, version or cut
+      // has changed by the time it arrives (refs: read live, after the await).
+      const live = (): DirectorBinding | null => {
+        const { ws, active } = workspaceRef.current;
+        const seq = sequenceOf(ws, active, editorClips);
+        return seq
+          ? {
+              projectId: activeRef.current.record?.id ?? null,
+              versionId: active,
+              revision: sequenceRevision(seq),
+            }
+          : null;
+      };
+      const binding: DirectorBinding = {
+        projectId: activeRef.current.record?.id ?? null,
+        versionId: context.versionId,
+        revision: context.revision,
+      };
+      const res = await client.propose(instruction, context);
+      if (res.status !== "proposal") return res;
+      const bound = bindDirectorProposal(res.proposal, { instruction, binding }, live());
+      return bound.ok
+        ? { status: "proposal", proposal: bound.proposal }
+        : { status: "invalid", reason: bound.reason };
+    },
+    [proposalContext, selects, project?.transcript, project?.visualEvidence, editorClips],
+  );
   const acceptEditorProposal = useCallback(
     (raw: unknown): AcceptOutcome => {
       const out = acceptProposalIn(raw, { ...proposalContext(), ids: randomIds });
@@ -1602,6 +1663,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
           ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id],
         ),
       runCommand,
+      askDirector,
       setActiveVersion: (id: string) => setActiveVersionId(id),
       editor,
       setTargetSeconds,
@@ -1640,6 +1702,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       retryAiAnalysis,
       directorNotice,
       runCommand,
+      askDirector,
       setMode,
       projects,
       activeProject,

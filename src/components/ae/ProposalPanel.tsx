@@ -5,8 +5,19 @@
 // Proposals come from a typed instruction, interpreted deterministically
 // (src/lib/timeline/instructions.ts — no AI provider), or from the clearly
 // labeled developer demonstration (development builds only).
-import { useState } from "react";
-import { AlertTriangle, Check, Eye, FlaskConical, Send, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  Check,
+  Eye,
+  FlaskConical,
+  Loader2,
+  RotateCcw,
+  Send,
+  Sparkles,
+  X,
+} from "lucide-react";
+import type { DirectorProposalResult } from "@/lib/ae/service";
 import { describeOperation, type ProposalPreview } from "@/lib/ae/proposal-preview";
 import type { EditorApi } from "@/lib/ae/store";
 import { DEMO_KINDS, demoProposal } from "@/lib/timeline/demo-proposals";
@@ -57,6 +68,7 @@ export function ProposalPanel({
   editor,
   preview,
   selection = [],
+  askDirector,
   onBeforeChange,
   demo,
 }: {
@@ -68,6 +80,12 @@ export function ProposalPanel({
   onBeforeChange?: () => void;
   /** Show the developer demonstration (development builds only). */
   demo: boolean;
+  /** The AI Director, for instructions the precise interpreter doesn't
+   * cover. Absent: such instructions are refused as before. */
+  askDirector?: (
+    instruction: string,
+    selection: readonly string[],
+  ) => Promise<DirectorProposalResult>;
 }) {
   const { review, pending, notice, interpretation } = preview;
   const proposal: EditProposal | null = review?.proposal ?? null;
@@ -75,13 +93,65 @@ export function ProposalPanel({
   const stale = !!review && !review.ok && review.issues.some((i) => i.code === "stale");
   const [text, setText] = useState("");
 
-  const submit = () => {
-    if (!text.trim()) return;
-    onBeforeChange?.();
-    const r = interpretInstruction(text, editor.proposalContext(), selection);
-    if (r.ok) preview.propose(r.proposal, r.interpretation);
-    else preview.inform(r.reason);
+  // The AI Director's progress for the last instruction it was asked.
+  const [ai, setAi] = useState<AiState | null>(null);
+  const request = useRef(0);
+  // A reply that arrives after the panel is gone (another project, another
+  // page) is dropped.
+  useEffect(
+    () => () => {
+      request.current += 1;
+    },
+    [],
+  );
+
+  const ask = async (instruction: string) => {
+    if (!askDirector) return;
+    const mine = ++request.current;
+    preview.clear(); // nothing pending while the Director works
+    setAi({ state: "generating", instruction });
+    const res = await askDirector(instruction, selection);
+    if (mine !== request.current) return; // superseded
+    switch (res.status) {
+      case "proposal":
+        preview.propose(res.proposal);
+        setAi({ state: "ready", instruction });
+        break;
+      case "refused":
+        setAi({ state: "unsupported", instruction, message: res.reason });
+        break;
+      case "failed":
+        setAi({
+          state: "provider-failure",
+          instruction,
+          message: res.message,
+          retryable: res.retryable,
+        });
+        break;
+      case "invalid":
+        setAi({ state: "invalid", instruction, message: res.reason });
+        break;
+    }
   };
+
+  const submit = () => {
+    if (!text.trim() || ai?.state === "generating") return;
+    onBeforeChange?.();
+    // Precise commands first (deterministic, Phase 4). Only wording it doesn't
+    // recognise goes to the AI Director — a precise command it understood but
+    // had to refuse (no selection, impossible trim…) is NOT re-tried by AI.
+    const r = interpretInstruction(text, editor.proposalContext(), selection);
+    if (r.ok) {
+      setAi(null);
+      preview.propose(r.proposal, r.interpretation);
+    } else if (r.code === "unrecognized" && askDirector && text.trim()) {
+      void ask(text.trim());
+    } else {
+      setAi(null);
+      preview.inform(r.reason);
+    }
+  };
+  const generating = ai?.state === "generating";
 
   return (
     <div className="panel p-4" data-testid="proposal-panel">
@@ -130,18 +200,27 @@ export function ProposalPanel({
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder={`Tell the Director… e.g. "${EXAMPLES[0]}"`}
-          disabled={pending !== null}
+          disabled={pending !== null || generating}
           className="h-8 min-w-0 flex-1 rounded border border-border bg-surface px-2.5 text-xs placeholder:text-muted-foreground/70 focus:border-primary/60 focus:outline-none disabled:opacity-50"
         />
         <button
           type="submit"
           data-testid="instruction-submit"
-          disabled={pending !== null || !text.trim()}
+          disabled={pending !== null || generating || !text.trim()}
           className="inline-flex h-8 items-center gap-1 rounded border border-border px-2.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground disabled:opacity-40"
         >
           <Send className="size-3.5" /> Propose
         </button>
       </form>
+
+      {ai && (
+        <AiStatus
+          ai={ai}
+          pending={pending !== null}
+          reviewOk={ok}
+          onRetry={() => void ask(ai.instruction)}
+        />
+      )}
 
       {notice && !pending && (
         <p
@@ -299,6 +378,79 @@ export function ProposalPanel({
             </button>
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+type AiState =
+  | { state: "generating" | "ready"; instruction: string }
+  | { state: "unsupported" | "invalid"; instruction: string; message: string }
+  | { state: "provider-failure"; instruction: string; message: string; retryable: boolean };
+
+/** Where the AI Director is with the last instruction. A proposal it returns
+ * is still only a proposal: "ready" means it passed validation and can be
+ * previewed; otherwise it is reported as a validation failure. */
+function AiStatus({
+  ai,
+  pending,
+  reviewOk,
+  onRetry,
+}: {
+  ai: AiState;
+  pending: boolean;
+  reviewOk: boolean;
+  onRetry: () => void;
+}) {
+  if (ai.state === "ready" && !pending) return null; // accepted or rejected since
+  const state =
+    ai.state === "ready" && !reviewOk
+      ? "validation-failure"
+      : ai.state === "invalid"
+        ? "validation-failure"
+        : ai.state;
+  const retry =
+    state === "provider-failure"
+      ? (ai as { retryable: boolean }).retryable
+      : state === "validation-failure" && ai.state === "invalid";
+  const text =
+    state === "generating"
+      ? "Generating a proposal — the AI Director is reading the current cut…"
+      : state === "ready"
+        ? "AI proposal ready — preview it below, then accept or reject it."
+        : state === "unsupported"
+          ? `Unsupported instruction: ${(ai as { message: string }).message}`
+          : state === "provider-failure"
+            ? `AI provider failure — ${(ai as { message: string }).message}. Nothing was changed.`
+            : ai.state === "invalid"
+              ? `Validation failure: ${ai.message} Nothing was changed.`
+              : "Validation failure: the AI proposal breaks the timeline's rules (see below). Nothing was changed.";
+  return (
+    <div
+      data-testid="ai-status"
+      data-state={state}
+      className={cn(
+        "mt-2 flex items-start gap-1.5 text-xs",
+        state === "ready" || state === "generating" ? "text-muted-foreground" : "text-destructive",
+      )}
+    >
+      {state === "generating" ? (
+        <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin" />
+      ) : state === "ready" ? (
+        <Sparkles className="mt-0.5 size-3.5 shrink-0 text-primary" />
+      ) : (
+        <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+      )}
+      <span className="min-w-0 flex-1">{text}</span>
+      {retry && (
+        <button
+          type="button"
+          data-testid="ai-retry"
+          onClick={onRetry}
+          className="inline-flex h-6 shrink-0 items-center gap-1 rounded border border-border px-2 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+        >
+          <RotateCcw className="size-3" /> Retry
+        </button>
       )}
     </div>
   );

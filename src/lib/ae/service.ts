@@ -82,6 +82,14 @@ export interface BuildResult {
   status?: BuildStatus | undefined;
 }
 
+/** What the AI Director answered for one instruction (POST /propose). A
+ * proposal is NOT trusted here: the app validates it deterministically. */
+export type DirectorProposalResult =
+  | { status: "proposal"; proposal: Record<string, unknown> }
+  | { status: "refused"; reason: string }
+  | { status: "failed"; message: string; retryable: boolean }
+  | { status: "invalid"; reason: string };
+
 export interface RetryAiResult {
   accepted: boolean;
   /** Why nothing started: "nothing-to-retry", "analysis-running", … */
@@ -213,6 +221,53 @@ export class EngineClient {
       ...extractBuildSummary(raw),
       status: extractBuildStatus(raw),
     };
+  }
+
+  /** Asks the AI Director for an edit proposal against the CURRENT sequence
+   * (worker/director.py). Never throws: an unreachable engine, a timeout or a
+   * provider failure comes back as `failed`. */
+  async propose(instruction: string, context: unknown): Promise<DirectorProposalResult> {
+    let raw: unknown;
+    try {
+      raw = await this.call("build", "/propose", {
+        method: "POST",
+        body: { instruction, context },
+        timeoutMs: 90000,
+      });
+    } catch (err) {
+      return {
+        status: "failed",
+        message: `The local engine didn't answer (${message(err)}).`,
+        retryable: true,
+      };
+    }
+    const root = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    const text = (v: unknown, fallback: string) =>
+      typeof v === "string" && v.trim() ? v.trim() : fallback;
+    switch (root["status"]) {
+      case "proposal":
+        return root["proposal"] && typeof root["proposal"] === "object"
+          ? { status: "proposal", proposal: root["proposal"] as Record<string, unknown> }
+          : { status: "invalid", reason: "The Director's reply was not a usable proposal." };
+      case "refused":
+        return { status: "refused", reason: text(root["reason"], "The Director can't do that.") };
+      case "failed": {
+        const f = (root["aiFailure"] ?? {}) as Record<string, unknown>;
+        return {
+          status: "failed",
+          message: text(f["message"], "the AI provider didn't respond"),
+          retryable: f["retryable"] !== false,
+        };
+      }
+      case "invalid-request":
+      case "invalid-response":
+        return {
+          status: "invalid",
+          reason: text(root["reason"], "The Director's reply could not be used."),
+        };
+      default:
+        return { status: "invalid", reason: "The engine doesn't support Director proposals yet." };
+    }
   }
 
   /** Re-runs only the AI steps that failed in the loaded analysis

@@ -121,8 +121,11 @@ describe("typed instructions → proposals", () => {
     click(itemEl(e7.id), 740, { shiftKey: true });
     instruct("Move this clip 2 seconds earlier");
     expect(text("proposal-notice")).toMatch(/Select one clip.*2 are selected/);
+    // Not a precise command: it goes to the AI Director (no provider here).
     instruct("Make the opening more engaging");
-    expect(text("proposal-notice")).toMatch(/I can't interpret that instruction yet/);
+    await wait(20);
+    expect(q("ai-status")!.dataset.state).toBe("provider-failure");
+    expect(text("ai-status")).toMatch(/No AI provider is configured/);
     // Protected. (Clear the two-clip selection first.)
     click(q("track-row-A2")!, 0);
     click(itemEl(e7.id), 740);

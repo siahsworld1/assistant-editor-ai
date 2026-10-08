@@ -62,6 +62,27 @@ export const schema1File = JSON.stringify({
   savedAt: "2026-10-06T19:00:00.000Z",
 });
 
+/** Scripted AI Director: what POST /propose answers (fake — no provider). */
+export const fakeDirector: {
+  replies: Array<
+    unknown | ((body: { instruction: string; context: Record<string, unknown> }) => unknown)
+  >;
+  requests: Array<{ instruction: string; context: Record<string, unknown> }>;
+  delayMs: number;
+} = { replies: [], requests: [], delayMs: 0 };
+
+/** What the worker answers with no AI key configured (the dev app). */
+export const NOT_CONFIGURED = {
+  status: "failed",
+  aiFailure: {
+    task: "director",
+    status: "failed",
+    category: "not-configured",
+    message: "No AI provider is configured — add an API key in Settings",
+    retryable: false,
+  },
+};
+
 export interface Disk {
   v1: string | null;
   v2: string | null;
@@ -94,6 +115,7 @@ export function Harness(): ReactNode {
     editor: ae.editor,
     preview: proposals,
     selection,
+    askDirector: ae.askDirector,
     onBeforeChange: playback.pause,
     demo: true,
   });
@@ -164,6 +186,18 @@ export function install(disk: Disk) {
       if (path === "/project") return { status: 200, body: { project: engineProject } };
       if (path === "/selects") return { status: 200, body: { selects: [] } };
       if (path === "/stories") return { status: 200, body: { stories: [] } };
+      if (path === "/propose") {
+        const body = (
+          req as unknown as { body: { instruction: string; context: Record<string, unknown> } }
+        ).body;
+        fakeDirector.requests.push(body);
+        if (fakeDirector.delayMs) await new Promise((r) => setTimeout(r, fakeDirector.delayMs));
+        const next =
+          fakeDirector.replies.length > 1 ? fakeDirector.replies.shift() : fakeDirector.replies[0];
+        const reply = typeof next === "function" ? next(body) : next;
+        if (reply instanceof Error) throw reply;
+        return { status: 200, body: reply ?? NOT_CONFIGURED };
+      }
       return { status: 404, body: null };
     }),
   };
@@ -243,6 +277,9 @@ export async function teardown() {
   window.localStorage.clear();
   pauseSpy.mockClear();
   togglePlaySpy.mockClear();
+  fakeDirector.replies = [];
+  fakeDirector.requests = [];
+  fakeDirector.delayMs = 0;
   shuttleSpy.mockClear();
 }
 

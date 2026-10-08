@@ -27,6 +27,7 @@ if os.environ.get("ASSISTANT_EDITOR_SKIP_DOTENV") != "1":
 
 from flask import Flask, jsonify, request  # noqa: E402 - load_dotenv must run first
 
+import director  # noqa: E402
 import media  # noqa: E402
 import persistence  # noqa: E402
 import pipeline  # noqa: E402
@@ -129,6 +130,16 @@ def build():
     command = body.get("command") or body.get("prompt")
     result = pipeline.build_timeline(project_id, story_id, target_seconds, command)
     return jsonify(result)
+
+
+@app.route("/propose", methods=["POST", "OPTIONS"])
+def propose():
+    """A Director edit proposal for the CURRENT sequence (worker/director.py).
+    Returns a proposal for the app to validate and preview — never applies one."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    return jsonify(director.propose(body.get("instruction"), body.get("context")))
 
 
 @app.route("/restore", methods=["POST", "OPTIONS"])
