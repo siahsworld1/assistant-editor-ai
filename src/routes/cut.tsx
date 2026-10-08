@@ -8,7 +8,9 @@ import {
   SourcePreviewDialog,
   type PreviewTarget,
 } from "@/components/ae/SourceVisuals";
+import { ProposalPanel } from "@/components/ae/ProposalPanel";
 import { TimelineEditor } from "@/components/ae/TimelineEditor";
+import { useProposalPreview } from "@/lib/ae/proposal-preview";
 import { decisionSourceRange } from "@/lib/ae/source-range";
 import { PageHeader } from "@/components/ae/AppShell";
 import { Badge } from "@/components/ui/badge";
@@ -70,7 +72,10 @@ function CutPage() {
   const clips = project?.clips ?? [];
   const mediaRoot = project?.mediaRoot ?? "";
 
-  const playback = useTimelinePlayback(timeline, clips);
+  // A Director proposal under review is previewed in memory only; while its
+  // "Proposed" picture is shown, playback plays the proposed cut.
+  const proposals = useProposalPreview(editor);
+  const playback = useTimelinePlayback(proposals.previewTimeline ?? timeline, clips);
 
   const [preview, setPreview] = useState<PreviewTarget | null>(null);
   const clipById = new Map(clips.map((c) => [c.id, c]));
@@ -226,11 +231,18 @@ function CutPage() {
                     {formatDuration(playback.playheadSeconds)}
                   </span>
                   <span className="font-tc text-[11px] text-muted-foreground">
-                    / {formatDuration(timeline.totalSeconds)}
+                    / {formatDuration((proposals.previewTimeline ?? timeline).totalSeconds)}
                   </span>
                 </div>
               </div>
             )}
+
+            <ProposalPanel
+              editor={editor}
+              preview={proposals}
+              onBeforeChange={playback.pause}
+              demo={import.meta.env.DEV}
+            />
 
             <div className="panel p-5">
               <div className="flex flex-wrap items-center justify-between gap-4">
@@ -258,7 +270,13 @@ function CutPage() {
                 </div>
               </div>
 
-              <TimelineEditor className="mt-5" editor={editor} playback={playback} clips={clips} />
+              <TimelineEditor
+                className="mt-5"
+                editor={editor}
+                playback={playback}
+                clips={clips}
+                compare={proposals.compare}
+              />
             </div>
 
             <div className="panel">

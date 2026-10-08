@@ -15,6 +15,12 @@ import type { WorkerStatus } from "@/types/bridge";
 import type { History } from "@/lib/timeline/history";
 import { randomIds, type IdGenerator } from "@/lib/timeline/ids";
 import type { MediaInventory } from "@/lib/timeline/invariants";
+import {
+  acceptProposal as acceptProposalIn,
+  type AcceptOutcome,
+  type AnalysisInventory,
+  type ProposalContext,
+} from "@/lib/timeline/proposals";
 import type { Sequence, Transaction } from "@/lib/timeline/types";
 import {
   dispatchTransaction as dispatchToWorkspace,
@@ -320,6 +326,12 @@ export interface EditorApi {
   persistence: EditorPersistence;
   /** Tries the last failed save again (any further edit also retries). */
   retrySave: () => void;
+  /** A read-only snapshot for reviewing / previewing Director proposals
+   * (src/lib/timeline/proposals.ts) against the version on screen. */
+  proposalContext: () => ProposalContext;
+  /** Accepts a proposal: re-validated against the CURRENT state, committed as
+   * one Director transaction, then saved like any edit. */
+  acceptProposal: (raw: unknown) => AcceptOutcome;
 }
 
 /**
@@ -1482,6 +1494,34 @@ export function AEProvider({ children }: { children: ReactNode }) {
 
   const retrySave = useCallback(() => setSaveRetry((n) => n + 1), []);
 
+  // What a proposal may cite as evidence: the project's real analysis ids.
+  const analysisInventory = useMemo<AnalysisInventory>(
+    () => ({
+      selectIds: new Set(selects.map((s) => s.id)),
+      transcriptIds: new Set((project?.transcript ?? []).map((t) => t.id)),
+      visualIds: new Set((project?.visualEvidence ?? []).map((v) => v.id)),
+    }),
+    [selects, project?.transcript, project?.visualEvidence],
+  );
+  const proposalContext = useCallback(
+    (): ProposalContext => ({
+      workspace: workspaceRef.current.ws,
+      activeVersionId: workspaceRef.current.active,
+      clips: editorClips,
+      media: editorMedia,
+      analysis: analysisInventory,
+    }),
+    [editorClips, editorMedia, analysisInventory],
+  );
+  const acceptEditorProposal = useCallback(
+    (raw: unknown): AcceptOutcome => {
+      const out = acceptProposalIn(raw, { ...proposalContext(), ids: randomIds });
+      if (out.ok) publishWorkspace(out.workspace, out.activeVersionId);
+      return out;
+    },
+    [proposalContext, publishWorkspace],
+  );
+
   const editor = useMemo<EditorApi>(() => {
     const ws: Workspace = { versions, histories };
     return {
@@ -1493,6 +1533,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
       ...editorStatus(ws, activeVersionId),
       persistence,
       retrySave,
+      proposalContext,
+      acceptProposal: acceptEditorProposal,
     };
   }, [
     versions,
@@ -1504,6 +1546,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
     redoEditor,
     persistence,
     retrySave,
+    proposalContext,
+    acceptEditorProposal,
   ]);
 
   const value = useMemo<AEContextValue>(

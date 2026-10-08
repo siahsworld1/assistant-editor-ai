@@ -44,6 +44,7 @@ import {
 } from "lucide-react";
 import { Filmstrip } from "@/components/ae/SourceVisuals";
 import { isTypingTarget } from "@/lib/ae/keyboard";
+import type { ProposalCompare, ProposalMark } from "@/lib/ae/proposal-preview";
 import type { EditorApi } from "@/lib/ae/store";
 import type { TimelinePlayback } from "@/lib/ae/timeline-playback";
 import type { Clip } from "@/lib/ae/types";
@@ -86,6 +87,7 @@ const FALLBACK_WIDTH = 960;
 const MIN_PX_PER_FRAME = 0.02;
 const MAX_PX_PER_FRAME = 24;
 const ZOOM_STEP = 1.5;
+const PREVIEW_PAUSED = "Reviewing a Director proposal — accept or reject it before editing.";
 
 type Tool = "select" | "blade";
 
@@ -137,13 +139,19 @@ export function TimelineEditor({
   playback,
   clips,
   className,
+  compare = null,
 }: {
   editor: EditorApi;
   playback: TimelineTransport;
   clips: Clip[];
   className?: string;
+  /** A Director proposal under review: draw this picture (current or
+   * proposed), mark the affected clips, and pause editing until it is
+   * accepted or rejected. Playback and navigation keep working. */
+  compare?: ProposalCompare | null;
 }) {
   const seq = editor.sequence;
+  const readOnly = !!compare;
   const media = useMemo<MediaInventory>(
     () => new Map(clips.map((c) => [c.id, { durationSeconds: c.durationSeconds }])),
     [clips],
@@ -215,6 +223,7 @@ export function TimelineEditor({
     editor,
     playback,
     media,
+    readOnly,
   });
   latest.current = {
     seq,
@@ -227,6 +236,7 @@ export function TimelineEditor({
     editor,
     playback,
     media,
+    readOnly,
   };
 
   /* --------------------------------- zoom --------------------------------- */
@@ -454,6 +464,10 @@ export function TimelineEditor({
       const s = L.seq;
       if (!s || e.button !== 0) return;
       e.stopPropagation();
+      if (L.readOnly) {
+        setMessage(PREVIEW_PAUSED);
+        return;
+      }
       if (L.tool === "blade") {
         const at = bladeFrame(s, item.id, frameAt(e.clientX), snapOptions());
         if (at === null) {
@@ -559,7 +573,7 @@ export function TimelineEditor({
   );
 
   const onTrackPointerDown = useCallback((e: ReactPointerEvent) => {
-    if (e.button !== 0 || e.shiftKey || e.metaKey || e.ctrlKey) return;
+    if (e.button !== 0 || e.shiftKey || e.metaKey || e.ctrlKey || latest.current.readOnly) return;
     setSelected(new Set()); // empty space deselects
   }, []);
 
@@ -595,6 +609,28 @@ export function TimelineEditor({
       window.addEventListener("pointerup", onUp);
     },
     [frameAt],
+  );
+
+  /* ------------------------------ protection ------------------------------ */
+
+  /** Locks / AI-protects the selection (linked partners follow) — one
+   * undoable filmmaker transaction (SetProtection). */
+  const setSelectionProtection = useCallback(
+    (field: "locked" | "aiLocked", value: boolean) => {
+      const { seq: s, selected: sel } = latest.current;
+      if (!s || !sel.size) return;
+      const targets = linkRepresentatives(s, sel);
+      const label =
+        field === "locked"
+          ? value
+            ? "Lock clips"
+            : "Unlock clips"
+          : value
+            ? "Protect from AI"
+            : "Allow AI changes";
+      commit(label, (ids) => [commands.setProtection(ids, targets, { [field]: value })]);
+    },
+    [commit],
   );
 
   /* ------------------------------- keyboard ------------------------------- */
@@ -636,6 +672,19 @@ export function TimelineEditor({
         return;
       }
       if (gestureRef.current) return; // nothing else mid-drag
+      // While a proposal is under review, editing keys are paused (playback,
+      // navigation, zoom and snapping keep working).
+      const editingKey =
+        (mod && (key === "z" || key === "k")) ||
+        key === "Delete" ||
+        key === "Backspace" ||
+        ((key === "ArrowLeft" || key === "ArrowRight") && e.altKey) ||
+        (!mod && (key === "b" || key === "v" || key === "a"));
+      if (L.readOnly && editingKey) {
+        setMessage(PREVIEW_PAUSED);
+        handled();
+        return;
+      }
       if (mod && key === "z") {
         L.playback.pause();
         if (e.shiftKey) L.editor.redo();
@@ -740,7 +789,7 @@ export function TimelineEditor({
 
   /* -------------------------------- render -------------------------------- */
 
-  const shown = preview?.proposal.ok ? preview.proposal.sequence : seq;
+  const shown = compare ? compare.sequence : preview?.proposal.ok ? preview.proposal.sequence : seq;
   const itemsByTrack = useMemo(() => {
     const m = new Map<string, ClipItem[]>();
     for (const it of Object.values(shown?.items ?? {})) {
@@ -780,6 +829,10 @@ export function TimelineEditor({
   const ticks: number[] = [];
   for (let f = 0; f <= viewFrames + tickStep; f += tickStep) ticks.push(f);
   const shuttle = playback.shuttleRate;
+  const selectedItems = [...selected].map((id) => seq.items[id]).filter((i): i is ClipItem => !!i);
+  const selectionLocked = !!selectedItems.length && selectedItems.every((i) => i.protection.locked);
+  const selectionAiLocked =
+    !!selectedItems.length && selectedItems.every((i) => i.protection.aiLocked);
 
   return (
     <div
@@ -820,7 +873,7 @@ export function TimelineEditor({
             playback.pause();
             editor.undo();
           }}
-          disabled={!editor.canUndo}
+          disabled={readOnly || !editor.canUndo}
           title={editor.nextUndoLabel ? `Undo ${editor.nextUndoLabel} (⌘Z)` : "Undo (⌘Z)"}
           testId="undo-button"
         >
@@ -834,7 +887,7 @@ export function TimelineEditor({
             playback.pause();
             editor.redo();
           }}
-          disabled={!editor.canRedo}
+          disabled={readOnly || !editor.canRedo}
           title={editor.nextRedoLabel ? `Redo ${editor.nextRedoLabel} (⇧⌘Z)` : "Redo (⇧⌘Z)"}
           testId="redo-button"
         >
@@ -852,6 +905,35 @@ export function TimelineEditor({
         </ToolButton>
         <ToolButton onClick={fit} title="Zoom to fit (\)" testId="zoom-fit">
           Fit
+        </ToolButton>
+        <span className="mx-1 h-4 w-px bg-border" />
+        <ToolButton
+          active={selectionLocked}
+          disabled={readOnly || !selectedItems.length}
+          onClick={() => setSelectionProtection("locked", !selectionLocked)}
+          title={
+            selectionLocked
+              ? "Unlock the selected clips (and their linked audio)"
+              : "Lock the selected clips (and their linked audio) — no one can change them"
+          }
+          testId="lock-toggle"
+        >
+          <Lock className="size-3.5" />
+          {selectionLocked ? "Locked" : "Lock"}
+        </ToolButton>
+        <ToolButton
+          active={selectionAiLocked}
+          disabled={readOnly || !selectedItems.length}
+          onClick={() => setSelectionProtection("aiLocked", !selectionAiLocked)}
+          title={
+            selectionAiLocked
+              ? "Allow the Director to change the selected clips again"
+              : "Protect the selected clips (and their linked audio) from Director changes"
+          }
+          testId="ai-protect-toggle"
+        >
+          <ShieldCheck className="size-3.5" />
+          {selectionAiLocked ? "AI-protected" : "AI-protect"}
         </ToolButton>
         <span
           className="ml-2 font-tc text-[11px] text-primary"
@@ -872,6 +954,18 @@ export function TimelineEditor({
           onRetry={editor.retrySave}
         />
       </div>
+
+      {compare && (
+        <div
+          data-testid="proposal-banner"
+          data-mode={compare.mode}
+          className="rounded border border-warning/50 bg-warning/10 px-3 py-1.5 text-[11px] text-foreground"
+        >
+          {compare.mode === "after"
+            ? "Showing the Director's PROPOSED cut — highlighted clips change, dashed outlines are removed. Editing is paused."
+            : "Showing the ORIGINAL cut — highlighted clips are what the proposal would change. Editing is paused."}
+        </div>
+      )}
 
       <div className="flex">
         <div className="w-[112px] shrink-0">
@@ -938,10 +1032,28 @@ export function TimelineEditor({
                         selected={selected.has(item.id)}
                         linkedSelected={!selected.has(item.id) && linkedToSelection.has(item.id)}
                         affected={!!preview && preview.linked.has(item.id)}
-                        blade={tool === "blade"}
+                        blade={tool === "blade" && !readOnly}
+                        mark={compare?.marks.get(item.id) ?? null}
+                        readOnly={readOnly}
                         onPointerDown={onItemPointerDown}
                       />
                     ))}
+                  {track &&
+                    compare?.removed
+                      .filter((r) => r.trackId === track.id)
+                      .map((r) => (
+                        <div
+                          key={`removed-${r.id}`}
+                          data-testid="proposal-removed"
+                          data-item-id={r.id}
+                          title={`Removed by the proposal: ${r.label}`}
+                          className="pointer-events-none absolute inset-y-1 rounded-sm border-2 border-dashed border-destructive/80 bg-destructive/10"
+                          style={{
+                            left: px(r.startFrame),
+                            width: Math.max(2, px(r.durationFrames)),
+                          }}
+                        />
+                      ))}
                   {track &&
                     invalid &&
                     [...ghostById.values()]
@@ -1210,6 +1322,8 @@ const TimelineItem = memo(function TimelineItem({
   linkedSelected,
   affected,
   blade,
+  mark = null,
+  readOnly = false,
   onPointerDown,
 }: {
   item: ClipItem;
@@ -1221,6 +1335,9 @@ const TimelineItem = memo(function TimelineItem({
   linkedSelected: boolean;
   affected: boolean;
   blade: boolean;
+  /** How a proposal under review affects this clip. */
+  mark?: ProposalMark | null;
+  readOnly?: boolean;
   onPointerDown: (e: ReactPointerEvent, item: ClipItem) => void;
 }) {
   const video = track.kind === "video";
@@ -1249,6 +1366,7 @@ const TimelineItem = memo(function TimelineItem({
       data-linked={linkedSelected ? "true" : "false"}
       data-affected={affected ? "linked" : undefined}
       data-locked={locked ? "true" : aiLocked ? "ai" : undefined}
+      data-proposal={mark ?? undefined}
       title={`${name} · ${item.label} · ${frameToTc(item.sourceInFrame, item.mediaRate)}–${frameToTc(item.sourceOutFrame, item.mediaRate)}${locked ? " · locked" : ""}`}
       onPointerDown={(e) => onPointerDown(e, item)}
       className={cn(
@@ -1258,17 +1376,25 @@ const TimelineItem = memo(function TimelineItem({
           : track.role === "dialogue-audio"
             ? "bg-lane-interview/70"
             : "bg-lane-audio",
-        locked
-          ? "cursor-not-allowed"
-          : blade
-            ? "cursor-crosshair"
-            : "cursor-grab active:cursor-grabbing",
+        readOnly
+          ? "cursor-default"
+          : locked
+            ? "cursor-not-allowed"
+            : blade
+              ? "cursor-crosshair"
+              : "cursor-grab active:cursor-grabbing",
         // Selected: solid ring. Linked to a selection, or carried along by a
         // gesture: dashed outline — never mistaken for a selection.
         selected && "z-10 ring-2 ring-primary",
         (linkedSelected || affected) &&
           "outline-dashed outline-1 outline-offset-[-2px] outline-primary",
         !item.enabled && "opacity-40",
+        // A proposal under review: what it changes / adds / removes, or the
+        // protected clip it was refused for.
+        mark === "changed" && "z-10 ring-2 ring-warning",
+        mark === "added" && "z-10 ring-2 ring-warning ring-offset-1 ring-offset-background",
+        mark === "removed" && "z-10 opacity-60 ring-2 ring-destructive",
+        mark === "blocked" && "z-10 ring-2 ring-destructive",
       )}
       style={{ left, width: Math.max(2, width) }}
     >
@@ -1315,7 +1441,7 @@ const TimelineItem = memo(function TimelineItem({
           {framesToSeconds(item.durationFrames, sequenceRate).toFixed(1)}s
         </span>
       )}
-      {!blade && !locked && (
+      {!blade && !locked && !readOnly && (
         <>
           <div
             data-edge="in"

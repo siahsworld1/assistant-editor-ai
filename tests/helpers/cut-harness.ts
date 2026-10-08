@@ -7,10 +7,12 @@
 //   V1: e1 0–240 · e2 240–408 · e3 408–552 · e5 552–696 · e6 696–792
 //   V2: e4 420–532 (over e3) · e7 708–784 (over e6)
 //   A1: linked sync audio, aligned with every V1 item.
-import { act, createElement, type ReactNode } from "react";
+import { act, createElement, Fragment, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { expect, vi } from "vitest";
+import { ProposalPanel } from "@/components/ae/ProposalPanel";
 import { TimelineEditor } from "@/components/ae/TimelineEditor";
+import { useProposalPreview, type ProposalPreview } from "@/lib/ae/proposal-preview";
 import { AEProvider, useAE } from "@/lib/ae/store";
 import { useTimelinePlayback, type TimelinePlayback } from "@/lib/ae/timeline-playback";
 import type { Clip, EditVersion } from "@/lib/ae/types";
@@ -70,6 +72,7 @@ export interface Disk {
 export type Ctx = ReturnType<typeof useAE>;
 export let ctx: Ctx | null = null;
 export let pb: TimelinePlayback | null = null;
+export let pr: ProposalPreview | null = null;
 export let root: Root | null = null;
 export const pauseSpy = vi.fn();
 export const togglePlaySpy = vi.fn();
@@ -82,9 +85,18 @@ export function Harness(): ReactNode {
   ctx = ae;
   const version = ae.versions.find((v) => v.id === ae.activeVersionId) ?? ae.versions[0]!;
   const clips = ae.project?.clips ?? EMPTY;
-  const playback = useTimelinePlayback(version.timeline, clips);
+  const proposals = useProposalPreview(ae.editor);
+  pr = proposals;
+  const playback = useTimelinePlayback(proposals.previewTimeline ?? version.timeline, clips);
   pb = playback;
-  return createElement(TimelineEditor, {
+  const panel = createElement(ProposalPanel, {
+    editor: ae.editor,
+    preview: proposals,
+    onBeforeChange: playback.pause,
+    demo: true,
+  });
+  const timeline = createElement(TimelineEditor, {
+    compare: proposals.compare,
     editor: ae.editor,
     playback: {
       ...playback,
@@ -103,6 +115,7 @@ export function Harness(): ReactNode {
     },
     clips,
   });
+  return createElement(Fragment, null, panel, timeline);
 }
 
 export function install(disk: Disk) {
@@ -215,6 +228,7 @@ export async function quit() {
   root = null;
   ctx = null;
   pb = null;
+  pr = null;
   document.body.innerHTML = "";
 }
 export const freshDisk = (): Disk => ({ v1: schema1File, v2: null, saves2: 0 });
