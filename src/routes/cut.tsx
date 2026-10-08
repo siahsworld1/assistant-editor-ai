@@ -75,6 +75,8 @@ function CutPage() {
   // A Director proposal under review is previewed in memory only; while its
   // "Proposed" picture is shown, playback plays the proposed cut.
   const proposals = useProposalPreview(editor);
+  // The timeline's selection — what "this clip" means in a Director instruction.
+  const [selection, setSelection] = useState<string[]>([]);
   const playback = useTimelinePlayback(proposals.previewTimeline ?? timeline, clips);
 
   const [preview, setPreview] = useState<PreviewTarget | null>(null);
@@ -240,6 +242,7 @@ function CutPage() {
             <ProposalPanel
               editor={editor}
               preview={proposals}
+              selection={selection}
               onBeforeChange={playback.pause}
               demo={import.meta.env.DEV}
             />
@@ -276,6 +279,7 @@ function CutPage() {
                 playback={playback}
                 clips={clips}
                 compare={proposals.compare}
+                onSelectionChange={setSelection}
               />
             </div>
 

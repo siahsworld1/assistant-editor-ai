@@ -95,6 +95,9 @@ export interface ProposalIssue {
   path?: string | undefined;
   message: string;
   itemIds?: string[] | undefined;
+  /** For "engine-rejected": the timeline rule that refused it (e.g. "overlap",
+   * "ripple-blocked"), so the reason can be explained plainly. */
+  engineCode?: TimelineError["code"] | undefined;
 }
 
 export type Parsed = { ok: true; proposal: EditProposal } | { ok: false; issues: ProposalIssue[] };
@@ -622,7 +625,7 @@ function engineIssue(e: TimelineError): ProposalIssue {
         : e.code === "invalid-range" || e.code === "out-of-bounds"
           ? "invalid-range"
           : "engine-rejected";
-  return { code, message: e.message, itemIds: e.itemIds };
+  return { code, message: e.message, itemIds: e.itemIds, engineCode: e.code };
 }
 
 /* ------------------------------- accept / reject ---------------------------- */

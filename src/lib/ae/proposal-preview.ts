@@ -11,6 +11,7 @@
 import { useCallback, useMemo, useState } from "react";
 import type { AcceptOutcome, ProposalIssue, ProposalOp, Review } from "@/lib/timeline/proposals";
 import { reviewProposal } from "@/lib/timeline/proposals";
+import type { Interpretation } from "@/lib/timeline/instructions";
 import type { ClipItem, Sequence } from "@/lib/timeline/types";
 import { derivedTimeline } from "@/lib/timeline/workspace";
 import type { EditorApi } from "./store";
@@ -78,6 +79,8 @@ export function useProposalPreview(editor: EditorApi) {
   const [pending, setPending] = useState<unknown>(null);
   const [mode, setMode] = useState<CompareMode>("after");
   const [notice, setNotice] = useState<ProposalNotice | null>(null);
+  /** How a typed instruction was understood (absent for demo proposals). */
+  const [interpretation, setInterpretation] = useState<Interpretation | null>(null);
 
   // Re-reviewed whenever the editor (its sequence, versions, history) changes.
   const review: Review | null = useMemo(
@@ -110,8 +113,9 @@ export function useProposalPreview(editor: EditorApi) {
     [review, mode],
   );
 
-  const propose = useCallback((raw: unknown) => {
+  const propose = useCallback((raw: unknown, understood: Interpretation | null = null) => {
     setPending(raw);
+    setInterpretation(understood);
     setMode("after");
     setNotice(null);
   }, []);
@@ -121,6 +125,7 @@ export function useProposalPreview(editor: EditorApi) {
     const out = editor.acceptProposal(pending);
     if (out.ok) {
       setPending(null);
+      setInterpretation(null);
       setNotice({
         kind: "accepted",
         message: "Accepted as one Director edit — Undo reverts all of it.",
@@ -139,18 +144,21 @@ export function useProposalPreview(editor: EditorApi) {
    * nothing to act on in this cut). */
   const inform = useCallback((message: string) => {
     setPending(null);
+    setInterpretation(null);
     setNotice({ kind: "error", message, issues: [] });
   }, []);
 
   const reject = useCallback(() => {
     if (pending === null) return;
     setPending(null);
+    setInterpretation(null);
     setNotice({ kind: "rejected", message: "Rejected — nothing in the project changed." });
   }, [pending]);
 
   return {
     /** The raw proposal under review (null when none). */
     pending,
+    interpretation,
     review,
     mode,
     setMode,

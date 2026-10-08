@@ -7,7 +7,7 @@
 //   V1: e1 0–240 · e2 240–408 · e3 408–552 · e5 552–696 · e6 696–792
 //   V2: e4 420–532 (over e3) · e7 708–784 (over e6)
 //   A1: linked sync audio, aligned with every V1 item.
-import { act, createElement, Fragment, type ReactNode } from "react";
+import { act, createElement, Fragment, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { expect, vi } from "vitest";
 import { ProposalPanel } from "@/components/ae/ProposalPanel";
@@ -86,17 +86,20 @@ export function Harness(): ReactNode {
   const version = ae.versions.find((v) => v.id === ae.activeVersionId) ?? ae.versions[0]!;
   const clips = ae.project?.clips ?? EMPTY;
   const proposals = useProposalPreview(ae.editor);
+  const [selection, setSelection] = useState<string[]>([]);
   pr = proposals;
   const playback = useTimelinePlayback(proposals.previewTimeline ?? version.timeline, clips);
   pb = playback;
   const panel = createElement(ProposalPanel, {
     editor: ae.editor,
     preview: proposals,
+    selection,
     onBeforeChange: playback.pause,
     demo: true,
   });
   const timeline = createElement(TimelineEditor, {
     compare: proposals.compare,
+    onSelectionChange: setSelection,
     editor: ae.editor,
     playback: {
       ...playback,

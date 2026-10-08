@@ -2,14 +2,16 @@
 // whether it may (and why not), Original / Proposed comparison, Accept and
 // Reject. The proposal itself lives in useProposalPreview (memory only).
 //
-// Phase 3 has no natural-language Director yet: proposals come only from the
-// clearly labeled developer demonstration (src/lib/timeline/demo-proposals.ts),
-// shown in development builds only.
-import { AlertTriangle, Check, Eye, FlaskConical, X } from "lucide-react";
+// Proposals come from a typed instruction, interpreted deterministically
+// (src/lib/timeline/instructions.ts — no AI provider), or from the clearly
+// labeled developer demonstration (development builds only).
+import { useState } from "react";
+import { AlertTriangle, Check, Eye, FlaskConical, Send, X } from "lucide-react";
 import { describeOperation, type ProposalPreview } from "@/lib/ae/proposal-preview";
 import type { EditorApi } from "@/lib/ae/store";
 import { DEMO_KINDS, demoProposal } from "@/lib/timeline/demo-proposals";
-import type { EditProposal, ProposalIssueCode } from "@/lib/timeline/proposals";
+import { EXAMPLES, interpretInstruction } from "@/lib/timeline/instructions";
+import type { EditProposal, ProposalIssue, ProposalIssueCode } from "@/lib/timeline/proposals";
 import { cn } from "@/lib/utils";
 
 const ISSUE_TITLE: Record<ProposalIssueCode, string> = {
@@ -27,25 +29,59 @@ const ISSUE_TITLE: Record<ProposalIssueCode, string> = {
   "engine-rejected": "Not allowed by the timeline rules",
 };
 
+/** Why a proposal can't go ahead, in the filmmaker's terms. */
+function plainReason(issue: ProposalIssue): string {
+  switch (issue.code) {
+    case "protected":
+      return "That clip is protected from AI editing (locked or AI-protected).";
+    case "manual-conflict":
+      return "That clip was edited by hand — the Director never changes your edits.";
+    case "ownership-unknown":
+      return "That clip's edit history can't be verified, so the Director leaves it alone.";
+    case "stale":
+      return "The cut changed after this proposal was made — propose it again.";
+    case "engine-rejected":
+      if (issue.engineCode === "ripple-blocked")
+        return "Closing this gap would affect overlapping footage on another track.";
+      if (issue.engineCode === "overlap")
+        return "That would overlap another clip on the same track.";
+      return issue.message;
+    case "invalid-range":
+      return `That edit isn't possible: ${issue.message}`;
+    default:
+      return issue.message;
+  }
+}
+
 export function ProposalPanel({
   editor,
   preview,
+  selection = [],
   onBeforeChange,
   demo,
 }: {
   editor: EditorApi;
   preview: ProposalPreview;
+  /** The clips selected in the timeline ("this clip" in an instruction). */
+  selection?: readonly string[];
   /** Called before accept / mode changes (pauses playback). */
   onBeforeChange?: () => void;
   /** Show the developer demonstration (development builds only). */
   demo: boolean;
 }) {
-  const { review, pending, notice } = preview;
+  const { review, pending, notice, interpretation } = preview;
   const proposal: EditProposal | null = review?.proposal ?? null;
   const ok = !!review?.ok;
   const stale = !!review && !review.ok && review.issues.some((i) => i.code === "stale");
+  const [text, setText] = useState("");
 
-  if (!pending && !notice && !demo) return null;
+  const submit = () => {
+    if (!text.trim()) return;
+    onBeforeChange?.();
+    const r = interpretInstruction(text, editor.proposalContext(), selection);
+    if (r.ok) preview.propose(r.proposal, r.interpretation);
+    else preview.inform(r.reason);
+  };
 
   return (
     <div className="panel p-4" data-testid="proposal-panel">
@@ -80,6 +116,32 @@ export function ProposalPanel({
           </div>
         )}
       </div>
+
+      <form
+        className="mt-2 flex items-center gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <input
+          data-testid="instruction-input"
+          aria-label="Director instruction"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={`Tell the Director… e.g. "${EXAMPLES[0]}"`}
+          disabled={pending !== null}
+          className="h-8 min-w-0 flex-1 rounded border border-border bg-surface px-2.5 text-xs placeholder:text-muted-foreground/70 focus:border-primary/60 focus:outline-none disabled:opacity-50"
+        />
+        <button
+          type="submit"
+          data-testid="instruction-submit"
+          disabled={pending !== null || !text.trim()}
+          className="inline-flex h-8 items-center gap-1 rounded border border-border px-2.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground disabled:opacity-40"
+        >
+          <Send className="size-3.5" /> Propose
+        </button>
+      </form>
 
       {notice && !pending && (
         <p
@@ -123,6 +185,32 @@ export function ProposalPanel({
               <p className="mt-1 text-xs text-muted-foreground" data-testid="proposal-summary">
                 {proposal.summary}
               </p>
+              {interpretation && (
+                <dl
+                  className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs"
+                  data-testid="instruction-interpretation"
+                >
+                  <dt className="text-muted-foreground">Understood</dt>
+                  <dd data-testid="interpretation-action">{interpretation.action}</dd>
+                  <dt className="text-muted-foreground">Clip</dt>
+                  <dd data-testid="interpretation-clips">{interpretation.clips.join(", ")}</dd>
+                  {interpretation.expected && (
+                    <>
+                      <dt className="text-muted-foreground">Expected</dt>
+                      <dd data-testid="interpretation-expected">{interpretation.expected}</dd>
+                    </>
+                  )}
+                  {interpretation.limitations.map((l, i) => (
+                    <dd
+                      key={i}
+                      className="col-start-2 text-muted-foreground"
+                      data-testid="interpretation-note"
+                    >
+                      Note: {l}
+                    </dd>
+                  ))}
+                </dl>
+              )}
               <ol
                 className="mt-2 list-decimal space-y-0.5 pl-5 text-xs"
                 data-testid="proposal-operations"
@@ -156,7 +244,8 @@ export function ProposalPanel({
                 >
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                   <span>
-                    <span className="font-medium">{ISSUE_TITLE[issue.code]}:</span> {issue.message}
+                    <span className="font-medium">{ISSUE_TITLE[issue.code]}:</span>{" "}
+                    {plainReason(issue)}
                   </span>
                 </li>
               ))}

@@ -140,6 +140,7 @@ export function TimelineEditor({
   clips,
   className,
   compare = null,
+  onSelectionChange,
 }: {
   editor: EditorApi;
   playback: TimelineTransport;
@@ -149,6 +150,8 @@ export function TimelineEditor({
    * proposed), mark the affected clips, and pause editing until it is
    * accepted or rejected. Playback and navigation keep working. */
   compare?: ProposalCompare | null;
+  /** Reports the selected clip ids (e.g. for "this clip" in a Director instruction). */
+  onSelectionChange?: (ids: string[]) => void;
 }) {
   const seq = editor.sequence;
   const readOnly = !!compare;
@@ -200,6 +203,12 @@ export function TimelineEditor({
   const endOfCut = seq ? sequenceEndFrame(seq) : 0;
   const playheadFrame = Math.min(playback.playheadFrame, Math.max(endOfCut, 0));
   const viewFrames = Math.max(endOfCut, seq?.targetFrames ?? 0, fpsOf(rate) * 5);
+
+  const onSelectionChangeRef = useRef(onSelectionChange);
+  onSelectionChangeRef.current = onSelectionChange;
+  useEffect(() => {
+    onSelectionChangeRef.current?.([...selected]);
+  }, [selected]);
 
   // Selection follows the Sequence: ids that no longer exist drop out.
   useEffect(() => {
