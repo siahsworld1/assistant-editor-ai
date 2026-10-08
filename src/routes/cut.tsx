@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { Download, Hammer, Loader2, Pause, Play } from "lucide-react";
 import { toast } from "sonner";
 import { SequencePlayer } from "@/components/ae/SequencePlayer";
-import { useState } from "react";
+import { memo, useCallback, useMemo, useRef, useState } from "react";
 import {
   CutawayOverlay,
   SourcePreviewDialog,
@@ -17,7 +17,7 @@ import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
 import { formatDuration, useAE } from "@/lib/ae/store";
 import { useTimelinePlayback } from "@/lib/ae/timeline-playback";
-import type { EditDecisionLane, UniversalTimeline } from "@/lib/ae/types";
+import type { Clip, EditDecisionLane, UniversalTimeline } from "@/lib/ae/types";
 import { buildCmx3600Edl, edlFilename, validateTimelineForExport } from "@/lib/nle/edl";
 import { buildFcpxml, fcpxmlFilename } from "@/lib/nle/fcpxml";
 import { buildXmeml, xmemlFilename } from "@/lib/nle/xmeml";
@@ -90,6 +90,12 @@ function CutPage() {
         subtitle: `${d.lane} · timeline ${d.timelineStartSeconds.toFixed(1)}s`,
       });
   };
+  const openSourceRef = useRef(openSource);
+  openSourceRef.current = openSource;
+  const onOpenSource = useCallback(
+    (d: UniversalTimeline["decisions"][number]) => openSourceRef.current(d),
+    [],
+  );
   type ExportFormat = "edl" | "xmeml" | "fcpxml";
   const FORMAT_LABEL: Record<ExportFormat, string> = {
     edl: "CMX3600 EDL",
@@ -194,6 +200,7 @@ function CutPage() {
                     overlay={playback.overlay}
                     playheadSeconds={playback.playheadSeconds}
                     playing={playback.isPlaying}
+                    rate={playback.shuttleRate > 0 ? playback.shuttleRate : 1}
                   />
                 </div>
                 <div className="mx-auto mt-1 max-w-md truncate font-tc text-[10px] text-muted-foreground">
@@ -258,51 +265,7 @@ function CutPage() {
               <div className="border-b border-border px-5 py-3 text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
                 Edit decision list
               </div>
-              <table className="w-full text-left text-xs">
-                <thead className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                  <tr className="border-b border-border">
-                    <th className="px-5 py-2 font-normal">#</th>
-                    <th className="px-3 py-2 font-normal">Lane</th>
-                    <th className="px-3 py-2 font-normal">Event</th>
-                    <th className="px-3 py-2 font-normal">Source</th>
-                    <th className="px-3 py-2 font-normal">Source in</th>
-                    <th className="px-3 py-2 font-normal">Source out</th>
-                    <th className="px-3 py-2 font-normal">Duration</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  {timeline.decisions.map((d, i) => (
-                    <tr key={d.id} className="hover:bg-accent/30">
-                      <td className="px-5 py-2 font-tc text-muted-foreground">
-                        {String(i + 1).padStart(3, "0")}
-                      </td>
-                      <td className="px-3 py-2">
-                        <span
-                          className={cn(
-                            "inline-block size-2 rounded-sm align-middle",
-                            laneMeta[d.lane].color,
-                          )}
-                        />
-                        <span className="ml-2 text-muted-foreground">{d.lane}</span>
-                      </td>
-                      <td className="px-3 py-2">{d.label}</td>
-                      <td className="px-3 py-2 font-tc text-[11px] text-muted-foreground">
-                        <button
-                          type="button"
-                          className="inline-flex items-center gap-1 hover:text-foreground"
-                          onClick={() => openSource(d)}
-                          title="Preview this edit's source range"
-                        >
-                          <Play className="size-3" /> {clipById.get(d.clipId)?.filename ?? d.clipId}
-                        </button>
-                      </td>
-                      <td className="px-3 py-2 font-tc text-muted-foreground">{d.sourceInTc}</td>
-                      <td className="px-3 py-2 font-tc text-muted-foreground">{d.sourceOutTc}</td>
-                      <td className="px-3 py-2 font-tc">{d.durationSeconds.toFixed(1)}s</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <EdlTable decisions={timeline.decisions} clips={clips} onOpen={onOpenSource} />
             </div>
           </div>
 
@@ -396,3 +359,67 @@ function CutPage() {
     </div>
   );
 }
+
+/**
+ * The edit decision list. Memoized: the CUT page re-renders on every playhead
+ * tick, and on a long cut re-rendering every row each tick was the largest
+ * per-frame cost; the rows only change when the cut does.
+ */
+const EdlTable = memo(function EdlTable({
+  decisions,
+  clips,
+  onOpen,
+}: {
+  decisions: UniversalTimeline["decisions"];
+  clips: Clip[];
+  onOpen: (d: UniversalTimeline["decisions"][number]) => void;
+}) {
+  const clipById = useMemo(() => new Map(clips.map((c) => [c.id, c])), [clips]);
+  return (
+    <table className="w-full text-left text-xs">
+      <thead className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+        <tr className="border-b border-border">
+          <th className="px-5 py-2 font-normal">#</th>
+          <th className="px-3 py-2 font-normal">Lane</th>
+          <th className="px-3 py-2 font-normal">Event</th>
+          <th className="px-3 py-2 font-normal">Source</th>
+          <th className="px-3 py-2 font-normal">Source in</th>
+          <th className="px-3 py-2 font-normal">Source out</th>
+          <th className="px-3 py-2 font-normal">Duration</th>
+        </tr>
+      </thead>
+      <tbody className="divide-y divide-border">
+        {decisions.map((d, i) => (
+          <tr key={d.id} className="hover:bg-accent/30">
+            <td className="px-5 py-2 font-tc text-muted-foreground">
+              {String(i + 1).padStart(3, "0")}
+            </td>
+            <td className="px-3 py-2">
+              <span
+                className={cn(
+                  "inline-block size-2 rounded-sm align-middle",
+                  laneMeta[d.lane].color,
+                )}
+              />
+              <span className="ml-2 text-muted-foreground">{d.lane}</span>
+            </td>
+            <td className="px-3 py-2">{d.label}</td>
+            <td className="px-3 py-2 font-tc text-[11px] text-muted-foreground">
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 hover:text-foreground"
+                onClick={() => onOpen(d)}
+                title="Preview this edit's source range"
+              >
+                <Play className="size-3" /> {clipById.get(d.clipId)?.filename ?? d.clipId}
+              </button>
+            </td>
+            <td className="px-3 py-2 font-tc text-muted-foreground">{d.sourceInTc}</td>
+            <td className="px-3 py-2 font-tc text-muted-foreground">{d.sourceOutTc}</td>
+            <td className="px-3 py-2 font-tc">{d.durationSeconds.toFixed(1)}s</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+});

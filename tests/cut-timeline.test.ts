@@ -1,271 +1,39 @@
 // 1.1 Step 6 — the interactive CUT timeline (src/components/ae/TimelineEditor.tsx)
 // driven like a user would: pointer gestures and keyboard shortcuts against
-// the REAL store (AEProvider → schema-2 workspace, history, persistence) and
-// the REAL playback hook, with a fake engine and an in-memory "disk".
-//
-// The v1.2-shaped Director cut (24 fps sequence, 23.976 media):
-//   V1: e1 0–240 · e2 240–408 · e3 408–552 · e5 552–696 · e6 696–792
-//   V2: e4 420–532 (over e3) · e7 708–784 (over e6)
-//   A1: linked sync audio, aligned with every V1 item.
-import { act, createElement, type ReactNode } from "react";
-import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+// the REAL store and the REAL playback hook (tests/helpers/cut-harness.ts).
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, describe, expect, it } from "vitest";
 import { CutawayOverlay } from "@/components/ae/SourceVisuals";
-import { TimelineEditor } from "@/components/ae/TimelineEditor";
-import { AEProvider, useAE } from "@/lib/ae/store";
-import {
-  buildPlaybackPlan,
-  useTimelinePlayback,
-  type TimelinePlayback,
-} from "@/lib/ae/timeline-playback";
-import type { Clip, EditVersion } from "@/lib/ae/types";
+import { buildPlaybackPlan } from "@/lib/ae/timeline-playback";
 import { endFrame } from "@/lib/timeline/selectors";
-import type { ClipItem, Sequence } from "@/lib/timeline/types";
 import { importedSequence } from "@/lib/timeline/workspace";
-import { directorCut, projectClips } from "./timeline/legacy-fixtures";
+import {
+  click,
+  ctx,
+  director,
+  drag,
+  freshDisk,
+  itemEl,
+  itemOf,
+  key,
+  launch,
+  partnerOf,
+  pauseSpy,
+  pb,
+  pointer,
+  ppf,
+  q,
+  quit,
+  seq,
+  settle,
+  snappingOff,
+  teardown,
+  wait,
+} from "./helpers/cut-harness";
+import { projectClips } from "./timeline/legacy-fixtures";
 
-(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-const MEDIA_ROOT = "/Users/editor/Footage";
-const ANALYSIS = "analysis-A";
-const baseline: EditVersion = {
-  id: "v1",
-  label: "Awaiting first build",
-  version: "v1.0",
-  command: "—",
-  summary: "No sequence built yet.",
-  createdAt: "—",
-  changes: [],
-  timeline: {
-    id: "tl-empty",
-    name: "Empty",
-    fps: 24,
-    targetSeconds: 30,
-    totalSeconds: 0,
-    decisions: [],
-  },
-};
-const director: EditVersion = {
-  id: "v2",
-  label: "Create a 30-second rough cut",
-  version: "v1.1",
-  command: "Create a 30-second rough cut",
-  summary: "Director build.",
-  createdAt: "18:16",
-  changes: [],
-  timeline: directorCut,
-  parentId: "v1",
-};
-const schema1File = JSON.stringify({
-  schema: 1,
-  analysisId: ANALYSIS,
-  versions: [baseline, director],
-  activeVersionId: "v2",
-  chosenStoryId: "story-01",
-  targetSeconds: 30,
-  storyboardSelectIds: [],
-  savedAt: "2026-10-06T19:00:00.000Z",
-});
-
-interface Disk {
-  v1: string | null;
-  v2: string | null;
-  saves2: number;
-  fail2?: "write-failed" | null;
-}
-
-type Ctx = ReturnType<typeof useAE>;
-let ctx: Ctx | null = null;
-let pb: TimelinePlayback | null = null;
-let root: Root | null = null;
-const pauseSpy = vi.fn();
-const EMPTY: Clip[] = [];
-
-/** The CUT timeline wired exactly as src/routes/cut.tsx wires it. */
-function Harness(): ReactNode {
-  const ae = useAE();
-  ctx = ae;
-  const version = ae.versions.find((v) => v.id === ae.activeVersionId) ?? ae.versions[0]!;
-  const clips = ae.project?.clips ?? EMPTY;
-  const playback = useTimelinePlayback(version.timeline, clips);
-  pb = playback;
-  return createElement(TimelineEditor, {
-    editor: ae.editor,
-    playback: {
-      ...playback,
-      pause: () => {
-        pauseSpy();
-        playback.pause();
-      },
-    },
-    clips,
-  });
-}
-
-function install(disk: Disk) {
-  const engineProject = {
-    id: "proj-1",
-    mediaRoot: MEDIA_ROOT,
-    analysisState: "complete",
-    analysisProgress: 100,
-    analysisId: ANALYSIS,
-    clips: projectClips.map((c) => ({
-      id: c.id,
-      filename: c.filename,
-      state: "analyzed",
-      fps: c.fps,
-      durationSeconds: c.durationSeconds,
-      hasTranscript: true,
-    })),
-    transcript: [],
-    visualEvidence: [],
-    error: null,
-  };
-  window.assistantEditorBridge = {
-    request: vi.fn(async (req: { method: string; path: string }) => {
-      const path = req.path.split("?")[0];
-      if (path === "/health")
-        return {
-          status: 200,
-          body: {
-            ok: true,
-            service: "assistant-editor-worker",
-            capabilities: {
-              health: true,
-              analyze: true,
-              selects: true,
-              stories: true,
-              build: true,
-              project: true,
-              nle: false,
-            },
-          },
-        };
-      if (path === "/restore") return { status: 200, body: { restored: true, reason: "restored" } };
-      if (path === "/project") return { status: 200, body: { project: engineProject } };
-      if (path === "/selects") return { status: 200, body: { selects: [] } };
-      if (path === "/stories") return { status: 200, body: { stories: [] } };
-      return { status: 404, body: null };
-    }),
-  };
-  const project = {
-    id: "proj-1",
-    name: "Doc",
-    client: "c",
-    format: "Documentary",
-    profile: "documentary",
-    mediaRoot: MEDIA_ROOT,
-    mediaCount: projectClips.length,
-    createdAt: "",
-    updatedAt: "",
-  };
-  window.assistantEditorDesktop = {
-    available: true as const,
-    version: "t",
-    listProjects: vi.fn(async () => ({ ok: true, projects: [project] })),
-    saveProject: vi.fn(async () => ({ ok: true, projects: [project] })),
-    deleteProject: vi.fn(async () => ({ ok: true, projects: [project] })),
-    chooseMediaFolder: vi.fn(async () => ({ ok: false })),
-    indexMedia: vi.fn(async () => ({ ok: false })),
-    exportFile: vi.fn(async () => ({ ok: false })),
-    setActiveMediaRoot: vi.fn(async () => ({ ok: true })),
-    getActiveProject: vi.fn(async () => ({ ok: true, id: "proj-1" })),
-    setActiveProject: vi.fn(async () => ({ ok: true })),
-    loadEditState: vi.fn(async () => ({ ok: true, state: disk.v1 ? JSON.parse(disk.v1) : null })),
-    saveEditState: vi.fn(async (_id: string, state: unknown) => {
-      disk.v1 = JSON.stringify(state);
-      return { ok: true };
-    }),
-    loadEditStateV2: vi.fn(async () => ({ ok: true, state: disk.v2 ? JSON.parse(disk.v2) : null })),
-    saveEditStateV2: vi.fn(async (_id: string, state: unknown) => {
-      if (disk.fail2) return { ok: false, code: disk.fail2 };
-      disk.v2 = JSON.stringify(state);
-      disk.saves2 += 1;
-      return { ok: true };
-    }),
-  };
-}
-
-async function settle(until: (c: Ctx) => boolean, ms = 8000) {
-  for (let t = 0; t < ms; t += 25) {
-    if (ctx && until(ctx)) return;
-    await act(async () => new Promise((r) => setTimeout(r, 25)));
-  }
-  throw new Error("never settled");
-}
-const wait = (ms: number) => act(async () => new Promise((r) => setTimeout(r, ms)));
-
-async function launch(disk: Disk, ready: (c: Ctx) => boolean = (c) => c.activeVersionId === "v2") {
-  install(disk);
-  const el = document.createElement("div");
-  document.body.appendChild(el);
-  root = createRoot(el);
-  await act(async () => root!.render(createElement(AEProvider, null, createElement(Harness))));
-  await settle((c) => c.project?.analysisId === ANALYSIS && !!c.editor.sequence && ready(c));
-  await wait(50);
-}
-async function quit() {
-  await act(async () => root?.unmount());
-  root = null;
-  ctx = null;
-  pb = null;
-  document.body.innerHTML = "";
-}
-const freshDisk = (): Disk => ({ v1: schema1File, v2: null, saves2: 0 });
-
-afterEach(async () => {
-  await quit();
-  delete window.assistantEditorBridge;
-  delete window.assistantEditorDesktop;
-  window.localStorage.clear();
-  pauseSpy.mockClear();
-});
-
-/* --------------------------------- driving -------------------------------- */
-
-const seq = (): Sequence => ctx!.editor.sequence!;
-function itemOf(s: Sequence, decisionId: string): ClipItem {
-  return Object.values(s.items).find((i) => i.legacy?.decision.id === decisionId)!;
-}
-const partnerOf = (s: Sequence, it: ClipItem) =>
-  s.items[s.links[it.linkGroupId!]!.itemIds.find((id) => id !== it.id)!]!;
-const ppf = () =>
-  Number(document.querySelector<HTMLElement>("[data-testid=timeline-editor]")!.dataset.pxPerFrame);
-const x = (frame: number) => frame * ppf();
-const itemEl = (id: string) =>
-  document.querySelector<HTMLElement>(`[data-testid=timeline-item][data-item-id="${id}"]`)!;
-const q = (testId: string) => document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
-
-function pointer(target: EventTarget, type: string, frame: number, init: PointerEventInit = {}) {
-  act(() => {
-    target.dispatchEvent(
-      new PointerEvent(type, { bubbles: true, button: 0, clientX: x(frame), ...init }),
-    );
-  });
-}
-/** Press on `target` at `frame`, drag to `to` (in steps), optionally release. */
-function drag(target: HTMLElement, frame: number, to: number, opts: { release?: boolean } = {}) {
-  pointer(target, "pointerdown", frame);
-  const steps = 4;
-  for (let i = 1; i <= steps; i += 1)
-    pointer(window, "pointermove", frame + ((to - frame) * i) / steps);
-  if (opts.release !== false) pointer(window, "pointerup", to);
-}
-function click(target: HTMLElement, frame: number, init: PointerEventInit = {}) {
-  pointer(target, "pointerdown", frame, init);
-  pointer(window, "pointerup", frame, init);
-}
-function key(k: string, init: KeyboardEventInit = {}, target: EventTarget = window) {
-  act(() => {
-    target.dispatchEvent(
-      new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true, ...init }),
-    );
-  });
-}
-function snappingOff() {
-  if (q("timeline-editor")!.dataset.snapping === "on") key("s");
-  expect(q("timeline-editor")!.dataset.snapping).toBe("off");
-}
+afterEach(teardown);
 
 /* ---------------------------------- tests --------------------------------- */
 

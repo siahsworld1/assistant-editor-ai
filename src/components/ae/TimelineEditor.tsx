@@ -10,21 +10,40 @@
 //   - an edit pauses playback; the playback hook keeps the playhead on the
 //     same sequence frame when the plan is rebuilt.
 // Positions are integer sequence frames throughout; pixels only for drawing.
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+//
+// Rendering: clip blocks are memoized, and every handler reads the latest
+// state through one ref, so a pointer move or a playhead tick re-renders only
+// the blocks whose props changed (the dragged ones), not the whole timeline.
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
 import {
   AlertTriangle,
   Check,
+  EyeOff,
   Link2,
   Loader2,
+  Lock,
   Magnet,
   MousePointer2,
   Redo2,
   Scissors,
+  ShieldCheck,
   Undo2,
+  VolumeX,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
 import { Filmstrip } from "@/components/ae/SourceVisuals";
+import { isTypingTarget } from "@/lib/ae/keyboard";
 import type { EditorApi } from "@/lib/ae/store";
 import type { TimelinePlayback } from "@/lib/ae/timeline-playback";
 import type { Clip } from "@/lib/ae/types";
@@ -42,16 +61,9 @@ import {
   type SnapOptions,
 } from "@/lib/timeline/gestures";
 import { endFrame, expandLinked, sequenceEndFrame } from "@/lib/timeline/selectors";
-import {
-  fpsOf,
-  frameToTc,
-  framesToSeconds,
-  secondsToFrames,
-  tcClockSeconds,
-} from "@/lib/timeline/time";
+import { fpsOf, frameToTc, framesToSeconds, tcClockSeconds } from "@/lib/timeline/time";
 import { makeTransaction } from "@/lib/timeline/transactions";
-import type { ClipItem, Command, Sequence, Track } from "@/lib/timeline/types";
-import { isTypingTarget } from "@/lib/ae/keyboard";
+import type { ClipItem, Command, FrameRate, Sequence, Track } from "@/lib/timeline/types";
 import { cn } from "@/lib/utils";
 
 /** Rows top to bottom, as in an NLE. */
@@ -65,28 +77,59 @@ const ROW_LABEL: Record<(typeof ROWS)[number], string> = {
 /** A pointer must travel this far before a press becomes a drag. */
 const DRAG_START_PX = 3;
 /** Width of the trim handles at each end of a clip. */
-const HANDLE_PX = 6;
+const HANDLE_PX = 8;
+/** Dragging within this distance of the timeline's edge scrolls it. */
+export const AUTO_SCROLL_EDGE_PX = 32;
+/** Fastest auto-scroll, in pixels per animation frame. */
+const AUTO_SCROLL_MAX_PX = 24;
 const FALLBACK_WIDTH = 960;
 const MIN_PX_PER_FRAME = 0.02;
 const MAX_PX_PER_FRAME = 24;
+const ZOOM_STEP = 1.5;
 
 type Tool = "select" | "blade";
 
+/** What the timeline needs from the preview transport. */
+export type TimelineTransport = Pick<
+  TimelinePlayback,
+  | "playheadSeconds"
+  | "playheadFrame"
+  | "endFrame"
+  | "isPlaying"
+  | "shuttleRate"
+  | "seek"
+  | "seekFrame"
+  | "pause"
+  | "togglePlay"
+  | "shuttle"
+>;
+
 interface Preview {
+  kind: "move" | "trim";
   proposal: Proposal;
   /** Where the dragged items would go, drawn even when the engine refuses. */
   ghosts: Array<{ id: string; start: number; end: number }>;
+  /** Items the gesture moves only because they are linked to a dragged one. */
+  linked: ReadonlySet<string>;
+  /** The item the readout describes, its edge, and the frame offset. */
+  itemId: string;
+  edge: "in" | "out" | null;
+  dxFrames: number;
+  edgeFrame: number;
 }
 
 interface Gesture {
-  kind: "move" | "trim";
-  startX: number;
+  /** The viewport's on-screen left edge and width, read once at press time. */
+  left: number;
+  width: number;
+  startClientX: number;
+  startFrame: number;
+  lastClientX: number;
+  lastDx: number | null;
   dragging: boolean;
-  itemIds: string[];
-  itemId: string;
-  edge: "in" | "out";
   propose: (dxFrames: number) => Preview;
   latest: Preview | null;
+  autoScroll: number;
 }
 
 export function TimelineEditor({
@@ -96,7 +139,7 @@ export function TimelineEditor({
   className,
 }: {
   editor: EditorApi;
-  playback: Pick<TimelinePlayback, "playheadSeconds" | "seek" | "pause">;
+  playback: TimelineTransport;
   clips: Clip[];
   className?: string;
 }) {
@@ -115,13 +158,39 @@ export function TimelineEditor({
   const [message, setMessage] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const contentRef = useRef<HTMLDivElement | null>(null);
   const gestureRef = useRef<Gesture | null>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
+  /** Set by keyboard navigation: bring the playhead into view once. */
+  const revealRef = useRef(false);
+  /** Set by zooming: the frame to keep under the same on-screen x. */
+  const anchorRef = useRef<{ frame: number; px: number } | null>(null);
+  /** The scroll viewport's width and offset, kept up to date by a
+   * ResizeObserver and scroll events. Reading them from the DOM after a render
+   * would force a synchronous layout of the whole page on every playhead tick,
+   * zoom step and drag move — the main cost on long sequences. */
+  const viewRef = useRef({ width: FALLBACK_WIDTH, scrollLeft: 0, contentWidth: 0 });
+  const setScroll = useCallback((left: number) => {
+    const { contentWidth, width } = viewRef.current;
+    const v = Math.max(0, Math.min(left, contentWidth ? contentWidth - width : left));
+    viewRef.current.scrollLeft = v;
+    if (scrollRef.current) scrollRef.current.scrollLeft = v;
+  }, []);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    viewRef.current.width = el.clientWidth || FALLBACK_WIDTH; // once, on mount
+    if (typeof ResizeObserver !== "function") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (w) viewRef.current.width = w;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  const rate = seq?.rate ?? { num: 24, den: 1 };
-  const playheadFrame = secondsToFrames(playback.playheadSeconds, rate);
+  const rate: FrameRate = seq?.rate ?? { num: 24, den: 1 };
   const endOfCut = seq ? sequenceEndFrame(seq) : 0;
+  const playheadFrame = Math.min(playback.playheadFrame, Math.max(endOfCut, 0));
   const viewFrames = Math.max(endOfCut, seq?.targetFrames ?? 0, fpsOf(rate) * 5);
 
   // Selection follows the Sequence: ids that no longer exist drop out.
@@ -133,54 +202,147 @@ export function TimelineEditor({
     });
   }, [seq]);
 
+  /* ------------------------- latest state, for handlers ------------------------ */
+
+  const latest = useRef({
+    seq,
+    selected,
+    tool,
+    snapping,
+    pxPerFrame,
+    playheadFrame,
+    endOfCut,
+    editor,
+    playback,
+    media,
+  });
+  latest.current = {
+    seq,
+    selected,
+    tool,
+    snapping,
+    pxPerFrame,
+    playheadFrame,
+    endOfCut,
+    editor,
+    playback,
+    media,
+  };
+
   /* --------------------------------- zoom --------------------------------- */
 
+  const clampZoom = (p: number) => Math.min(MAX_PX_PER_FRAME, Math.max(MIN_PX_PER_FRAME, p));
+  const viewportWidth = () => viewRef.current.width;
+
   const fit = useCallback(() => {
-    const width = scrollRef.current?.clientWidth || FALLBACK_WIDTH;
-    const frames = Math.max(endOfCut, seq?.targetFrames ?? 0, 1);
-    setPxPerFrame(Math.min(MAX_PX_PER_FRAME, Math.max(MIN_PX_PER_FRAME, (width - 24) / frames)));
-    if (scrollRef.current) scrollRef.current.scrollLeft = 0;
-  }, [endOfCut, seq?.targetFrames]);
-  const zoom = useCallback(
-    (factor: number) =>
-      setPxPerFrame((p) => Math.min(MAX_PX_PER_FRAME, Math.max(MIN_PX_PER_FRAME, p * factor))),
-    [],
-  );
+    const L = latest.current;
+    const frames = Math.max(L.endOfCut, L.seq?.targetFrames ?? 0, 1);
+    anchorRef.current = { frame: 0, px: 0 };
+    setPxPerFrame(clampZoom((viewportWidth() - 24) / frames));
+  }, []);
+
+  /** Zooms keeping one frame fixed on screen: the pointer's frame when given,
+   * else the playhead when it is in view, else the middle of the view. */
+  const zoomBy = useCallback((factor: number, clientX?: number) => {
+    const el = scrollRef.current;
+    const L = latest.current;
+    const old = L.pxPerFrame;
+    const width = viewportWidth();
+    const scrollLeft = viewRef.current.scrollLeft;
+    let anchor: { frame: number; px: number };
+    if (clientX !== undefined) {
+      const px = clientX - (el?.getBoundingClientRect().left ?? 0);
+      anchor = { frame: (scrollLeft + px) / old, px };
+    } else {
+      const playheadPx = L.playheadFrame * old - scrollLeft;
+      anchor =
+        playheadPx >= 0 && playheadPx <= width
+          ? { frame: L.playheadFrame, px: playheadPx }
+          : { frame: (scrollLeft + width / 2) / old, px: width / 2 };
+    }
+    anchorRef.current = anchor;
+    setPxPerFrame(clampZoom(old * factor));
+  }, []);
+
+  useLayoutEffect(() => {
+    const a = anchorRef.current;
+    if (!a) return;
+    anchorRef.current = null;
+    setScroll(a.frame * pxPerFrame - a.px);
+  }, [pxPerFrame, setScroll]);
+
   // Fit when a different sequence is shown (not after every edit: the view
   // must not jump under the pointer).
   const seqId = seq?.id ?? null;
-  const fitRef = useRef(fit);
-  fitRef.current = fit;
   useLayoutEffect(() => {
-    fitRef.current();
-  }, [seqId]);
+    fit();
+  }, [seqId, fit]);
+
+  // Pinch / ⌘-wheel zooms around the pointer; a plain wheel scrolls.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      zoomBy(Math.exp(-e.deltaY * 0.01), e.clientX);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [zoomBy]);
+
+  // Keep the playhead in view while playing / shuttling, and after keyboard
+  // navigation. Never during a drag (the view must stay put under the pointer).
+  useLayoutEffect(() => {
+    if (!scrollRef.current || gestureRef.current) return;
+    const moving = playback.isPlaying || playback.shuttleRate !== 0;
+    if (!moving && !revealRef.current) return;
+    revealRef.current = false;
+    const { width, scrollLeft } = viewRef.current;
+    const x = playheadFrame * pxPerFrame;
+    const margin = Math.min(48, width / 8);
+    const reverse = playback.shuttleRate < 0;
+    if (x > scrollLeft + width - margin) {
+      // Playing forward: page ahead, leaving the next stretch in view. A jump
+      // (End, ⇧→): bring it in near the right, keeping what led up to it.
+      setScroll(moving && !reverse ? x - width * 0.15 : x - width * 0.85);
+    } else if (x < scrollLeft + (moving ? 0 : margin)) {
+      setScroll(moving && reverse ? x - width * 0.85 : x - width * 0.15);
+    }
+  }, [playheadFrame, pxPerFrame, playback.isPlaying, playback.shuttleRate, setScroll]);
 
   /* ------------------------------ coordinates ----------------------------- */
 
+  /** The viewport's left edge on screen (one layout read, at press time). */
+  const viewportLeft = () => scrollRef.current?.getBoundingClientRect().left ?? 0;
+  /** The (fractional) sequence frame under a client x, scroll included. */
+  const frameAtExact = useCallback(
+    (clientX: number, left: number = viewportLeft()) =>
+      Math.max(0, (clientX - left + viewRef.current.scrollLeft) / latest.current.pxPerFrame),
+    [],
+  );
   const frameAt = useCallback(
-    (clientX: number) => {
-      const left = contentRef.current?.getBoundingClientRect().left ?? 0;
-      return Math.max(0, Math.round((clientX - left) / pxPerFrame));
-    },
-    [pxPerFrame],
+    (clientX: number) => Math.round(frameAtExact(clientX)),
+    [frameAtExact],
   );
-  const snapOptions = useCallback(
-    (): SnapOptions => ({
-      enabled: snapping,
-      playheadFrame,
-      threshold: snapThresholdFrames(pxPerFrame),
-    }),
-    [snapping, playheadFrame, pxPerFrame],
-  );
+  const snapOptions = (): SnapOptions => {
+    const L = latest.current;
+    return {
+      enabled: L.snapping,
+      playheadFrame: L.playheadFrame,
+      threshold: snapThresholdFrames(L.pxPerFrame),
+    };
+  };
 
   /* -------------------------------- commits ------------------------------- */
 
   const commit = useCallback(
     (label: string, build: (ids: EditorApi["ids"]) => TypedCommand[]): boolean => {
-      playback.pause(); // never edit under a playing preview
-      const ids = editor.ids;
+      const { editor: ed, playback: pb } = latest.current;
+      pb.pause(); // never edit under a playing preview
+      const ids = ed.ids;
       const cmds = build(ids) as unknown as Command[]; // typed builders → the log's shape
-      const out = editor.dispatchTransaction(makeTransaction(ids, label, "manual", cmds));
+      const out = ed.dispatchTransaction(makeTransaction(ids, label, "manual", cmds));
       if (!out.ok) {
         setMessage(out.error.message);
         return false;
@@ -188,17 +350,66 @@ export function TimelineEditor({
       setMessage(null);
       return true;
     },
-    [editor, playback],
+    [],
   );
 
   /* ------------------------------- gestures ------------------------------- */
 
   const endGesture = useCallback(() => {
+    const g = gestureRef.current;
+    if (g?.autoScroll) cancelAnimationFrame(g.autoScroll);
     cleanupRef.current?.();
     cleanupRef.current = null;
     gestureRef.current = null;
     setPreview(null);
   }, []);
+
+  /** Re-proposes for the pointer's current frame (only when it changed). */
+  const updateGesture = useCallback(
+    (g: Gesture) => {
+      const dx = Math.round(frameAtExact(g.lastClientX, g.left) - g.startFrame);
+      if (dx === g.lastDx) return;
+      g.lastDx = dx;
+      g.latest = g.propose(dx);
+      setPreview(g.latest);
+    },
+    [frameAtExact],
+  );
+
+  /** While the pointer is near either edge, scroll and keep proposing. */
+  const autoScroll = useCallback(
+    (g: Gesture) => {
+      if (!scrollRef.current || typeof requestAnimationFrame !== "function" || !g.width) return;
+      const depth = () =>
+        Math.max(
+          AUTO_SCROLL_EDGE_PX - (g.lastClientX - g.left),
+          AUTO_SCROLL_EDGE_PX - (g.left + g.width - g.lastClientX),
+        );
+      if (depth() <= 0) {
+        if (g.autoScroll) cancelAnimationFrame(g.autoScroll);
+        g.autoScroll = 0;
+        return;
+      }
+      if (g.autoScroll) return;
+      const step = () => {
+        if (gestureRef.current !== g) return;
+        const d = depth();
+        if (d <= 0) {
+          g.autoScroll = 0;
+          return;
+        }
+        const towardsRight = g.lastClientX - g.left > g.width / 2;
+        const speed = Math.ceil(
+          (Math.min(d, AUTO_SCROLL_EDGE_PX) / AUTO_SCROLL_EDGE_PX) * AUTO_SCROLL_MAX_PX,
+        );
+        setScroll(viewRef.current.scrollLeft + (towardsRight ? speed : -speed));
+        updateGesture(g);
+        g.autoScroll = requestAnimationFrame(step);
+      };
+      g.autoScroll = requestAnimationFrame(step);
+    },
+    [setScroll, updateGesture],
+  );
 
   const beginGesture = useCallback(
     (g: Gesture) => {
@@ -206,12 +417,11 @@ export function TimelineEditor({
       const onMove = (ev: PointerEvent) => {
         const cur = gestureRef.current;
         if (!cur) return;
-        const dx = ev.clientX - cur.startX;
-        if (!cur.dragging && Math.abs(dx) < DRAG_START_PX) return;
+        cur.lastClientX = ev.clientX;
+        if (!cur.dragging && Math.abs(ev.clientX - cur.startClientX) < DRAG_START_PX) return;
         cur.dragging = true;
-        const next = cur.propose(Math.round(dx / pxPerFrame));
-        cur.latest = next;
-        setPreview(next);
+        updateGesture(cur);
+        autoScroll(cur);
       };
       const onUp = () => {
         const cur = gestureRef.current;
@@ -222,7 +432,7 @@ export function TimelineEditor({
           setMessage(p.error.message);
           return;
         }
-        if (p.sequence === seqRef.current) return; // no change
+        if (p.sequence === latest.current.seq) return; // no change
         commit(p.label, (ids) => [p.build(ids)]);
       };
       window.addEventListener("pointermove", onMove);
@@ -234,169 +444,263 @@ export function TimelineEditor({
         window.removeEventListener("pointercancel", endGesture);
       };
     },
-    [commit, endGesture, pxPerFrame],
+    [autoScroll, commit, endGesture, updateGesture],
   );
   useEffect(() => () => cleanupRef.current?.(), []);
 
-  const seqRef = useRef(seq);
-  seqRef.current = seq;
-
-  const onItemPointerDown = (e: React.PointerEvent, item: ClipItem) => {
-    if (!seq || e.button !== 0) return;
-    e.stopPropagation();
-    if (tool === "blade") {
-      const at = bladeFrame(seq, item.id, frameAt(e.clientX), snapOptions());
-      if (at === null) {
-        setMessage("Click inside a clip to cut it.");
+  const onItemPointerDown = useCallback(
+    (e: ReactPointerEvent, item: ClipItem) => {
+      const L = latest.current;
+      const s = L.seq;
+      if (!s || e.button !== 0) return;
+      e.stopPropagation();
+      if (L.tool === "blade") {
+        const at = bladeFrame(s, item.id, frameAt(e.clientX), snapOptions());
+        if (at === null) {
+          setMessage("Click inside a clip to cut it.");
+          return;
+        }
+        commit("Blade", (ids) => [commands.split(ids, s, item.id, at)]);
         return;
       }
-      commit("Blade", (ids) => [commands.split(ids, seq, item.id, at)]);
-      return;
-    }
-    const edgeAttr = (e.target as HTMLElement).closest?.("[data-edge]")?.getAttribute("data-edge");
-    const edge = edgeAttr === "in" || edgeAttr === "out" ? edgeAttr : null;
+      const edgeAttr = (e.target as HTMLElement)
+        .closest?.("[data-edge]")
+        ?.getAttribute("data-edge");
+      const edge = edgeAttr === "in" || edgeAttr === "out" ? edgeAttr : null;
+      const toggle = e.shiftKey || e.metaKey || e.ctrlKey;
 
-    let ids: string[];
-    if (e.shiftKey) {
-      const next = new Set(selected);
-      if (next.has(item.id)) next.delete(item.id);
-      else next.add(item.id);
-      setSelected(next);
-      if (!next.has(item.id)) return; // shift-click deselected it: no drag
-      ids = [...next];
-    } else if (selected.has(item.id) && !edge) {
-      ids = [...selected];
-    } else {
-      setSelected(new Set([item.id]));
-      ids = [item.id];
-    }
-    setMessage(null);
-    const snap = snapOptions();
-
-    if (edge) {
-      const original = edge === "in" ? item.startFrame : endFrame(item);
-      const partners = expandLinked(seq, [item.id]);
-      beginGesture({
-        kind: "trim",
-        startX: e.clientX,
+      let ids: string[];
+      if (toggle) {
+        const next = new Set(L.selected);
+        if (next.has(item.id)) next.delete(item.id);
+        else next.add(item.id);
+        setSelected(next);
+        if (!next.has(item.id)) return; // toggled off: no drag
+        ids = edge ? [item.id] : [...next];
+      } else if (L.selected.has(item.id) && !edge) {
+        ids = [...L.selected];
+      } else {
+        setSelected(new Set([item.id]));
+        ids = [item.id];
+      }
+      setMessage(null);
+      const snap = snapOptions();
+      const media = L.media;
+      const rect = scrollRef.current?.getBoundingClientRect();
+      const left = rect?.left ?? 0;
+      const base: Omit<Gesture, "propose"> = {
+        left,
+        width: rect?.width || viewRef.current.width,
+        startClientX: e.clientX,
+        startFrame: frameAtExact(e.clientX, left),
+        lastClientX: e.clientX,
+        lastDx: null,
         dragging: false,
-        itemIds: [item.id],
-        itemId: item.id,
-        edge,
         latest: null,
+        autoScroll: 0,
+      };
+
+      if (edge) {
+        const original = edge === "in" ? item.startFrame : endFrame(item);
+        const partners = expandLinked(s, [item.id]);
+        const linked = new Set(partners.filter((id) => id !== item.id));
+        beginGesture({
+          ...base,
+          propose: (dx) => {
+            const proposal = proposeTrim(s, item.id, edge, original + dx, snap, media);
+            const edgeFrame = proposal.edgeFrame;
+            return {
+              kind: "trim",
+              proposal,
+              linked,
+              itemId: item.id,
+              edge,
+              dxFrames: edgeFrame - original,
+              edgeFrame,
+              ghosts: partners.map((id) => {
+                const it = s.items[id]!;
+                return edge === "in"
+                  ? { id, start: Math.min(edgeFrame, endFrame(it) - 1), end: endFrame(it) }
+                  : { id, start: it.startFrame, end: Math.max(edgeFrame, it.startFrame + 1) };
+              }),
+            };
+          },
+        });
+        return;
+      }
+      const moving = expandLinked(s, ids);
+      const direct = new Set(ids);
+      const linked = new Set(moving.filter((id) => !direct.has(id)));
+      beginGesture({
+        ...base,
         propose: (dx) => {
-          const proposal = proposeTrim(seq, item.id, edge, original + dx, snap, media);
-          const edgeFrame = proposal.edgeFrame;
+          const proposal = proposeMove(s, ids, dx, snap, media);
           return {
+            kind: "move",
             proposal,
-            ghosts: partners.map((id) => {
-              const it = seq.items[id]!;
-              return edge === "in"
-                ? { id, start: Math.min(edgeFrame, endFrame(it) - 1), end: endFrame(it) }
-                : { id, start: it.startFrame, end: Math.max(edgeFrame, it.startFrame + 1) };
+            linked,
+            itemId: item.id,
+            edge: null,
+            dxFrames: proposal.deltaFrames,
+            edgeFrame: item.startFrame + proposal.deltaFrames,
+            ghosts: moving.map((id) => {
+              const it = s.items[id]!;
+              return {
+                id,
+                start: it.startFrame + proposal.deltaFrames,
+                end: endFrame(it) + proposal.deltaFrames,
+              };
             }),
           };
         },
       });
-      return;
-    }
-    const moving = expandLinked(seq, ids);
-    beginGesture({
-      kind: "move",
-      startX: e.clientX,
-      dragging: false,
-      itemIds: ids,
-      itemId: item.id,
-      edge: "in",
-      latest: null,
-      propose: (dx) => {
-        const proposal = proposeMove(seq, ids, dx, snap, media);
-        return {
-          proposal,
-          ghosts: moving.map((id) => {
-            const it = seq.items[id]!;
-            return {
-              id,
-              start: it.startFrame + proposal.deltaFrames,
-              end: endFrame(it) + proposal.deltaFrames,
-            };
-          }),
-        };
-      },
-    });
-  };
+    },
+    [beginGesture, commit, frameAt, frameAtExact],
+  );
 
-  const onTrackPointerDown = (e: React.PointerEvent) => {
-    if (e.button !== 0 || e.shiftKey) return;
+  const onTrackPointerDown = useCallback((e: ReactPointerEvent) => {
+    if (e.button !== 0 || e.shiftKey || e.metaKey || e.ctrlKey) return;
     setSelected(new Set()); // empty space deselects
-  };
+  }, []);
 
-  const onRulerPointerDown = (e: React.PointerEvent) => {
-    if (e.button !== 0 || !seq) return;
-    const seekTo = (clientX: number) =>
-      playback.seek(framesToSeconds(Math.min(frameAt(clientX), endOfCut), rate));
-    seekTo(e.clientX);
-    const onMove = (ev: PointerEvent) => seekTo(ev.clientX);
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  };
+  /** Scrubbing: one seek per animation frame, on whole frames. */
+  const onRulerPointerDown = useCallback(
+    (e: ReactPointerEvent) => {
+      const L = latest.current;
+      if (e.button !== 0 || !L.seq) return;
+      if (L.playback.isPlaying || L.playback.shuttleRate !== 0) L.playback.pause();
+      let pendingX: number | null = null;
+      let raf = 0;
+      const seekTo = (clientX: number) =>
+        latest.current.playback.seekFrame(Math.min(frameAt(clientX), latest.current.endOfCut));
+      seekTo(e.clientX);
+      const onMove = (ev: PointerEvent) => {
+        pendingX = ev.clientX;
+        if (raf || typeof requestAnimationFrame !== "function") {
+          if (!raf) seekTo(ev.clientX);
+          return;
+        }
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          if (pendingX !== null) seekTo(pendingX);
+        });
+      };
+      const onUp = (ev: PointerEvent) => {
+        if (raf) cancelAnimationFrame(raf);
+        seekTo(ev.clientX);
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [frameAt],
+  );
 
   /* ------------------------------- keyboard ------------------------------- */
 
-  const keyState = useRef({ seq, selected, playheadFrame, editor, commit, endGesture });
-  keyState.current = { seq, selected, playheadFrame, editor, commit, endGesture };
-
   useEffect(() => {
+    const stepPlayhead = (to: number) => {
+      const { playback: pb, endOfCut: end } = latest.current;
+      if (pb.isPlaying || pb.shuttleRate !== 0) pb.pause();
+      revealRef.current = true;
+      pb.seekFrame(Math.max(0, Math.min(to, end)));
+    };
+    const nudge = (frames: number) => {
+      const { seq: s, selected: sel } = latest.current;
+      if (!s || !sel.size) {
+        setMessage("Select a clip to nudge it.");
+        return;
+      }
+      const targets = linkRepresentatives(s, sel);
+      commit(
+        Math.abs(frames) > 1 ? `Nudge ${frames > 0 ? "+" : "−"}${Math.abs(frames)}` : "Nudge",
+        (ids) => [commands.move(ids, targets, frames)],
+      );
+    };
+
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || isTypingTarget(e.target)) return;
-      const k = keyState.current;
+      const L = latest.current;
       const mod = e.metaKey || e.ctrlKey;
-      const key = e.key.toLowerCase();
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       const handled = () => e.preventDefault();
 
-      if (key === "escape") {
+      if (key === "Escape") {
         if (gestureRef.current) {
-          k.endGesture();
+          endGesture();
           setMessage("Cancelled.");
-        } else if (tool === "blade") setTool("select");
+        } else if (L.tool === "blade") setTool("select");
         else setSelected(new Set());
         handled();
         return;
       }
       if (gestureRef.current) return; // nothing else mid-drag
       if (mod && key === "z") {
-        playback.pause();
-        if (e.shiftKey) k.editor.redo();
-        else k.editor.undo();
+        L.playback.pause();
+        if (e.shiftKey) L.editor.redo();
+        else L.editor.undo();
         handled();
         return;
       }
       if (mod && key === "k") {
-        if (!k.seq) return;
-        const targets = splitAtPlayheadTargets(k.seq, k.selected, k.playheadFrame);
         handled();
+        if (!L.seq) return;
+        const targets = splitAtPlayheadTargets(L.seq, L.selected, L.playheadFrame);
         if (!targets.length) {
           setMessage("Nothing to split at the playhead.");
           return;
         }
-        const seqNow = k.seq;
-        k.commit(targets.length > 1 ? "Split clips at playhead" : "Split at playhead", (ids) =>
-          targets.map((id) => commands.split(ids, seqNow, id, k.playheadFrame)),
+        const s = L.seq;
+        const at = L.playheadFrame;
+        commit(targets.length > 1 ? "Split clips at playhead" : "Split at playhead", (ids) =>
+          targets.map((id) => commands.split(ids, s, id, at)),
         );
         return;
       }
-      if (mod || e.altKey) return;
-      if (key === "delete" || key === "backspace") {
-        if (!k.seq || !k.selected.size) return;
-        const targets = linkRepresentatives(k.seq, k.selected);
+      if (mod) return;
+
+      // Transport and navigation.
+      if (key === " " && !e.altKey) {
+        L.playback.togglePlay();
+        handled();
+        return;
+      }
+      if ((key === "ArrowLeft" || key === "ArrowRight") && !e.altKey) {
+        const n = (e.shiftKey ? 10 : 1) * (key === "ArrowLeft" ? -1 : 1);
+        stepPlayhead(L.playheadFrame + n);
+        handled();
+        return;
+      }
+      if ((key === "ArrowLeft" || key === "ArrowRight") && e.altKey) {
+        nudge((e.shiftKey ? 10 : 1) * (key === "ArrowLeft" ? -1 : 1));
+        handled();
+        return;
+      }
+      if (key === "Home" || key === "End") {
+        stepPlayhead(key === "Home" ? 0 : L.endOfCut);
+        handled();
+        return;
+      }
+      if (e.altKey) return;
+      if (key === "j" || key === "l") {
+        L.playback.shuttle(key === "j" ? -1 : 1);
+        handled();
+        return;
+      }
+      if (key === "k") {
+        L.playback.pause();
+        handled();
+        return;
+      }
+
+      if (key === "Delete" || key === "Backspace") {
+        if (!L.seq || !L.selected.size) return;
+        const targets = linkRepresentatives(L.seq, L.selected);
         handled();
         const ok = e.shiftKey
-          ? k.commit("Ripple delete", (ids) => [commands.rippleDelete(ids, targets)])
-          : k.commit("Lift", (ids) => [commands.delete(ids, targets)]);
+          ? commit("Ripple delete", (ids) => [commands.rippleDelete(ids, targets)])
+          : commit("Lift", (ids) => [commands.delete(ids, targets)]);
         if (ok) setSelected(new Set());
         return;
       }
@@ -410,45 +714,72 @@ export function TimelineEditor({
         setSnapping((s) => !s);
         handled();
       } else if (key === "=" || key === "+") {
-        zoom(1.5);
+        zoomBy(ZOOM_STEP);
         handled();
       } else if (key === "-") {
-        zoom(1 / 1.5);
+        zoomBy(1 / ZOOM_STEP);
         handled();
       } else if (key === "\\") {
-        fitRef.current();
+        fit();
         handled();
       }
     };
+    // A focused button must not also "click" on the Space we just used.
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === " " && !isTypingTarget(e.target) && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+      }
+    };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [tool, playback, zoom]);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [commit, endGesture, fit, zoomBy]);
 
   /* -------------------------------- render -------------------------------- */
 
-  if (!seq) {
+  const shown = preview?.proposal.ok ? preview.proposal.sequence : seq;
+  const itemsByTrack = useMemo(() => {
+    const m = new Map<string, ClipItem[]>();
+    for (const it of Object.values(shown?.items ?? {})) {
+      const list = m.get(it.trackId);
+      if (list) list.push(it);
+      else m.set(it.trackId, [it]);
+    }
+    return m;
+  }, [shown]);
+  const linkedToSelection = useMemo(
+    () =>
+      seq
+        ? new Set(
+            expandLinked(
+              seq,
+              [...selected].filter((id) => seq.items[id]),
+            ),
+          )
+        : new Set<string>(),
+    [seq, selected],
+  );
+
+  if (!seq || !shown) {
     return (
       <div className={cn("text-xs text-muted-foreground", className)}>No sequence to edit.</div>
     );
   }
 
-  const shown = preview?.proposal.ok ? preview.proposal.sequence : seq;
   const ghostById = new Map((preview?.ghosts ?? []).map((g) => [g.id, g]));
   const invalid = !!preview && !preview.proposal.ok;
   const trackByName = new Map(seq.tracks.map((t) => [t.name, t]));
   const contentWidth = Math.ceil(viewFrames * pxPerFrame) + 160;
-  const linkedToSelection = new Set(
-    expandLinked(
-      seq,
-      [...selected].filter((id) => seq.items[id]),
-    ),
-  );
+  viewRef.current.contentWidth = contentWidth;
   const snappedTo = preview?.proposal.snappedTo ?? null;
   const px = (frames: number) => frames * pxPerFrame;
   const tickStep = rulerStep(pxPerFrame, fpsOf(rate));
   const ticks: number[] = [];
   for (let f = 0; f <= viewFrames + tickStep; f += tickStep) ticks.push(f);
-  const status = editor.persistence;
+  const shuttle = playback.shuttleRate;
 
   return (
     <div
@@ -513,10 +844,10 @@ export function TimelineEditor({
           )}
         </ToolButton>
         <span className="mx-1 h-4 w-px bg-border" />
-        <ToolButton onClick={() => zoom(1 / 1.5)} title="Zoom out (−)" testId="zoom-out">
+        <ToolButton onClick={() => zoomBy(1 / ZOOM_STEP)} title="Zoom out (−)" testId="zoom-out">
           <ZoomOut className="size-3.5" />
         </ToolButton>
-        <ToolButton onClick={() => zoom(1.5)} title="Zoom in (=)" testId="zoom-in">
+        <ToolButton onClick={() => zoomBy(ZOOM_STEP)} title="Zoom in (=)" testId="zoom-in">
           <ZoomIn className="size-3.5" />
         </ToolButton>
         <ToolButton onClick={fit} title="Zoom to fit (\)" testId="zoom-fit">
@@ -525,45 +856,53 @@ export function TimelineEditor({
         <span
           className="ml-2 font-tc text-[11px] text-primary"
           data-testid="playhead-tc"
-          title="Playhead (sequence timecode)"
+          title="Playhead (sequence timecode) — ←/→ frame, ⇧←/→ 10 frames, Home/End"
         >
-          {frameToTc(Math.min(playheadFrame, Math.max(endOfCut, 0)), rate)}
+          {frameToTc(playheadFrame, rate)}
         </span>
+        {shuttle !== 0 && (
+          <span className="font-tc text-[11px] text-warning" data-testid="shuttle-rate">
+            {shuttle > 0 ? "▶" : "◀"} {Math.abs(shuttle)}×
+          </span>
+        )}
         <span className="ml-auto" />
-        <PersistenceStatus edited={editor.edited} status={status} onRetry={editor.retrySave} />
+        <PersistenceStatus
+          edited={editor.edited}
+          status={editor.persistence}
+          onRetry={editor.retrySave}
+        />
       </div>
 
       <div className="flex">
         <div className="w-[112px] shrink-0">
           <div className="h-6" />
           {ROWS.map((name) => (
-            <div
+            <TrackHeader
               key={name}
-              className={cn(
-                "flex items-center font-tc text-[11px] text-muted-foreground",
-                name.startsWith("V") ? "h-14" : "h-9",
-                "mb-1",
-              )}
-            >
-              {ROW_LABEL[name]}
-            </div>
+              name={name}
+              track={trackByName.get(name)}
+              count={itemsByTrack.get(trackByName.get(name)?.id ?? "")?.length ?? 0}
+            />
           ))}
         </div>
         <div
           ref={scrollRef}
+          onScroll={(e) => {
+            viewRef.current.scrollLeft = e.currentTarget.scrollLeft;
+          }}
           className="relative min-w-0 flex-1 overflow-x-auto overflow-y-hidden"
           data-testid="timeline-scroll"
         >
-          <div ref={contentRef} className="relative" style={{ width: contentWidth }}>
+          <div className="relative" style={{ width: contentWidth }}>
             <div
-              className="relative h-6 cursor-text border-b border-border"
+              className="relative h-6 cursor-text touch-none select-none border-b border-border"
               data-testid="timeline-ruler"
               onPointerDown={onRulerPointerDown}
             >
               {ticks.map((f) => (
                 <span
                   key={f}
-                  className="absolute top-0 h-full border-l border-border/70 pl-1 font-tc text-[10px] text-muted-foreground"
+                  className="pointer-events-none absolute top-0 h-full border-l border-border/70 pl-1 font-tc text-[10px] text-muted-foreground"
                   style={{ left: px(f) }}
                 >
                   {frameToTc(f, rate).slice(3, 8)}
@@ -573,9 +912,7 @@ export function TimelineEditor({
 
             {ROWS.map((name) => {
               const track = trackByName.get(name);
-              const items = track
-                ? Object.values(shown.items).filter((i) => i.trackId === track.id)
-                : [];
+              const items = track ? (itemsByTrack.get(track.id) ?? []) : [];
               return (
                 <div
                   key={name}
@@ -586,6 +923,7 @@ export function TimelineEditor({
                     "hairline-grid relative mb-1 rounded border border-border bg-surface",
                     name.startsWith("V") ? "h-14" : "h-9",
                     tool === "blade" && "cursor-crosshair",
+                    track?.hidden && "opacity-50",
                   )}
                 >
                   {track &&
@@ -596,12 +934,12 @@ export function TimelineEditor({
                         track={track}
                         clip={clipById.get(item.mediaClipId)}
                         sequenceRate={rate}
-                        left={px(item.startFrame)}
-                        width={px(item.durationFrames)}
+                        pxPerFrame={pxPerFrame}
                         selected={selected.has(item.id)}
                         linkedSelected={!selected.has(item.id) && linkedToSelection.has(item.id)}
+                        affected={!!preview && preview.linked.has(item.id)}
                         blade={tool === "blade"}
-                        onPointerDown={(e) => onItemPointerDown(e, item)}
+                        onPointerDown={onItemPointerDown}
                       />
                     ))}
                   {track &&
@@ -631,15 +969,26 @@ export function TimelineEditor({
               <div
                 data-testid="snap-indicator"
                 data-frame={snappedTo}
-                className="pointer-events-none absolute inset-y-0 z-20 w-px bg-primary"
-                style={{ left: px(snappedTo) }}
+                className="pointer-events-none absolute inset-y-0 left-0 z-20 w-px bg-primary will-change-transform"
+                style={{ transform: `translateX(${px(snappedTo)}px)` }}
+              />
+            )}
+            {preview && (
+              <GestureReadout
+                preview={preview}
+                seq={seq}
+                left={px(preview.edgeFrame)}
+                align={readoutAlign(px(preview.edgeFrame), viewRef.current)}
               />
             )}
             <div
               data-testid="playhead"
               data-frame={playheadFrame}
-              className="pointer-events-none absolute inset-y-0 z-30 w-px bg-warning"
-              style={{ left: px(playheadFrame) }}
+              // Its own compositor layer, moved by transform: a moving playhead
+              // never re-rasterizes the clip blocks underneath it (on a long cut
+              // that re-raster stalled frames for hundreds of milliseconds).
+              className="pointer-events-none absolute inset-y-0 left-0 z-30 w-px bg-warning will-change-transform"
+              style={{ transform: `translateX(${px(playheadFrame)}px)` }}
             />
           </div>
         </div>
@@ -649,11 +998,16 @@ export function TimelineEditor({
         {preview && (
           <span className={invalid ? "text-destructive" : "text-muted-foreground"}>
             {preview.proposal.ok
-              ? `${preview.proposal.label}${snappedTo !== null ? ` · snapped to ${frameToTc(snappedTo, rate)}` : ""}`
+              ? `${preview.proposal.label}${preview.linked.size ? ` · linked audio follows (${preview.linked.size})` : ""}${snappedTo !== null ? ` · snapped to ${frameToTc(snappedTo, rate)}` : ""}`
               : preview.proposal.error.message}
           </span>
         )}
-        {!preview && message && <span className="text-destructive">{message}</span>}
+        {!preview && message && (
+          <span className="inline-flex items-center gap-1 text-destructive" role="alert">
+            <AlertTriangle className="size-3.5" />
+            {message}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -665,6 +1019,99 @@ function rulerStep(pxPerFrame: number, fps: number): number {
   const nominal = Math.max(1, Math.round(fps));
   for (const s of steps) if (s * nominal * pxPerFrame >= 64) return s * nominal;
   return 3600 * nominal;
+}
+
+/** Keeps the readout on screen: it grows away from the nearer viewport edge. */
+function readoutAlign(
+  x: number,
+  view: { scrollLeft: number; width: number },
+): "start" | "center" | "end" {
+  const rel = (x - view.scrollLeft) / Math.max(1, view.width);
+  return rel > 0.7 ? "end" : rel < 0.3 ? "start" : "center";
+}
+
+/** Frame-accurate feedback beside the dragged edge: the sequence position,
+ * the source timecode it lands on, the change in frames — or why not. */
+function GestureReadout({
+  preview,
+  seq,
+  left,
+  align,
+}: {
+  preview: Preview;
+  seq: Sequence;
+  left: number;
+  align: "start" | "center" | "end";
+}) {
+  const p = preview.proposal;
+  const sign = preview.dxFrames > 0 ? "+" : preview.dxFrames < 0 ? "−" : "±";
+  const delta = `${sign}${Math.abs(preview.dxFrames)}f`;
+  let text: string;
+  if (!p.ok) {
+    text = p.error.message;
+  } else {
+    const it = p.sequence.items[preview.itemId]!;
+    if (preview.kind === "trim") {
+      const src =
+        preview.edge === "in"
+          ? `In ${frameToTc(it.sourceInFrame, it.mediaRate)}`
+          : `Out ${frameToTc(it.sourceOutFrame, it.mediaRate)}`;
+      text = `${src} · ${frameToTc(preview.edgeFrame, seq.rate)} · ${delta} · ${it.durationFrames}f`;
+    } else {
+      text = `${frameToTc(it.startFrame, seq.rate)} · ${delta}`;
+    }
+  }
+  return (
+    <div
+      data-testid="gesture-readout"
+      data-valid={p.ok ? "true" : "false"}
+      className={cn(
+        "pointer-events-none absolute top-6 z-40 -translate-y-full whitespace-nowrap rounded border px-1.5 py-0.5 font-tc text-[10px] shadow",
+        align === "center" ? "-translate-x-1/2" : align === "end" ? "-translate-x-full" : "",
+        p.ok
+          ? "border-primary/50 bg-background text-foreground"
+          : "border-destructive bg-destructive/90 text-destructive-foreground",
+      )}
+      style={{ left }}
+    >
+      {text}
+    </div>
+  );
+}
+
+function TrackHeader({
+  name,
+  track,
+  count,
+}: {
+  name: (typeof ROWS)[number];
+  track: Track | undefined;
+  count: number;
+}) {
+  const locked = !!track?.protection.locked;
+  const aiLocked = !!track?.protection.aiLocked;
+  return (
+    <div
+      data-testid={`track-header-${name}`}
+      className={cn(
+        "mb-1 flex flex-col justify-center pr-2 font-tc text-[11px] text-muted-foreground",
+        name.startsWith("V") ? "h-14" : "h-9",
+      )}
+    >
+      <span className="flex items-center gap-1">
+        <span className="truncate">{ROW_LABEL[name]}</span>
+        {locked && <Lock className="size-3 shrink-0" aria-label="Track locked" />}
+        {!locked && aiLocked && (
+          <ShieldCheck className="size-3 shrink-0" aria-label="Protected from Director changes" />
+        )}
+        {track?.hidden && <EyeOff className="size-3 shrink-0" aria-label="Hidden" />}
+        {track?.muted && <VolumeX className="size-3 shrink-0" aria-label="Muted" />}
+      </span>
+      {name.startsWith("V") && (
+        <span className="text-[10px] text-muted-foreground/70">{count} clips</span>
+      )}
+    </div>
+  );
 }
 
 function ToolButton({
@@ -680,7 +1127,7 @@ function ToolButton({
   onClick: () => void;
   title: string;
   testId: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <button
@@ -752,33 +1199,45 @@ function PersistenceStatus({
   );
 }
 
-function TimelineItem({
+/** One clip block. Memoized: re-renders only when its own props change. */
+const TimelineItem = memo(function TimelineItem({
   item,
   track,
   clip,
   sequenceRate,
-  left,
-  width,
+  pxPerFrame,
   selected,
   linkedSelected,
+  affected,
   blade,
   onPointerDown,
 }: {
   item: ClipItem;
   track: Track;
   clip: Clip | undefined;
-  sequenceRate: Sequence["rate"];
-  left: number;
-  width: number;
+  sequenceRate: FrameRate;
+  pxPerFrame: number;
   selected: boolean;
   linkedSelected: boolean;
+  affected: boolean;
   blade: boolean;
-  onPointerDown: (e: React.PointerEvent) => void;
+  onPointerDown: (e: ReactPointerEvent, item: ClipItem) => void;
 }) {
   const video = track.kind === "video";
-  const inSeconds = tcClockSeconds(item.sourceInFrame, item.mediaRate);
-  const outSeconds = tcClockSeconds(item.sourceOutFrame, item.mediaRate);
+  const left = item.startFrame * pxPerFrame;
+  const width = item.durationFrames * pxPerFrame;
   const name = clip?.filename ?? item.label;
+  const locked = item.protection.locked || track.protection.locked;
+  const aiLocked = item.protection.aiLocked || track.protection.aiLocked;
+  const handle = Math.min(HANDLE_PX, Math.max(2, width / 4));
+  const inSeconds = useMemo(
+    () => tcClockSeconds(item.sourceInFrame, item.mediaRate),
+    [item.sourceInFrame, item.mediaRate],
+  );
+  const outSeconds = useMemo(
+    () => tcClockSeconds(item.sourceOutFrame, item.mediaRate),
+    [item.sourceOutFrame, item.mediaRate],
+  );
   return (
     <div
       data-testid="timeline-item"
@@ -787,18 +1246,28 @@ function TimelineItem({
       data-start={item.startFrame}
       data-end={endFrame(item)}
       data-selected={selected ? "true" : "false"}
-      title={`${name} · ${item.label} · ${frameToTc(item.sourceInFrame, item.mediaRate)}–${frameToTc(item.sourceOutFrame, item.mediaRate)}`}
-      onPointerDown={onPointerDown}
+      data-linked={linkedSelected ? "true" : "false"}
+      data-affected={affected ? "linked" : undefined}
+      data-locked={locked ? "true" : aiLocked ? "ai" : undefined}
+      title={`${name} · ${item.label} · ${frameToTc(item.sourceInFrame, item.mediaRate)}–${frameToTc(item.sourceOutFrame, item.mediaRate)}${locked ? " · locked" : ""}`}
+      onPointerDown={(e) => onPointerDown(e, item)}
       className={cn(
-        "absolute inset-y-1 select-none overflow-hidden rounded-sm border border-black/50",
+        "group absolute inset-y-1 touch-none select-none overflow-hidden rounded-sm border border-black/50",
         video
           ? "bg-black"
           : track.role === "dialogue-audio"
             ? "bg-lane-interview/70"
             : "bg-lane-audio",
-        blade ? "cursor-crosshair" : "cursor-grab active:cursor-grabbing",
+        locked
+          ? "cursor-not-allowed"
+          : blade
+            ? "cursor-crosshair"
+            : "cursor-grab active:cursor-grabbing",
+        // Selected: solid ring. Linked to a selection, or carried along by a
+        // gesture: dashed outline — never mistaken for a selection.
         selected && "z-10 ring-2 ring-primary",
-        linkedSelected && "ring-1 ring-primary/60",
+        (linkedSelected || affected) &&
+          "outline-dashed outline-1 outline-offset-[-2px] outline-primary",
         !item.enabled && "opacity-40",
       )}
       style={{ left, width: Math.max(2, width) }}
@@ -814,8 +1283,8 @@ function TimelineItem({
       )}
       <span
         className={cn(
-          "pointer-events-none relative flex items-center gap-1 truncate px-1.5 pt-0.5 text-[10px] font-medium",
-          video ? "text-white drop-shadow" : "text-black/85",
+          "pointer-events-none relative flex items-center gap-1 truncate px-2 pt-0.5 text-[10px] font-medium",
+          video ? "text-white [text-shadow:0_1px_2px_rgb(0_0_0/0.8)]" : "text-black/85",
         )}
       >
         {item.linkGroupId && (
@@ -825,30 +1294,51 @@ function TimelineItem({
             data-testid="link-indicator"
           />
         )}
+        {locked && (
+          <Lock className="size-3 shrink-0" aria-label="Locked" data-testid="lock-indicator" />
+        )}
+        {!locked && aiLocked && (
+          <ShieldCheck
+            className="size-3 shrink-0"
+            aria-label="Protected from Director changes"
+            data-testid="ai-lock-indicator"
+          />
+        )}
         <span className="truncate">{name}</span>
+        {(linkedSelected || affected) && (
+          <span className="shrink-0 rounded bg-primary/80 px-1 text-[9px] text-black">linked</span>
+        )}
       </span>
       {video && (
-        <span className="pointer-events-none relative block truncate px-1.5 font-tc text-[9px] text-white/80 drop-shadow">
+        <span className="pointer-events-none relative block truncate px-2 font-tc text-[9px] text-white/80 [text-shadow:0_1px_2px_rgb(0_0_0/0.8)]">
           {frameToTc(item.sourceInFrame, item.mediaRate)} ·{" "}
           {framesToSeconds(item.durationFrames, sequenceRate).toFixed(1)}s
         </span>
       )}
-      {!blade && (
+      {!blade && !locked && (
         <>
           <div
             data-edge="in"
             data-testid="trim-in"
-            className="absolute inset-y-0 left-0 cursor-ew-resize hover:bg-primary/40"
-            style={{ width: Math.min(HANDLE_PX, Math.max(2, width / 3)) }}
+            title="Trim in point"
+            className={cn(
+              "absolute inset-y-0 left-0 cursor-w-resize border-l-[3px] border-transparent hover:border-primary hover:bg-primary/25",
+              selected && "border-primary/70",
+            )}
+            style={{ width: handle }}
           />
           <div
             data-edge="out"
             data-testid="trim-out"
-            className="absolute inset-y-0 right-0 cursor-ew-resize hover:bg-primary/40"
-            style={{ width: Math.min(HANDLE_PX, Math.max(2, width / 3)) }}
+            title="Trim out point"
+            className={cn(
+              "absolute inset-y-0 right-0 cursor-e-resize border-r-[3px] border-transparent hover:border-primary hover:bg-primary/25",
+              selected && "border-primary/70",
+            )}
+            style={{ width: handle }}
           />
         </>
       )}
     </div>
   );
-}
+});

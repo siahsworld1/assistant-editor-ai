@@ -21,6 +21,7 @@ class FakeMedia implements MediaLike {
   seeking = false;
   readyState = 0;
   muted = false;
+  playbackRate = 1;
   /** auto: load + seek complete instantly (fast disk); manual: call finish*(). */
   constructor(public auto = true) {}
   private listeners = new Map<string, Set<() => void>>();
@@ -274,5 +275,21 @@ describe("CUT preview: double-buffered playback", () => {
     env.buffer.play();
     expect(env.last().activeIndex).toBe(0);
     expect(env.last().playing).toBe(true);
+  });
+
+  it("shuttle speed (J/K/L) applies to both elements and carries across a cut; pause resets it", () => {
+    const env = setup();
+    env.buffer.setRate(2);
+    env.buffer.play();
+    expect(env.front().playbackRate).toBe(2);
+    expect(env.media[0].playbackRate).toBe(2);
+    expect(env.media[1].playbackRate).toBe(2); // the pre-rolled element too
+    run(env, 12); // across the first cut, never black
+    expect(env.last().activeIndex).toBe(1);
+    expect(env.front().playbackRate).toBe(2);
+    env.buffer.setRate(1);
+    expect([env.media[0].playbackRate, env.media[1].playbackRate]).toEqual([1, 1]);
+    env.buffer.setRate(Number.NaN); // nonsense falls back to normal speed
+    expect(env.front().playbackRate).toBe(1);
   });
 });

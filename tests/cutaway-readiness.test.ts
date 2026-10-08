@@ -47,7 +47,11 @@ const sign = cutaway("sign", 29.5, 4.83, 3.17);
 let root: Root | null = null;
 let host: HTMLDivElement | null = null;
 
-async function render(overlay: PlayableSegment | null, playheadSeconds: number) {
+async function render(
+  overlay: PlayableSegment | null,
+  playheadSeconds: number,
+  opts: { playing?: boolean; rate?: number } = {},
+) {
   if (!root) {
     host = document.createElement("div");
     document.body.appendChild(host);
@@ -59,7 +63,12 @@ async function render(overlay: PlayableSegment | null, playheadSeconds: number) 
         "div",
         { className: "relative mx-auto max-w-md" },
         createElement(SequencePlayer, { playback }),
-        createElement(CutawayOverlay, { overlay, playheadSeconds, playing: true }),
+        createElement(CutawayOverlay, {
+          overlay,
+          playheadSeconds,
+          playing: opts.playing ?? true,
+          rate: opts.rate ?? 1,
+        }),
       ),
     ),
   );
@@ -198,5 +207,25 @@ describe("V2 cutaway readiness", () => {
     const front = v1Front();
     expect(has(front, "opacity-100")).toBe(true);
     expect(zIndex(front)).toBe(1);
+  });
+
+  it("7: paused frame steps move the cutaway one frame at a time; playing tolerates drift", async () => {
+    await render(board, 18, { playing: false });
+    const el = v2()!;
+    media(el, { readyState: 4, seeking: false, currentTime: 6.96 + 0.5 });
+    await fire(el, "seeked");
+    await render(board, 18 + 1 / 24, { playing: false }); // one frame on (→ / ←)
+    expect(el.currentTime).toBeCloseTo(6.96 + 0.5 + 1 / 24, 6);
+    expect(isVisible(el)).toBe(true); // the decoded frame stays up while it seeks
+    const before = el.currentTime;
+    await render(board, 18 + 2 / 24, { playing: true }); // playing: a frame of drift is fine
+    expect(el.currentTime).toBe(before);
+  });
+
+  it("8: the cutaway plays at the shuttle speed", async () => {
+    await render(board, 18, { rate: 4 });
+    expect(v2()!.playbackRate).toBe(4);
+    await render(board, 18, { rate: 1 });
+    expect(v2()!.playbackRate).toBe(1);
   });
 });

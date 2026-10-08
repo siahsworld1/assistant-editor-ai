@@ -28,6 +28,8 @@ export interface MediaLike {
   readonly seeking: boolean;
   readonly readyState: number;
   muted: boolean;
+  /** Optional: speed for shuttle playback (1 = normal). */
+  playbackRate?: number;
   play(): Promise<void> | void;
   pause(): void;
   addEventListener(type: string, listener: () => void): void;
@@ -74,6 +76,8 @@ export class SequenceBuffer {
   private pending: { slot: 0 | 1; play: boolean } | null = null;
   private wantPlaying = false;
   private ended = false;
+  /** Forward playback speed (J/K/L shuttle); every element plays at it. */
+  private rate = 1;
   private state: SequenceState = {
     activeIndex: null,
     frontSlot: 0,
@@ -121,6 +125,13 @@ export class SequenceBuffer {
   }
 
   /* -------------------------------- transport ------------------------------- */
+
+  /** Forward playback speed (1, 2, 4 …). Applies to the visible and the
+   * pre-rolled element alike, so a cut at speed stays seamless. */
+  setRate(rate: number): void {
+    this.rate = rate > 0 && Number.isFinite(rate) ? rate : 1;
+    for (const slot of this.slots) if (slot.el) slot.el.playbackRate = this.rate;
+  }
 
   play(): void {
     this.wantPlaying = true;
@@ -298,7 +309,10 @@ export class SequenceBuffer {
       if (outgoing.el) outgoing.el.muted = true;
       this.front = slotIndex;
     }
-    if (incoming.el) incoming.el.muted = false;
+    if (incoming.el) {
+      incoming.el.muted = false;
+      incoming.el.playbackRate = this.rate;
+    }
     if (play) void incoming.el?.play();
     const seg = this.segments[incoming.segIndex!]!;
     this.emit({

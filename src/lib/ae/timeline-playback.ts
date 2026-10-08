@@ -7,6 +7,7 @@
 // source clips with their own in/out points.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { tcToSeconds } from "@/lib/nle/timecode";
+import { framesToSeconds, rateFromFps, secondsToFrames } from "@/lib/timeline/time";
 import { previewSrcForClip } from "./media-url";
 import { SequenceBuffer, type MediaLike, type SequenceState } from "./sequence-buffer";
 import type { Clip, EditDecision, UniversalTimeline } from "./types";
@@ -37,7 +38,10 @@ function toSegments(
       const fps = clip?.fps || timelineFps || 24;
       const sourceInSeconds = tcToSeconds(d.sourceInTc, fps) ?? 0;
       const parsedOut = tcToSeconds(d.sourceOutTc, fps);
-      const sourceOutSeconds = parsedOut !== null && parsedOut > sourceInSeconds ? parsedOut : sourceInSeconds + d.durationSeconds;
+      const sourceOutSeconds =
+        parsedOut !== null && parsedOut > sourceInSeconds
+          ? parsedOut
+          : sourceInSeconds + d.durationSeconds;
       return { decision: d, clip, src: previewSrcForClip(clip), sourceInSeconds, sourceOutSeconds };
     });
 }
@@ -83,6 +87,17 @@ export function sequenceEndSeconds(timeline: UniversalTimeline): number {
   return end > 0 ? end : timeline.totalSeconds;
 }
 
+/** Shuttle speeds (J/K/L): each press in the same direction doubles, to 8×. */
+export const SHUTTLE_MAX = 8;
+
+/** The next shuttle rate after pressing J (−1) or L (+1) at `current`
+ * (0 = stopped, negative = reverse). */
+export function nextShuttleRate(current: number, direction: 1 | -1): number {
+  if (Math.sign(current) === direction)
+    return direction * Math.min(SHUTTLE_MAX, Math.abs(current) * 2);
+  return direction;
+}
+
 /** Where the playhead stays when the sequence changes: the same position,
  * clamped to the new sequence length. */
 export function keptPlayhead(playheadSeconds: number, totalSeconds: number): number {
@@ -111,11 +126,22 @@ export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) 
   const playheadRef = useRef(state.playheadSeconds);
   playheadRef.current = state.playheadSeconds;
   const endSeconds = useMemo(() => sequenceEndSeconds(timeline), [timeline]);
+  // Shuttle: forward speeds play the media faster (every element at the same
+  // rate); reverse steps the playhead back frame by frame, because media
+  // elements cannot play backwards. 0 = not shuttling.
+  const [shuttleRate, setShuttleRate] = useState(0);
   useEffect(() => {
     const keep = keptPlayhead(playheadRef.current, endSeconds);
+    setShuttleRate(0);
+    buffer.setRate(1);
     buffer.setSequence(segments, endSeconds);
     if (keep > 0) buffer.seek(keep);
   }, [buffer, segments, endSeconds]);
+
+  // The sequence frame grid (the derived timeline's rate is the Sequence's).
+  const rate = useMemo(() => rateFromFps(timeline.fps), [timeline.fps]);
+  const endFrame = secondsToFrames(endSeconds, rate);
+  const playheadFrame = Math.min(secondsToFrames(state.playheadSeconds, rate), endFrame);
 
   // Edit points are checked every animation frame (not on ~4 Hz timeupdate).
   useEffect(() => {
@@ -133,11 +159,77 @@ export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) 
   const attachSlot0 = useCallback((el: MediaLike | null) => buffer.attach(0, el), [buffer]);
   const attachSlot1 = useCallback((el: MediaLike | null) => buffer.attach(1, el), [buffer]);
 
-  const play = useCallback(() => buffer.play(), [buffer]);
-  const pause = useCallback(() => buffer.pause(), [buffer]);
-  const togglePlay = useCallback(() => (state.playing ? buffer.pause() : buffer.play()), [buffer, state.playing]);
+  const play = useCallback(() => {
+    setShuttleRate(0);
+    buffer.setRate(1);
+    buffer.play();
+  }, [buffer]);
+  const pause = useCallback(() => {
+    setShuttleRate(0);
+    buffer.pause();
+    buffer.setRate(1);
+  }, [buffer]);
+  const playingRef = useRef(state.playing);
+  playingRef.current = state.playing;
+  const shuttleRef = useRef(shuttleRate);
+  shuttleRef.current = shuttleRate;
+  const togglePlay = useCallback(() => {
+    if (playingRef.current || shuttleRef.current !== 0) pause();
+    else play();
+  }, [play, pause]);
   /** Seeks to an absolute position on the *timeline* (not within one clip). */
   const seek = useCallback((globalSeconds: number) => buffer.seek(globalSeconds), [buffer]);
+
+  /** Puts the playhead on a whole sequence frame (clamped to the cut). */
+  const endFrameRef = useRef(endFrame);
+  endFrameRef.current = endFrame;
+  const seekFrame = useCallback(
+    (frame: number) => {
+      const f = Math.max(0, Math.min(Math.round(frame), endFrameRef.current));
+      buffer.seek(framesToSeconds(f, rate));
+    },
+    [buffer, rate],
+  );
+
+  /** J (−1) / L (+1): start, speed up or reverse the shuttle. K = pause(). */
+  const shuttle = useCallback(
+    (direction: 1 | -1) => {
+      const next = nextShuttleRate(shuttleRef.current, direction);
+      setShuttleRate(next);
+      if (next > 0) {
+        buffer.setRate(next);
+        buffer.play();
+      } else {
+        buffer.pause();
+        buffer.setRate(1);
+      }
+    },
+    [buffer],
+  );
+
+  // Reverse shuttle: step back along the frame grid in real time.
+  const playheadFrameRef = useRef(playheadFrame);
+  playheadFrameRef.current = playheadFrame;
+  useEffect(() => {
+    if (shuttleRate >= 0 || typeof requestAnimationFrame !== "function") return;
+    const fps = rate.num / rate.den;
+    let position = playheadFrameRef.current;
+    let last = performance.now();
+    let raf = 0;
+    const loop = (now: number) => {
+      position -= ((now - last) / 1000) * fps * -shuttleRate;
+      last = now;
+      const frame = Math.max(0, Math.round(position));
+      if (frame !== playheadFrameRef.current) seekFrame(frame);
+      if (frame === 0) {
+        setShuttleRate(0);
+        return;
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [shuttleRate, rate, seekFrame]);
 
   const activeSegment = state.activeIndex !== null ? (segments[state.activeIndex] ?? null) : null;
   const overlay = overlayAt(plan.overlays, state.playheadSeconds);
@@ -161,6 +253,13 @@ export function useTimelinePlayback(timeline: UniversalTimeline, clips: Clip[]) 
     pause,
     togglePlay,
     seek,
+    /** The playhead on the sequence frame grid, and the last frame of the cut. */
+    playheadFrame,
+    endFrame,
+    seekFrame,
+    /** 0 when not shuttling; otherwise the signed shuttle speed. */
+    shuttleRate,
+    shuttle,
   };
 }
 

@@ -271,10 +271,13 @@ export function CutawayOverlay({
   overlay,
   playheadSeconds,
   playing,
+  rate = 1,
 }: {
   overlay: import("@/lib/ae/timeline-playback").PlayableSegment | null;
   playheadSeconds: number;
   playing: boolean;
+  /** Shuttle speed: the cutaway plays at the same rate as V1. */
+  rate?: number;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const expected = overlay
@@ -306,7 +309,10 @@ export function CutawayOverlay({
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !overlay) return;
-    if (Math.abs(v.currentTime - expected) > 0.25) {
+    if (v.playbackRate !== rate) v.playbackRate = rate;
+    // Playing: re-sync only on real drift. Paused (scrub, frame steps): follow
+    // every frame. The decoded frame stays on screen while it seeks.
+    if (Math.abs(v.currentTime - expected) > (playing ? 0.25 : 0.02)) {
       try {
         v.currentTime = expected;
       } catch {
@@ -315,7 +321,7 @@ export function CutawayOverlay({
     }
     if (playing && v.paused) void v.play().catch(() => {});
     if (!playing && !v.paused) v.pause();
-  }, [overlay, expected, playing]);
+  }, [overlay, expected, playing, rate]);
 
   if (!overlay?.src) return null;
   return (
