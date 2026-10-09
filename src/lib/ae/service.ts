@@ -90,6 +90,14 @@ export type DirectorProposalResult =
   | { status: "failed"; message: string; retryable: boolean }
   | { status: "invalid"; reason: string };
 
+/** What POST /propose/story answered (Phase 6). A plan is only a plan: the
+ * app binds it to the cut it described and compiles it (story-plan.ts). */
+export type StoryPlanResult =
+  | { status: "plan"; plan: Record<string, unknown> }
+  | { status: "refused"; reason: string }
+  | { status: "failed"; message: string; retryable: boolean }
+  | { status: "invalid"; reason: string };
+
 export interface RetryAiResult {
   accepted: boolean;
   /** Why nothing started: "nothing-to-retry", "analysis-running", … */
@@ -267,6 +275,51 @@ export class EngineClient {
         };
       default:
         return { status: "invalid", reason: "The engine doesn't support Director proposals yet." };
+    }
+  }
+
+  /** A story plan for the current sequence (Phase 6). Never throws. */
+  async proposeStory(instruction: string, context: unknown): Promise<StoryPlanResult> {
+    let raw: unknown;
+    try {
+      raw = await this.call("build", "/propose/story", {
+        method: "POST",
+        body: { instruction, context },
+        timeoutMs: 90000,
+      });
+    } catch (err) {
+      return {
+        status: "failed",
+        message: `The local engine didn't answer (${message(err)}).`,
+        retryable: true,
+      };
+    }
+    const root = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    const text = (v: unknown, fallback: string) =>
+      typeof v === "string" && v.trim() ? v.trim() : fallback;
+    switch (root["status"]) {
+      case "plan":
+        return root["plan"] && typeof root["plan"] === "object" && !Array.isArray(root["plan"])
+          ? { status: "plan", plan: root["plan"] as Record<string, unknown> }
+          : { status: "invalid", reason: "The Director's reply was not a usable story plan." };
+      case "refused":
+        return { status: "refused", reason: text(root["reason"], "The Director can't do that.") };
+      case "failed": {
+        const f = (root["aiFailure"] ?? {}) as Record<string, unknown>;
+        return {
+          status: "failed",
+          message: text(f["message"], "the AI provider didn't respond"),
+          retryable: f["retryable"] !== false,
+        };
+      }
+      case "invalid-request":
+      case "invalid-response":
+        return {
+          status: "invalid",
+          reason: text(root["reason"], "The Director's reply could not be used."),
+        };
+      default:
+        return { status: "invalid", reason: "The engine doesn't support story plans yet." };
     }
   }
 

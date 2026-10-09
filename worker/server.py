@@ -28,6 +28,7 @@ if os.environ.get("ASSISTANT_EDITOR_SKIP_DOTENV") != "1":
 from flask import Flask, jsonify, request  # noqa: E402 - load_dotenv must run first
 
 import director  # noqa: E402
+import story  # noqa: E402
 import media  # noqa: E402
 import persistence  # noqa: E402
 import pipeline  # noqa: E402
@@ -140,6 +141,16 @@ def propose():
         return ("", 204)
     body = request.get_json(silent=True) or {}
     return jsonify(director.propose(body.get("instruction"), body.get("context")))
+
+
+@app.route("/propose/story", methods=["POST", "OPTIONS"])
+def propose_story():
+    """A story plan (ids only) for the CURRENT sequence (worker/story.py).
+    Returns a plan for the app to validate, compile and preview — never applies one."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    return jsonify(story.propose_story(body.get("instruction"), body.get("context")))
 
 
 @app.route("/restore", methods=["POST", "OPTIONS"])
