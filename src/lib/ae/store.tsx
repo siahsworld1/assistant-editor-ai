@@ -27,6 +27,10 @@ import {
   buildSequenceContext,
   type DirectorBinding,
 } from "@/lib/timeline/ai-context";
+import { bindStoryPlan } from "@/lib/timeline/story-binding";
+import { buildStoryContext } from "@/lib/timeline/story-context";
+import { compileStoryPlan } from "@/lib/timeline/story-plan";
+import { storyEvidence, type StoryAskResult } from "./story-request";
 import type { Sequence, Transaction } from "@/lib/timeline/types";
 import {
   dispatchTransaction as dispatchToWorkspace,
@@ -301,6 +305,10 @@ interface AEContextValue {
     instruction: string,
     selection: readonly string[],
   ) => Promise<DirectorProposalResult>;
+  /** Story mode (Phase 6): asks the AI Director for a story plan for the
+   * current cut, binds it to the exact cut it was asked about, compiles and
+   * reviews it. The result is only ever a proposal for the filmmaker. */
+  askStory: (instruction: string) => Promise<StoryAskResult>;
   setActiveVersion: (id: string) => void;
   /** The canonical schema-2 editor for the active version (see EditorApi). */
   editor: EditorApi;
@@ -1574,6 +1582,70 @@ export function AEProvider({ children }: { children: ReactNode }) {
     },
     [proposalContext, selects, project?.transcript, project?.visualEvidence, editorClips],
   );
+  const askStory = useCallback(
+    async (instruction: string): Promise<StoryAskResult> => {
+      const client = clientRef.current;
+      if (!client || modeRef.current === "demo")
+        return {
+          status: "failed",
+          message: "the AI Director needs the local engine — reconnect and try again",
+          retryable: true,
+        };
+      const analysis = {
+        selects,
+        transcript: project?.transcript ?? [],
+        stories,
+        chosenStoryId,
+      };
+      const context = buildStoryContext(proposalContext(), analysis, editorClips);
+      if (!context || !context.interview.length)
+        return {
+          status: "refused",
+          reason: "There are no interview clips in this cut to arrange.",
+        };
+      // Captured BEFORE the request; read live again only after it returns.
+      const live = (): DirectorBinding | null => {
+        const { ws, active } = workspaceRef.current;
+        const seq = sequenceOf(ws, active, editorClips);
+        return seq
+          ? {
+              projectId: activeRef.current.record?.id ?? null,
+              versionId: active,
+              revision: sequenceRevision(seq),
+            }
+          : null;
+      };
+      const binding: DirectorBinding = {
+        projectId: activeRef.current.record?.id ?? null,
+        versionId: context.versionId,
+        revision: context.revision,
+      };
+      const res = await client.proposeStory(instruction, context);
+      if (res.status !== "plan") return res;
+      const now = live();
+      if (
+        !now ||
+        now.projectId !== binding.projectId ||
+        now.versionId !== binding.versionId ||
+        now.revision !== binding.revision
+      )
+        return {
+          status: "stale",
+          reason:
+            "The cut changed while the Director was working, so its plan no longer applies. Ask again to use the current cut.",
+        };
+      const bound = bindStoryPlan(res.plan, { instruction, binding }, now);
+      if (!bound.ok) return { status: "invalid", reason: bound.reason };
+      const compiled = compileStoryPlan(bound.plan, proposalContext(), analysis);
+      return {
+        status: "compiled",
+        plan: bound.plan,
+        compiled,
+        evidence: storyEvidence(bound.plan, analysis),
+      };
+    },
+    [proposalContext, selects, project?.transcript, stories, chosenStoryId, editorClips],
+  );
   const acceptEditorProposal = useCallback(
     (raw: unknown): AcceptOutcome => {
       const out = acceptProposalIn(raw, { ...proposalContext(), ids: randomIds });
@@ -1664,6 +1736,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
         ),
       runCommand,
       askDirector,
+      askStory,
       setActiveVersion: (id: string) => setActiveVersionId(id),
       editor,
       setTargetSeconds,
@@ -1703,6 +1776,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       directorNotice,
       runCommand,
       askDirector,
+      askStory,
       setMode,
       projects,
       activeProject,

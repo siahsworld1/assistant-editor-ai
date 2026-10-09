@@ -71,6 +71,23 @@ export const fakeDirector: {
   delayMs: number;
 } = { replies: [], requests: [], delayMs: 0 };
 
+/** The analysis the fake engine reports (transcript and selects), and an
+ * optional second project to switch to. Set before launch(). */
+export const fakeAnalysis: { transcript: unknown[]; selects: unknown[]; otherProject: boolean } = {
+  transcript: [],
+  selects: [],
+  otherProject: false,
+};
+
+/** Scripted story Director: what POST /propose/story answers (fake — no provider). */
+export const fakeStory: {
+  replies: Array<
+    unknown | ((body: { instruction: string; context: Record<string, unknown> }) => unknown)
+  >;
+  requests: Array<{ instruction: string; context: Record<string, unknown> }>;
+  delayMs: number;
+} = { replies: [], requests: [], delayMs: 0 };
+
 /** What the worker answers with no AI key configured (the dev app). */
 export const NOT_CONFIGURED = {
   status: "failed",
@@ -116,6 +133,7 @@ export function Harness(): ReactNode {
     preview: proposals,
     selection,
     askDirector: ae.askDirector,
+    askStory: ae.askStory,
     onBeforeChange: playback.pause,
     demo: true,
   });
@@ -158,7 +176,7 @@ export function install(disk: Disk) {
       durationSeconds: c.durationSeconds,
       hasTranscript: true,
     })),
-    transcript: [],
+    transcript: fakeAnalysis.transcript,
     visualEvidence: [],
     error: null,
   };
@@ -184,8 +202,20 @@ export function install(disk: Disk) {
         };
       if (path === "/restore") return { status: 200, body: { restored: true, reason: "restored" } };
       if (path === "/project") return { status: 200, body: { project: engineProject } };
-      if (path === "/selects") return { status: 200, body: { selects: [] } };
+      if (path === "/selects") return { status: 200, body: { selects: fakeAnalysis.selects } };
       if (path === "/stories") return { status: 200, body: { stories: [] } };
+      if (path === "/propose/story") {
+        const body = (
+          req as unknown as { body: { instruction: string; context: Record<string, unknown> } }
+        ).body;
+        fakeStory.requests.push(body);
+        if (fakeStory.delayMs) await new Promise((r) => setTimeout(r, fakeStory.delayMs));
+        const next =
+          fakeStory.replies.length > 1 ? fakeStory.replies.shift() : fakeStory.replies[0];
+        const reply = typeof next === "function" ? next(body) : next;
+        if (reply instanceof Error) throw reply;
+        return { status: 200, body: reply ?? NOT_CONFIGURED };
+      }
       if (path === "/propose") {
         const body = (
           req as unknown as { body: { instruction: string; context: Record<string, unknown> } }
@@ -215,7 +245,12 @@ export function install(disk: Disk) {
   window.assistantEditorDesktop = {
     available: true as const,
     version: "t",
-    listProjects: vi.fn(async () => ({ ok: true, projects: [project] })),
+    listProjects: vi.fn(async () => ({
+      ok: true,
+      projects: fakeAnalysis.otherProject
+        ? [project, { ...project, id: "proj-2", name: "Other" }]
+        : [project],
+    })),
     saveProject: vi.fn(async () => ({ ok: true, projects: [project] })),
     deleteProject: vi.fn(async () => ({ ok: true, projects: [project] })),
     chooseMediaFolder: vi.fn(async () => ({ ok: false })),
@@ -280,6 +315,12 @@ export async function teardown() {
   fakeDirector.replies = [];
   fakeDirector.requests = [];
   fakeDirector.delayMs = 0;
+  fakeAnalysis.transcript = [];
+  fakeAnalysis.selects = [];
+  fakeAnalysis.otherProject = false;
+  fakeStory.replies = [];
+  fakeStory.requests = [];
+  fakeStory.delayMs = 0;
   shuttleSpy.mockClear();
 }
 

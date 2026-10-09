@@ -212,6 +212,51 @@ class TestProposeStory(unittest.TestCase):
         self.assertEqual(body["status"], "plan")
         self.assertEqual(client.post("/propose/story", json={}).get_json()["status"], "invalid-request")
 
+    def test_story_requests_make_one_attempt_while_everything_else_keeps_sdk_retries(self):
+        # The SDK clients are replaced by recorders: no network, no key used.
+        import anthropic
+        import openai
+
+        made = []
+
+        class Recorder:
+            def __init__(self, **kwargs):
+                made.append(kwargs)
+                outer = self
+
+                class _Messages:
+                    def create(self, **_k):
+                        class R:
+                            content = [type("B", (), {"type": "text", "text": json.dumps(PLAN)})()]
+
+                        return R()
+
+                class _Completions:
+                    def create(self, **_k):
+                        msg = type("M", (), {"content": json.dumps(PLAN)})()
+                        return type("R", (), {"choices": [type("C", (), {"message": msg})()]})()
+
+                outer.messages = _Messages()
+                outer.chat = type("Chat", (), {"completions": _Completions()})()
+
+        env = {"ANTHROPIC_API_KEY": "dummy-not-a-key", "OPENAI_API_KEY": "dummy-not-a-key"}
+        for vendor, sdk, attr in (("anthropic", anthropic, "Anthropic"), ("openai", openai, "OpenAI")):
+            made.clear()
+            with (
+                patch.dict("os.environ", {**env, "ASSISTANT_EDITOR_REASONING_PROVIDER": vendor}),
+                patch.object(sdk, attr, Recorder),
+            ):
+                out = story.propose_story(ASK, CONTEXT)  # resolves its own provider
+                self.assertEqual(out["status"], "plan", vendor)
+                self.assertEqual(made[-1].get("max_retries"), 0, vendor)
+                # Director (/propose) and analysis resolve providers as before: SDK default retries.
+                provider = pipeline._resolve_reasoning_provider()  # noqa: SLF001
+                provider.complete("s", [], max_tokens=10)
+                self.assertNotIn("max_retries", made[-1], vendor)
+                director.propose("Move it", {"schema": "ae.context/1", "versionId": "v",
+                                             "revision": "rev_0123456789abcdef_1", "clips": []})
+                self.assertNotIn("max_retries", made[-1], vendor)
+
     def test_propose_is_unchanged(self):
         # Phase 5's endpoint answers exactly as before, separately.
         import server

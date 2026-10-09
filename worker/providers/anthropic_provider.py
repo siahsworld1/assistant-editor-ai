@@ -21,13 +21,15 @@ from .base import ContentBlock, ImageBlock, ProviderError, ReasoningProvider, Te
 ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
 
 
-def _client():
+def _client(max_retries: int | None = None):
     api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "")
     if not api_key:
         raise ProviderError(f"{ANTHROPIC_API_KEY_ENV} is not set.")
     import anthropic  # lazy: keep this module importable without the SDK installed
 
-    return anthropic.Anthropic(api_key=api_key)
+    if max_retries is None:  # the SDK's own default, as every caller has always had
+        return anthropic.Anthropic(api_key=api_key)
+    return anthropic.Anthropic(api_key=api_key, max_retries=max_retries)
 
 
 class AnthropicReasoningProvider(ReasoningProvider):
@@ -35,9 +37,12 @@ class AnthropicReasoningProvider(ReasoningProvider):
 
     def __init__(self, model: str | None = None):
         self.model = model or os.environ.get("ASSISTANT_EDITOR_CLAUDE_MODEL", "claude-sonnet-4-5")
+        # None = the SDK's default retries. A caller may set 0 on its OWN
+        # instance (every resolution creates a new one) to make one attempt only.
+        self.max_retries: int | None = None
 
     def complete(self, system: str, content: list[ContentBlock], max_tokens: int = 4096) -> str:
-        client = _client()
+        client = _client() if self.max_retries is None else _client(self.max_retries)
         user_content = []
         for block in content:
             if isinstance(block, TextBlock):

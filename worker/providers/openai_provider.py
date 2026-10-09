@@ -35,13 +35,15 @@ from .base import (
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 
 
-def _client():
+def _client(max_retries: int | None = None):
     api_key = os.environ.get(OPENAI_API_KEY_ENV, "")
     if not api_key:
         raise ProviderError(f"{OPENAI_API_KEY_ENV} is not set.")
     from openai import OpenAI  # lazy: keep this module importable without the SDK installed
 
-    return OpenAI(api_key=api_key)
+    if max_retries is None:  # the SDK's own default, as every caller has always had
+        return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key, max_retries=max_retries)
 
 
 class OpenAIWhisperTranscriptionProvider(TranscriptionProvider):
@@ -98,9 +100,11 @@ class OpenAIReasoningProvider(ReasoningProvider):
 
     def __init__(self, model: str | None = None):
         self.model = model or os.environ.get("ASSISTANT_EDITOR_OPENAI_MODEL", "gpt-4o")
+        # None = the SDK's default retries; see AnthropicReasoningProvider.
+        self.max_retries: int | None = None
 
     def complete(self, system: str, content: list[ContentBlock], max_tokens: int = 4096) -> str:
-        client = _client()
+        client = _client() if self.max_retries is None else _client(self.max_retries)
         user_content = []
         for block in content:
             if isinstance(block, TextBlock):

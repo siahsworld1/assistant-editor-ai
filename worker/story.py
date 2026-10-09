@@ -124,6 +124,10 @@ def propose_story(instruction, context, reasoning_provider: ReasoningProvider | 
 
     if reasoning_provider is None:
         reasoning_provider = pipeline._resolve_reasoning_provider()  # noqa: SLF001
+        # One attempt only: no automatic (paid) SDK retries for a story request.
+        # This is a fresh instance — analysis and /propose keep the SDK default.
+        if reasoning_provider is not None and hasattr(reasoning_provider, "max_retries"):
+            reasoning_provider.max_retries = 0
     raw, entry = pipeline._call_ai(  # noqa: SLF001
         "story", reasoning_provider, "reasoning", lambda: _story_reply(reasoning_provider, brief)
     )

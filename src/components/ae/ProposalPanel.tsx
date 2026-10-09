@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import type { DirectorProposalResult } from "@/lib/ae/service";
 import { describeOperation, type ProposalPreview } from "@/lib/ae/proposal-preview";
+import { describeStory, type StoryAskResult, type StoryShown } from "@/lib/ae/story-request";
 import type { EditorApi } from "@/lib/ae/store";
 import { DEMO_KINDS, demoProposal } from "@/lib/timeline/demo-proposals";
 import { EXAMPLES, interpretInstruction } from "@/lib/timeline/instructions";
@@ -71,6 +72,7 @@ export function ProposalPanel({
   preview,
   selection = [],
   askDirector,
+  askStory,
   onBeforeChange,
   demo,
 }: {
@@ -88,12 +90,20 @@ export function ProposalPanel({
     instruction: string,
     selection: readonly string[],
   ) => Promise<DirectorProposalResult>;
+  /** Story mode (Phase 6): the AI Director's story plan for the current cut,
+   * bound, compiled and reviewed by the store. Absent: no Story mode. */
+  askStory?: (instruction: string) => Promise<StoryAskResult>;
 }) {
   const { review, pending, notice, interpretation } = preview;
   const proposal: EditProposal | null = review?.proposal ?? null;
   const ok = !!review?.ok;
   const stale = !!review && !review.ok && review.issues.some((i) => i.code === "stale");
   const [text, setText] = useState("");
+  // Edit: precise commands (and the AI Director for other wording).
+  // Story: whole-interview-clip restructuring, always through the AI Director.
+  const [mode, setMode] = useState<"edit" | "story">("edit");
+  const story = mode === "story" && !!askStory;
+  const [shown, setShown] = useState<StoryShown | null>(null);
 
   // The AI Director's progress for the last instruction it was asked.
   const [ai, setAi] = useState<AiState | null>(null);
@@ -136,9 +146,69 @@ export function ProposalPanel({
     }
   };
 
+  const askForStory = async (instruction: string) => {
+    if (!askStory) return;
+    const mine = ++request.current;
+    preview.clear();
+    setShown(null);
+    setAi({ state: "generating", instruction });
+    const res = await askStory(instruction);
+    if (mine !== request.current) return; // superseded, mode left or panel closed
+    switch (res.status) {
+      case "compiled": {
+        const detail = describeStory(res, editor.sequence);
+        setShown(detail);
+        if (res.compiled.ok) {
+          preview.propose(res.compiled.proposal);
+          setAi({ state: "ready", instruction });
+        } else if (res.compiled.proposal) {
+          // Compiled, then refused by review: show it, its reasons and the
+          // clips it would touch — it can't be accepted.
+          preview.propose(res.compiled.proposal);
+          setAi({ state: "ready", instruction });
+        } else {
+          setAi({
+            state: "invalid",
+            instruction,
+            message: "the plan can't be used as it is (see below).",
+          });
+        }
+        break;
+      }
+      case "refused":
+        setAi({ state: "unsupported", instruction, message: res.reason });
+        break;
+      case "failed":
+        setAi({
+          state: "provider-failure",
+          instruction,
+          message: res.message,
+          retryable: res.retryable,
+        });
+        break;
+      case "invalid":
+      case "stale":
+        setAi({ state: "invalid", instruction, message: res.reason });
+        break;
+    }
+  };
+
+  const switchMode = (next: "edit" | "story") => {
+    if (next === mode) return;
+    request.current += 1; // a reply still on its way is dropped
+    setMode(next);
+    setAi(null);
+    setShown(null);
+    preview.clear();
+  };
+
   const submit = () => {
     if (!text.trim() || ai?.state === "generating") return;
     onBeforeChange?.();
+    if (story) {
+      void askForStory(text.trim());
+      return;
+    }
     // Precise commands first (deterministic, Phase 4). Only wording it doesn't
     // recognise goes to the AI Director — a precise command it understood but
     // had to refuse (no selection, impossible trim…) is NOT re-tried by AI.
@@ -161,7 +231,40 @@ export function ProposalPanel({
         <div className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
           Director proposal
         </div>
-        {demo && (
+        {askStory && (
+          <div
+            className="inline-flex overflow-hidden rounded border border-border"
+            role="group"
+            aria-label="Director mode"
+            data-testid="director-mode"
+            data-mode={mode}
+          >
+            {(["edit", "story"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                data-testid={`mode-${m}`}
+                aria-pressed={mode === m}
+                disabled={pending !== null}
+                title={
+                  m === "edit"
+                    ? "Precise edits: move, trim, remove, reorder"
+                    : "Story: rearrange or remove whole interview clips"
+                }
+                onClick={() => switchMode(m)}
+                className={cn(
+                  "h-6 px-2.5 text-[11px] disabled:opacity-40",
+                  mode === m
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:bg-accent/40",
+                )}
+              >
+                {m === "edit" ? "Edit" : "Story"}
+              </button>
+            ))}
+          </div>
+        )}
+        {demo && !story && (
           <div className="flex flex-wrap items-center gap-1.5" data-testid="proposal-demo">
             <span
               className="inline-flex items-center gap-1 rounded border border-dashed border-border px-1.5 py-0.5 font-tc text-[10px] text-muted-foreground"
@@ -201,7 +304,11 @@ export function ProposalPanel({
           aria-label="Director instruction"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder={`Tell the Director… e.g. "${EXAMPLES[0]}"`}
+          placeholder={
+            story
+              ? 'Describe the story… e.g. "Start with the emotional moment"'
+              : `Tell the Director… e.g. "${EXAMPLES[0]}"`
+          }
           disabled={pending !== null || generating}
           className="h-8 min-w-0 flex-1 rounded border border-border bg-surface px-2.5 text-xs placeholder:text-muted-foreground/70 focus:border-primary/60 focus:outline-none disabled:opacity-50"
         />
@@ -220,9 +327,15 @@ export function ProposalPanel({
           ai={ai}
           pending={pending !== null}
           reviewOk={ok}
-          onRetry={() => void ask(ai.instruction)}
+          onRetry={() => void (story ? askForStory : ask)(ai.instruction)}
         />
       )}
+
+      {story &&
+        shown &&
+        (shown.proposalId === null
+          ? pending === null
+          : pending !== null && shown.proposalId === proposal?.id) && <StoryDetail shown={shown} />}
 
       {notice && !pending && (
         <p
@@ -383,6 +496,109 @@ export function ProposalPanel({
             </button>
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+/** The story plan, in the filmmaker's terms: what changes and why. */
+function StoryDetail({ shown }: { shown: StoryShown }) {
+  const h = "text-[11px] uppercase tracking-wide text-muted-foreground";
+  return (
+    <div className="mt-3 space-y-2 text-xs" data-testid="story-detail">
+      {shown.summary && (
+        <p data-testid="story-summary" className="text-sm">
+          {shown.summary}
+        </p>
+      )}
+      <div className="flex gap-4">
+        <div className="min-w-0 flex-1">
+          <span className={h}>Original order</span>
+          <ol className="list-decimal pl-4" data-testid="story-original">
+            {shown.original.map((c) => (
+              <li key={c.id} data-item-id={c.id}>
+                {c.label}
+              </li>
+            ))}
+          </ol>
+        </div>
+        <div className="min-w-0 flex-1">
+          <span className={h}>Proposed order</span>
+          <ol className="list-decimal pl-4" data-testid="story-proposed">
+            {shown.proposed.map((c) => (
+              <li
+                key={c.id}
+                data-item-id={c.id}
+                data-moved={c.moved ? "true" : undefined}
+                className={cn(c.moved && "text-primary")}
+              >
+                {c.label}
+              </li>
+            ))}
+          </ol>
+          {shown.removed.length > 0 && (
+            <ul className="mt-1 text-destructive" data-testid="story-removed">
+              {shown.removed.map((c) => (
+                <li key={c.id} data-item-id={c.id} className="line-through">
+                  {c.label}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+      {shown.brollRemoved.length > 0 && (
+        <ul data-testid="story-broll-removed" className="text-destructive">
+          {shown.brollRemoved.map((c) => (
+            <li key={c.id} data-item-id={c.id}>
+              Removes B-roll "{c.label}" (the plan says so explicitly — shown on the timeline)
+            </li>
+          ))}
+        </ul>
+      )}
+      {shown.reasons.length > 0 && (
+        <div>
+          <span className={h}>Why</span>
+          <ul className="space-y-1" data-testid="story-reasons">
+            {shown.reasons.map((r, i) => (
+              <li key={i} data-item-id={r.id}>
+                <span className="font-medium">{r.label}:</span> {r.reason}
+                {r.evidence.map((e) => (
+                  <span
+                    key={e.id}
+                    data-evidence-id={e.id}
+                    data-low-confidence={e.lowConfidence ? "true" : undefined}
+                    className="mt-0.5 block text-[11px] text-muted-foreground"
+                  >
+                    {e.kind} {e.id}
+                    {e.text ? `: “${e.text}”` : ""}
+                    {e.lowConfidence ? " — low confidence, may be wrong" : ""}
+                  </span>
+                ))}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {shown.warnings.length > 0 && (
+        <ul className="space-y-0.5 text-warning" data-testid="story-warnings">
+          {shown.warnings.map((w, i) => (
+            <li key={i} className="flex gap-1.5">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <span>{w}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {shown.issues.length > 0 && (
+        <ul className="space-y-0.5 text-destructive" data-testid="story-issues">
+          {shown.issues.map((m, i) => (
+            <li key={i} className="flex gap-1.5">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <span>{m}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
