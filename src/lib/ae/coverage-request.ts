@@ -19,10 +19,14 @@ import {
   type PlanResult,
 } from "@/lib/timeline/coverage-plan";
 import type { AnalysisInventory, ProposalContext } from "@/lib/timeline/proposals";
+import type { RankChoice } from "@/lib/timeline/coverage-ranking";
+import type { Sequence } from "@/lib/timeline/types";
 import { sequenceOf } from "@/lib/timeline/workspace";
 
 export interface CoverageRun {
   versionId: string;
+  /** The cut it describes. */
+  seq: Sequence;
   analysis: CoverageAnalysis;
   inventory: BrollInventory;
   plan: PlanResult;
@@ -58,8 +62,13 @@ const NO_ANALYSIS: AnalysisInventory = {
   visualIds: new Set(),
 };
 
-/** Analyses, plans and compiles coverage for the version on screen. */
-export function runCoverage(ctx: ProposalContext, source: CoverageSource): CoverageRun | null {
+/** Analyses, plans and compiles coverage for the version on screen —
+ * deterministically, or with a VALIDATED AI ranking reordering candidates. */
+export function runCoverage(
+  ctx: ProposalContext,
+  source: CoverageSource,
+  ranking?: ReadonlyMap<string, readonly RankChoice[]>,
+): CoverageRun | null {
   const versionId = ctx.activeVersionId;
   const seq = sequenceOf(ctx.workspace, versionId, ctx.clips as Clip[]);
   if (!seq) return null;
@@ -77,9 +86,24 @@ export function runCoverage(ctx: ProposalContext, source: CoverageSource): Cover
     inventory,
     visualEvidence: source.visualEvidence,
     transcript: source.transcript,
+    ranking,
   });
   const compiled = plan.ok
-    ? compileCoverageProposal(plan.plan, { ...ctx, analysis: ctx.analysis ?? NO_ANALYSIS })
+    ? compileCoverageProposal(
+        plan.plan,
+        { ...ctx, analysis: ctx.analysis ?? NO_ANALYSIS },
+        ranking
+          ? "Cover the uncovered interview cuts with B-roll (AI-assisted ranking)"
+          : undefined,
+      )
     : null;
-  return { versionId, analysis, inventory, plan, compiled };
+  return { versionId, seq, analysis, inventory, plan, compiled };
 }
+
+/** What asking the AI to rank B-roll came to (Phase 7, Milestone 6). Only
+ * "compiled" carries a plan — planned by the deterministic engine with the
+ * validated ranking; everything else leaves the cut and Cover as they were. */
+export type CoverageRankAsk =
+  | { status: "compiled"; run: CoverageRun; summary: string }
+  | { status: "refused" | "invalid" | "stale"; reason: string }
+  | { status: "failed"; message: string; retryable: boolean };

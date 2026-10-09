@@ -29,6 +29,7 @@ from flask import Flask, jsonify, request  # noqa: E402 - load_dotenv must run f
 
 import director  # noqa: E402
 import story  # noqa: E402
+import coverage_rank  # noqa: E402
 import media  # noqa: E402
 import persistence  # noqa: E402
 import pipeline  # noqa: E402
@@ -151,6 +152,17 @@ def propose_story():
         return ("", 204)
     body = request.get_json(silent=True) or {}
     return jsonify(story.propose_story(body.get("instruction"), body.get("context")))
+
+
+@app.route("/propose/coverage-rank", methods=["POST", "OPTIONS"])
+def propose_coverage_rank():
+    """An AI ranking of already-verified B-roll candidates for the CURRENT cut
+    (worker/coverage_rank.py). Ids and reasons only — the app validates it and
+    its deterministic planner places anything; nothing is applied here."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    return jsonify(coverage_rank.rank_coverage(body.get("context")))
 
 
 @app.route("/restore", methods=["POST", "OPTIONS"])

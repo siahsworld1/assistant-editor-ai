@@ -98,6 +98,15 @@ export type StoryPlanResult =
   | { status: "failed"; message: string; retryable: boolean }
   | { status: "invalid"; reason: string };
 
+/** What POST /propose/coverage-rank answered (Phase 7). A ranking is only
+ * a ranking: the app checks it against the live cut (coverage-ranking.ts)
+ * and its deterministic planner decides any placement. */
+export type CoverageRankResult =
+  | { status: "ranking"; ranking: Record<string, unknown> }
+  | { status: "refused"; reason: string }
+  | { status: "failed"; message: string; retryable: boolean }
+  | { status: "invalid"; reason: string };
+
 export interface RetryAiResult {
   accepted: boolean;
   /** Why nothing started: "nothing-to-retry", "analysis-running", … */
@@ -320,6 +329,57 @@ export class EngineClient {
         };
       default:
         return { status: "invalid", reason: "The engine doesn't support story plans yet." };
+    }
+  }
+
+  /** One AI ranking of verified B-roll candidates (POST /propose/coverage-rank).
+   * One request per call; never retried here. */
+  async rankCoverage(context: unknown): Promise<CoverageRankResult> {
+    let raw: unknown;
+    try {
+      raw = await this.call("build", "/propose/coverage-rank", {
+        method: "POST",
+        body: { context },
+        timeoutMs: 90000,
+      });
+    } catch (err) {
+      return {
+        status: "failed",
+        message: `The local engine didn't answer (${message(err)}).`,
+        retryable: true,
+      };
+    }
+    const root = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    const text = (v: unknown, fallback: string) =>
+      typeof v === "string" && v.trim() ? v.trim().slice(0, 1000) : fallback;
+    switch (root["status"]) {
+      case "ranking":
+        return root["ranking"] &&
+          typeof root["ranking"] === "object" &&
+          !Array.isArray(root["ranking"])
+          ? { status: "ranking", ranking: root["ranking"] as Record<string, unknown> }
+          : { status: "invalid", reason: "The AI's reply was not a usable ranking." };
+      case "refused":
+        return {
+          status: "refused",
+          reason: text(root["reason"], "The AI found nothing to recommend."),
+        };
+      case "failed": {
+        const f = (root["aiFailure"] ?? {}) as Record<string, unknown>;
+        return {
+          status: "failed",
+          message: text(f["message"], "the AI provider didn't respond"),
+          retryable: f["retryable"] !== false,
+        };
+      }
+      case "invalid-request":
+      case "invalid-response":
+        return {
+          status: "invalid",
+          reason: text(root["reason"], "The AI's reply could not be used."),
+        };
+      default:
+        return { status: "invalid", reason: "The engine doesn't support AI ranking yet." };
     }
   }
 

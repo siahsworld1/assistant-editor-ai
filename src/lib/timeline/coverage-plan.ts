@@ -27,6 +27,13 @@
 //   - Cuts are planned in timeline order; each placement reserves its V2 span
 //     and its source range, so later ones can't collide or repeat footage.
 //
+// Optional AI ranking (Phase 7, Milestone 6): a validated ranking
+// (coverage-ranking.ts) may reorder the usable candidates of a cut — its picks
+// are tried first, in its order. Everything else is unchanged: the hard
+// filters, the fit, the space and source reservations and the review still
+// decide; a cut the AI didn't rank, or whose AI picks don't fit, gets the
+// deterministic choice, and says so.
+//
 // Compiling: the plan becomes ordinary `place` operations in ae.proposal/1,
 // with evidence-backed rationale, and passes the existing review (the engine
 // dry run) before it is returned. Nothing here can accept it.
@@ -64,7 +71,7 @@ export const COVERAGE_PLAN_SCHEMA = "ae.coverage-plan/1" as const;
 export const LEAD_S = 1;
 export const TAIL_S = 1.5;
 /** Interview lines within this many seconds of a cut count as "nearby". */
-const NEARBY_S = 5;
+export const NEARBY_S = 5;
 const MAX_PLACEMENTS = 50;
 const STOP_WORDS = new Set(
   "the and that this with from for was are you our have has had they them their there then than what when where which who will would could should into onto over under about just very really also been being its it's i'm we're".split(
@@ -95,6 +102,10 @@ export interface RankBreakdown {
 
 export interface PlannedPlacement {
   cutId: string;
+  /** Who ranked this choice first: the AI ranking, or the deterministic score. */
+  ranking: "ai" | "deterministic";
+  /** The AI's short reason for its pick (model text, shown as such). */
+  aiReason?: string | undefined;
   cutTc: string;
   candidateId: string;
   mediaClipId: string;
@@ -132,6 +143,8 @@ export interface PlanSkip {
 
 export interface CoveragePlan {
   schema: typeof COVERAGE_PLAN_SCHEMA;
+  /** Whether a validated AI ranking was applied. */
+  ranking: "deterministic" | "ai-assisted";
   versionId: string;
   revision: string;
   overlayTrackId: string;
@@ -159,6 +172,9 @@ export interface PlanInput {
   /** All visual evidence of the project (to verify every cited id). */
   visualEvidence: readonly Pick<VisualEvidence, "id">[];
   transcript: readonly TranscriptSegment[];
+  /** A VALIDATED AI ranking (coverage-ranking.ts): per cut id, candidate ids
+   * best first, each with the AI's short reason. Only reorders candidates. */
+  ranking?: ReadonlyMap<string, ReadonlyArray<{ candidateId: string; reason: string }>> | undefined;
 }
 
 const LIMITATIONS = [
@@ -281,6 +297,11 @@ export function planCoverage(input: PlanInput): PlanResult {
       ...nearbyLines(left, "out", input.transcript, NEARBY_S),
       ...nearbyLines(right, "in", input.transcript, NEARBY_S),
     ];
+    const aiPicks = input.ranking?.get(cut.id);
+    const aiIndex = (id: string) => {
+      const i = aiPicks?.findIndex((p) => p.candidateId === id) ?? -1;
+      return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+    };
     const options = eligible
       .map((c) => {
         const fit = fitCandidate(seq, c, F, lo, hi, m, lead, tail);
@@ -332,7 +353,10 @@ export function planCoverage(input: PlanInput): PlanResult {
       })
       .filter((o): o is NonNullable<typeof o> => o !== null)
       .sort(
-        (a, b) => b.rank.score - a.rank.score || (a.c.id < b.c.id ? -1 : a.c.id > b.c.id ? 1 : 0),
+        (a, b) =>
+          aiIndex(a.c.id) - aiIndex(b.c.id) ||
+          b.rank.score - a.rank.score ||
+          (a.c.id < b.c.id ? -1 : a.c.id > b.c.id ? 1 : 0),
       );
 
     const best = options[0];
@@ -347,6 +371,7 @@ export function planCoverage(input: PlanInput): PlanResult {
       continue;
     }
     const { c, fit, rank } = best;
+    const aiPick = aiPicks?.find((p) => p.candidateId === c.id);
     const start = F - fit.before;
     const end = F + fit.after;
     occupied.push([start, end]);
@@ -361,8 +386,18 @@ export function planCoverage(input: PlanInput): PlanResult {
       ...(c.flags.includes("overlaps-another-candidate")
         ? ["Other logged moments in this file overlap this window (possibly the same shot)."]
         : []),
+      ...(aiPick
+        ? [
+            "The AI ranked it from the stored labels and transcript lines only; it hasn't seen the footage.",
+          ]
+        : aiPicks
+          ? [
+              "None of the AI's picks for this cut fit the free space or unused footage; this is the deterministic choice.",
+            ]
+          : []),
     ];
     const reason = [
+      ...(aiPick ? [`AI-assisted ranking put this shot first for this cut: ${aiPick.reason}`] : []),
       `Covers the potential jump cut at ${cut.tc} with "${c.evidence.label}" (${c.evidence.id}, ${c.evidence.kind}, confidence ${c.evidence.confidence}).`,
       rank.relevance
         ? `Its label shares ${rank.sharedWords.map((w) => `"${w}"`).join(", ")} with the interview around the cut.`
@@ -372,6 +407,8 @@ export function planCoverage(input: PlanInput): PlanResult {
     ].join(" ");
     placements.push({
       cutId: cut.id,
+      ranking: aiPick ? "ai" : "deterministic",
+      ...(aiPick ? { aiReason: aiPick.reason } : {}),
       cutTc: cut.tc,
       candidateId: c.id,
       mediaClipId: c.mediaClipId,
@@ -399,6 +436,7 @@ export function planCoverage(input: PlanInput): PlanResult {
 
   const plan: CoveragePlan = {
     schema: COVERAGE_PLAN_SCHEMA,
+    ranking: input.ranking ? "ai-assisted" : "deterministic",
     versionId: input.versionId,
     revision,
     overlayTrackId: overlay.id,
@@ -429,7 +467,7 @@ export function planCoverage(input: PlanInput): PlanResult {
 
 /** Interview lines of `item` near its in or out point, ignoring unreliable
  * or question lines. */
-function nearbyLines(
+export function nearbyLines(
   item: Sequence["items"][string],
   edge: "in" | "out",
   transcript: readonly TranscriptSegment[],
@@ -545,7 +583,10 @@ export function compileCoverageProposal(
       evidence,
     };
   });
-  const key = JSON.stringify([plan.revision, ops]);
+  // An AI-assisted plan is a different proposal even with the same placements.
+  const key = JSON.stringify(
+    plan.ranking === "ai-assisted" ? [plan.revision, ops, plan.ranking] : [plan.revision, ops],
+  );
   let h = 0x811c9dc5;
   for (let i = 0; i < key.length; i += 1) h = Math.imul(h ^ key.charCodeAt(i), 16777619) >>> 0;
   const proposal: Record<string, unknown> = {

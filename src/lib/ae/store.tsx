@@ -31,7 +31,13 @@ import { bindStoryPlan } from "@/lib/timeline/story-binding";
 import { buildStoryContext } from "@/lib/timeline/story-context";
 import { compileStoryPlan } from "@/lib/timeline/story-plan";
 import { storyEvidence, type StoryAskResult } from "./story-request";
-import { runCoverage, type CoverageRun } from "./coverage-request";
+import {
+  runCoverage,
+  type CoverageRankAsk,
+  type CoverageRun,
+  type CoverageSource,
+} from "./coverage-request";
+import { buildRankContext, checkRanking } from "@/lib/timeline/coverage-ranking";
 import type { Sequence, Transaction } from "@/lib/timeline/types";
 import {
   dispatchTransaction as dispatchToWorkspace,
@@ -318,6 +324,11 @@ interface AEContextValue {
    * and reviewed proposal for the version on screen — local, no AI request,
    * nothing applied. Null when there is no cut. */
   coverCuts: () => CoverageRun | null;
+  /** Cover mode, on the filmmaker's request only: ONE AI ranking of the
+   * verified B-roll candidates, bound to the project, version, cut and
+   * inventory it was asked about, checked against the live cut when it
+   * returns, then planned by the deterministic engine. Never applies. */
+  askCoverageRanking: () => Promise<CoverageRankAsk>;
   setActiveVersion: (id: string) => void;
   /** The canonical schema-2 editor for the active version (see EditorApi). */
   editor: EditorApi;
@@ -1713,6 +1724,62 @@ export function AEProvider({ children }: { children: ReactNode }) {
       mediaRoleOverrides,
     ],
   );
+  // Read live after an AI request returns (the project, roles or analysis
+  // may have changed while it was out).
+  const coverSourceRef = useRef<CoverageSource>({ clips: [], visualEvidence: [], transcript: [] });
+  coverSourceRef.current = {
+    clips: editorClips,
+    visualEvidence: project?.visualEvidence ?? [],
+    transcript: project?.transcript ?? [],
+    overrides: mediaRoleOverrides,
+  };
+  const proposalContextRef = useRef(proposalContext);
+  proposalContextRef.current = proposalContext;
+  const askCoverageRanking = useCallback(async (): Promise<CoverageRankAsk> => {
+    const client = clientRef.current;
+    if (!client || modeRef.current === "demo")
+      return {
+        status: "failed",
+        message: "AI ranking needs the local engine — reconnect and try again",
+        retryable: true,
+      };
+    const describe = () => {
+      const source = coverSourceRef.current;
+      const ctx = proposalContextRef.current();
+      const run = runCoverage(ctx, source);
+      const built = run
+        ? buildRankContext(run.seq, run.analysis, run.inventory, run.plan.plan, source.transcript)
+        : ({ ok: false, reason: "There is no cut to cover yet." } as const);
+      return { source, ctx, built, projectId: activeRef.current.record?.id ?? null };
+    };
+    // Captured BEFORE the request; read live again only after it returns.
+    const asked = describe();
+    if (!asked.built.ok) return { status: "refused", reason: asked.built.reason };
+    const res = await client.rankCoverage(asked.built.context);
+    if (res.status !== "ranking") return res;
+    const now = describe();
+    const a = asked.built.context;
+    if (
+      now.projectId !== asked.projectId ||
+      !now.built.ok ||
+      now.built.context.versionId !== a.versionId ||
+      now.built.context.revision !== a.revision ||
+      now.built.context.inventory !== a.inventory
+    )
+      return {
+        status: "stale",
+        reason:
+          "The cut or its B-roll changed while the AI was ranking, so its answer no longer applies.",
+      };
+    const check = checkRanking(res.ranking, now.built.context);
+    if (!check.ok)
+      return check.code === "stale"
+        ? { status: "stale", reason: check.reason }
+        : { status: "invalid", reason: check.reason };
+    const run = runCoverage(now.ctx, now.source, check.byCut);
+    if (!run) return { status: "stale", reason: "There is no cut to cover any more." };
+    return { status: "compiled", run, summary: check.summary };
+  }, []);
   const acceptEditorProposal = useCallback(
     (raw: unknown): AcceptOutcome => {
       const out = acceptProposalIn(raw, { ...proposalContext(), ids: randomIds });
@@ -1806,6 +1873,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       askDirector,
       askStory,
       coverCuts,
+      askCoverageRanking,
       setActiveVersion: (id: string) => setActiveVersionId(id),
       editor,
       setTargetSeconds,
@@ -1847,6 +1915,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       askDirector,
       askStory,
       coverCuts,
+      askCoverageRanking,
       setMode,
       projects,
       activeProject,

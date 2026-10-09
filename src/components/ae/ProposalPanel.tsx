@@ -20,12 +20,17 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { CUT_STATE_TEXT, cutState, type CoverageRun } from "@/lib/ae/coverage-request";
+import {
+  CUT_STATE_TEXT,
+  cutState,
+  type CoverageRankAsk,
+  type CoverageRun,
+} from "@/lib/ae/coverage-request";
 import type { DirectorProposalResult } from "@/lib/ae/service";
 import { describeOperation, type ProposalPreview } from "@/lib/ae/proposal-preview";
 import { describeStory, type StoryAskResult, type StoryShown } from "@/lib/ae/story-request";
 import type { EditorApi } from "@/lib/ae/store";
-import type { PlannedPlacement } from "@/lib/timeline/coverage-plan";
+import type { CoveragePlan, PlannedPlacement } from "@/lib/timeline/coverage-plan";
 import { DEMO_KINDS, demoProposal } from "@/lib/timeline/demo-proposals";
 import { EXAMPLES, interpretInstruction } from "@/lib/timeline/instructions";
 import {
@@ -71,6 +76,12 @@ interface CoverOutcome {
   message: string;
 }
 
+/** Cover's optional AI ranking: in flight, or how the last request ended. */
+interface AiRankState {
+  state: "requesting" | "ready" | "failed" | "invalid" | "stale" | "refused" | "cancelled";
+  message: string;
+}
+
 /** Why a proposal can't go ahead, in the filmmaker's terms. */
 function plainReason(issue: ProposalIssue): string {
   switch (issue.code) {
@@ -104,6 +115,7 @@ export function ProposalPanel({
   askDirector,
   askStory,
   coverCuts,
+  rankCoverage,
   setMediaRole,
   onModeChange,
   onBeforeChange,
@@ -129,6 +141,9 @@ export function ProposalPanel({
   /** Cover mode (Phase 7): the deterministic coverage run for the cut on
    * screen. Absent: no Cover mode. */
   coverCuts?: () => CoverageRun | null;
+  /** Cover mode's optional AI ranking — one request, made only when the
+   * filmmaker asks. Absent: no AI action is offered. */
+  rankCoverage?: () => Promise<CoverageRankAsk>;
   /** Filmmaker override of a file's role (null = automatic). */
   setMediaRole?: (clipId: string, role: "b-roll" | "interview" | null) => Promise<boolean>;
   /** Told when the mode changes (CUT shows coverage markers in Cover). */
@@ -150,6 +165,7 @@ export function ProposalPanel({
   const [proposedRun, setProposedRun] = useState<CoverageRun | null>(null);
   const [coverOutcome, setCoverOutcome] = useState<CoverOutcome | null>(null);
   const [roleSaving, setRoleSaving] = useState(false);
+  const [aiRank, setAiRank] = useState<AiRankState | null>(null);
   // The live analysis of the cut on screen, while in Cover mode.
   const liveSeq = editor.sequence;
   const run = useMemo(
@@ -251,8 +267,9 @@ export function ProposalPanel({
   const proposeCoverage = () => {
     if (!coverCuts) return;
     onBeforeChange?.();
-    request.current += 1;
+    request.current += 1; // an AI ranking still on its way is dropped
     setAi(null);
+    setAiRank(null);
     preview.clear();
     setProposedRun(null);
     const r = coverCuts();
@@ -272,12 +289,56 @@ export function ProposalPanel({
     }
   };
 
+  /** Asks the AI to rank the verified candidates (one request, on the
+   * filmmaker's click). The deterministic proposal stays under review until
+   * a valid AI-assisted plan replaces it; a failure, refusal, invalid or late
+   * reply changes nothing. */
+  const improveCoverage = async () => {
+    if (!rankCoverage) return;
+    onBeforeChange?.();
+    const mine = ++request.current;
+    setAiRank({ state: "requesting", message: "" });
+    const res = await rankCoverage();
+    if (mine !== request.current) return; // cancelled, re-planned, mode left or panel closed
+    switch (res.status) {
+      case "compiled": {
+        const r = res.run;
+        if (r.compiled?.ok) {
+          setProposedRun(r);
+          setCoverOutcome({ revision: r.analysis.revision, code: "proposed", message: "" });
+          preview.propose(r.compiled.proposal);
+          setAiRank({ state: "ready", message: res.summary });
+        } else {
+          setAiRank({
+            state: "invalid",
+            message: r.compiled
+              ? `the timeline rules refused the AI-assisted plan (${r.compiled.message})`
+              : r.plan.ok
+                ? "no placement could be planned"
+                : r.plan.message,
+          });
+        }
+        break;
+      }
+      case "failed":
+        setAiRank({ state: "failed", message: res.message });
+        break;
+      default:
+        setAiRank({ state: res.status, message: res.reason });
+    }
+  };
+  const cancelImprove = () => {
+    request.current += 1;
+    setAiRank({ state: "cancelled", message: "" });
+  };
+
   const switchMode = (next: DirectorMode) => {
     if (next === mode) return;
     request.current += 1; // a reply still on its way is dropped
     setMode(next);
     onModeChange?.(next);
     setAi(null);
+    setAiRank(null);
     setShown(null);
     setProposedRun(null);
     setCoverOutcome(null);
@@ -408,9 +469,13 @@ export function ProposalPanel({
       {cover && (
         <CoverPanel
           run={run}
+          shownPlan={pending !== null && proposedRun?.plan.ok ? proposedRun.plan.plan : null}
           outcome={coverOutcome}
           pending={pending !== null}
           canSetRoles={!!setMediaRole && !roleSaving}
+          ai={rankCoverage ? aiRank : undefined}
+          onImprove={() => void improveCoverage()}
+          onCancelImprove={cancelImprove}
           onPropose={proposeCoverage}
           onRole={(id, role) => void changeRole(id, role)}
         />
@@ -801,6 +866,16 @@ function PlacementDetail({
           </dd>
         </>
       )}
+      {planned && (
+        <>
+          <dt>Ranked by</dt>
+          <dd data-testid="placement-ranking" data-ranking={planned.ranking}>
+            {planned.ranking === "ai"
+              ? `AI — “${planned.aiReason ?? ""}” (the AI's words; it saw only labels and transcript lines)`
+              : "the deterministic score (shared words, handles, variety, evidence)"}
+          </dd>
+        </>
+      )}
       <dt>New clip</dt>
       <dd className="font-tc">{newItemId}</dd>
     </dl>
@@ -926,16 +1001,26 @@ const ROLE_TEXT = { interview: "Interview", "b-roll": "B-roll", uncertain: "Unce
  */
 function CoverPanel({
   run,
+  shownPlan,
   outcome,
   pending,
   canSetRoles,
+  ai,
+  onImprove,
+  onCancelImprove,
   onPropose,
   onRole,
 }: {
   run: CoverageRun | null;
+  /** The plan of the proposal under review (deterministic or AI-assisted). */
+  shownPlan: CoveragePlan | null;
   outcome: CoverOutcome | null;
   pending: boolean;
   canSetRoles: boolean;
+  /** The AI ranking's state; undefined when no AI action is offered. */
+  ai: AiRankState | null | undefined;
+  onImprove: () => void;
+  onCancelImprove: () => void;
   onPropose: () => void;
   onRole: (clipId: string, role: "b-roll" | "interview" | null) => void;
 }) {
@@ -943,7 +1028,8 @@ function CoverPanel({
   const jumps = run ? run.analysis.cuts.filter((c) => c.kind === "jump") : [];
   const plan = run ? (run.plan.ok ? run.plan.plan : run.plan.plan) : undefined;
   const skipOf = new Map((plan?.skipped ?? []).map((sk) => [sk.cutId, sk]));
-  const placeOf = new Map((plan?.placements ?? []).map((p) => [p.cutId, p]));
+  const placeOf = new Map((shownPlan?.placements ?? []).map((p) => [p.cutId, p]));
+  const requesting = ai?.state === "requesting";
   const counts = { uncovered: 0, partial: 0, covered: 0, blocked: 0 };
   for (const c of jumps) counts[cutState(c)] += 1;
   const uncertainEvidence =
@@ -965,9 +1051,9 @@ function CoverPanel({
     <div className="mt-3 space-y-3 text-xs" data-testid="coverage-panel">
       <p className="text-muted-foreground">
         Cover recommends B-roll on V2 over potential jump cuts — where two pieces of the same
-        interview take meet. Whether a cut actually reads as a jump isn&apos;t verified. Local and
-        deterministic: no AI request. Nothing changes until you accept; the interview picture and
-        audio stay as they are.
+        interview take meet. Whether a cut actually reads as a jump isn&apos;t verified.
+        Recommendations are local and deterministic — no AI request unless you ask for one below.
+        Nothing changes until you accept; the interview picture and audio stay as they are.
       </p>
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -978,6 +1064,20 @@ function CoverPanel({
         >
           <Sparkles className="size-3.5" /> {pending ? "Recommend again" : "Recommend B-roll"}
         </button>
+        {shownPlan && (
+          <span
+            data-testid="cover-source"
+            data-source={shownPlan.ranking}
+            className={cn(
+              "rounded px-1.5 py-0.5 font-tc text-[10px]",
+              shownPlan.ranking === "ai-assisted"
+                ? "bg-primary/15 text-primary"
+                : "bg-secondary text-muted-foreground",
+            )}
+          >
+            {shownPlan.ranking === "ai-assisted" ? "AI-assisted ranking" : "Deterministic ranking"}
+          </span>
+        )}
         {run && (
           <span data-testid="coverage-summary" className="text-muted-foreground">
             {jumps.length} potential jump cut{jumps.length === 1 ? "" : "s"}
@@ -986,6 +1086,17 @@ function CoverPanel({
           </span>
         )}
       </div>
+
+      {ai !== undefined && (
+        <AiRankPanel
+          ai={ai}
+          aiAssisted={shownPlan?.ranking === "ai-assisted"}
+          requesting={requesting}
+          onImprove={onImprove}
+          onCancel={onCancelImprove}
+          onDeterministic={onPropose}
+        />
+      )}
 
       {shownOutcome && (
         <p
@@ -1011,7 +1122,12 @@ function CoverPanel({
               <li key={c.id} data-testid="coverage-cut" data-state={st} data-cut-tc={c.tc}>
                 <span className="font-tc">{c.tc}</span> · {CUT_STATE_TEXT[st]}
                 {c.handEdited && " · hand-edited (covering won't change it)"}
-                {p && pending && ` · recommended: “${p.evidenceLabel}”`}
+                {p && pending && (
+                  <>
+                    {` · recommended: “${p.evidenceLabel}”`}
+                    {p.ranking === "ai" && <span className="text-primary"> (AI-ranked)</span>}
+                  </>
+                )}
                 {sk && sk.code !== "already-covered" && (
                   <span className="block pl-3 text-muted-foreground" data-skip={sk.code}>
                     {sk.message}
@@ -1093,6 +1209,100 @@ function CoverPanel({
             ))}
           </ul>
         </details>
+      )}
+    </div>
+  );
+}
+
+/** The optional AI ranking: what it sends, the request in flight, and how
+ * the last one ended. A deterministic recommendation is never lost to it. */
+function AiRankPanel({
+  ai,
+  aiAssisted,
+  requesting,
+  onImprove,
+  onCancel,
+  onDeterministic,
+}: {
+  ai: AiRankState | null;
+  aiAssisted: boolean;
+  requesting: boolean;
+  onImprove: () => void;
+  onCancel: () => void;
+  onDeterministic: () => void;
+}) {
+  const kept = "Nothing was changed; the deterministic recommendation is still available.";
+  const text: Record<AiRankState["state"], string> = {
+    requesting: "Asking the AI to rank the B-roll candidates…",
+    ready: `AI-assisted recommendation ready — preview it below, then accept or reject it.${ai?.message ? ` AI summary: “${ai.message}”` : ""}`,
+    failed: `AI ranking failed — ${ai?.message ?? ""}. ${kept}`,
+    invalid: `The AI's ranking was rejected: ${ai?.message ?? ""} ${kept}`,
+    stale: `${ai?.message ?? ""} ${kept}`,
+    refused: `The AI didn't rank anything: ${ai?.message ?? ""} ${kept}`,
+    cancelled: `AI ranking cancelled — its answer will be ignored. ${kept}`,
+  };
+  return (
+    <div
+      className="space-y-1.5 rounded border border-dashed border-border p-2"
+      data-testid="cover-ai-panel"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          data-testid="cover-ai"
+          disabled={requesting}
+          onClick={onImprove}
+          className="inline-flex h-7 items-center gap-1 rounded border border-primary/50 px-2.5 text-[11px] text-primary hover:bg-primary/10 disabled:opacity-40"
+        >
+          <Sparkles className="size-3.5" /> Improve recommendations with AI
+        </button>
+        {requesting && (
+          <button
+            type="button"
+            data-testid="cover-ai-cancel"
+            onClick={onCancel}
+            className="inline-flex h-7 items-center gap-1 rounded border border-border px-2.5 text-[11px] text-muted-foreground hover:bg-accent/40"
+          >
+            <X className="size-3.5" /> Cancel
+          </button>
+        )}
+        {aiAssisted && !requesting && (
+          <button
+            type="button"
+            data-testid="cover-deterministic"
+            onClick={onDeterministic}
+            className="inline-flex h-7 items-center gap-1 rounded border border-border px-2.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+          >
+            <RotateCcw className="size-3.5" /> Use deterministic recommendations
+          </button>
+        )}
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Optional: one request to your configured AI provider, made only when you click — no
+        automatic retry. It sends the interview lines around each cut and the B-roll labels and file
+        names; no media and no folder paths. The AI only ranks footage the app already verified; the
+        app places it, and nothing changes until you accept.
+      </p>
+      {ai && (ai.state !== "ready" || aiAssisted) && (
+        <p
+          data-testid="cover-ai-status"
+          data-state={ai.state}
+          className={cn(
+            "flex items-start gap-1.5",
+            ai.state === "requesting" || ai.state === "ready" || ai.state === "cancelled"
+              ? "text-muted-foreground"
+              : "text-destructive",
+          )}
+        >
+          {ai.state === "requesting" ? (
+            <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin" />
+          ) : ai.state === "ready" ? (
+            <Sparkles className="mt-0.5 size-3.5 shrink-0 text-primary" />
+          ) : ai.state === "cancelled" ? null : (
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          )}
+          <span>{text[ai.state]}</span>
+        </p>
       )}
     </div>
   );

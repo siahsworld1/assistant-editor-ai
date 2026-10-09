@@ -12,6 +12,7 @@ const ALLOWED_ROUTES = {
     "/build",
     "/propose",
     "/propose/story",
+    "/propose/coverage-rank",
     "/restore",
     "/frames",
   ],

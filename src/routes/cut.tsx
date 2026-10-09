@@ -67,6 +67,7 @@ function CutPage() {
     askDirector,
     askStory,
     coverCuts,
+    askCoverageRanking,
     setMediaRole,
   } = useAE();
 
@@ -252,6 +253,7 @@ function CutPage() {
               askDirector={askDirector}
               askStory={askStory}
               coverCuts={coverCuts}
+              rankCoverage={askCoverageRanking}
               setMediaRole={setMediaRole}
               onModeChange={(m) => setCoverageVisible(m === "cover")}
               onBeforeChange={playback.pause}

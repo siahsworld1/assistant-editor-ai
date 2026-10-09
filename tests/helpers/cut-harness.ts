@@ -96,6 +96,13 @@ export const fakeStory: {
   delayMs: number;
 } = { replies: [], requests: [], delayMs: 0 };
 
+/** Scripted AI ranking: what POST /propose/coverage-rank answers (fake — no provider). */
+export const fakeRank: {
+  replies: Array<unknown | ((body: { context: Record<string, unknown> }) => unknown)>;
+  requests: Array<{ context: Record<string, unknown> }>;
+  delayMs: number;
+} = { replies: [], requests: [], delayMs: 0 };
+
 /** What the worker answers with no AI key configured (the dev app). */
 export const NOT_CONFIGURED = {
   status: "failed",
@@ -146,6 +153,7 @@ export function Harness(): ReactNode {
     askDirector: ae.askDirector,
     askStory: ae.askStory,
     coverCuts: ae.coverCuts,
+    rankCoverage: ae.askCoverageRanking,
     setMediaRole: ae.setMediaRole,
     onModeChange: (m: string) => setCoverage(m === "cover"),
     onBeforeChange: playback.pause,
@@ -220,6 +228,15 @@ export function install(disk: Disk) {
       if (path === "/project") return { status: 200, body: { project: engineProject } };
       if (path === "/selects") return { status: 200, body: { selects: fakeAnalysis.selects } };
       if (path === "/stories") return { status: 200, body: { stories: [] } };
+      if (path === "/propose/coverage-rank") {
+        const body = (req as unknown as { body: { context: Record<string, unknown> } }).body;
+        fakeRank.requests.push(body);
+        if (fakeRank.delayMs) await new Promise((r) => setTimeout(r, fakeRank.delayMs));
+        const next = fakeRank.replies.length > 1 ? fakeRank.replies.shift() : fakeRank.replies[0];
+        const reply = typeof next === "function" ? next(body) : next;
+        if (reply instanceof Error) throw reply;
+        return { status: 200, body: reply ?? NOT_CONFIGURED };
+      }
       if (path === "/propose/story") {
         const body = (
           req as unknown as { body: { instruction: string; context: Record<string, unknown> } }
@@ -342,6 +359,9 @@ export async function teardown() {
   fakeStory.replies = [];
   fakeStory.requests = [];
   fakeStory.delayMs = 0;
+  fakeRank.replies = [];
+  fakeRank.requests = [];
+  fakeRank.delayMs = 0;
   shuttleSpy.mockClear();
 }
 
