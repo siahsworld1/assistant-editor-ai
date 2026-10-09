@@ -295,7 +295,10 @@ class CredentialService {
     const s = this.supervisor.status();
     if (s.state !== "ready" || !s.owned) return false;
     try {
-      const res = await fetch(`${s.url}/project`, { signal: AbortSignal.timeout(2000) });
+      const res = await fetch(`${s.url}/project`, {
+        headers: this.supervisor.authHeaders?.() ?? {},
+        signal: AbortSignal.timeout(2000),
+      });
       const body = await res.json();
       return body?.project?.analysisState === "running";
     } catch {

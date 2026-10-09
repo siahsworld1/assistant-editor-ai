@@ -92,9 +92,13 @@ The desktop app starts and stops the local worker itself
 and `python3 worker/server.py` (preferring `worker/.venv` if present, or
 `$ASSISTANT_EDITOR_PYTHON`). Electron waits for a healthy `GET /health` on
 `127.0.0.1:32145` (bounded, with backoff) before the UI treats the engine as live,
-and stops the worker it started on quit. A healthy Assistant Editor worker that is
-already running is reused and left running; anything else on port 32145 is reported
-as a startup error and never killed. That origin is hard-coded in
+and stops the worker it started on quit. The worker it starts gets a fresh random
+token (environment only, masked in logs) and answers only requests carrying it, so
+another app — a different build or copy of Assistant Editor — can't use it. An
+Assistant Editor worker that is already running is not used (it's reported as a
+startup error and left running) unless you gave both the same
+`ASSISTANT_EDITOR_WORKER_TOKEN`; anything else on port 32145 is reported as a
+startup error too, and never killed. That origin is hard-coded in
 `electron/allowlist.cjs` and is the only host the bridge will ever contact.
 
 If the engine can't start or becomes unreachable, the app shows an explicit

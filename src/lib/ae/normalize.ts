@@ -345,12 +345,26 @@ export function extractBuildStatus(payload: unknown): BuildStatus {
 
 /* ------------------------- /analyze (optional body) ---------------------- */
 
+/** A completed analysis already saved for the project's media folder, which
+ * a new analysis would replace (worker/server.py POST /analyze). */
+export interface ExistingAnalysis {
+  analysisId: string;
+  clips: number;
+  transcript: number;
+  visualEvidence: number;
+  selects: number;
+  stories: number;
+}
+
 export interface AnalyzeResult {
   accepted: boolean;
   jobId: string | null;
   progress: number | null;
   state: ProjectBrain["analysisState"] | null;
   summary: Partial<AnalysisSummary> | null;
+  /** The engine won't replace this saved analysis without the filmmaker's
+   * confirmation for it. */
+  confirmationRequired: ExistingAnalysis | null;
 }
 
 export function normalizeAnalyze(payload: unknown): AnalyzeResult {
@@ -371,12 +385,29 @@ export function normalizeAnalyze(payload: unknown): AnalyzeResult {
   const summary = isRec(rawSummary) ? normalizeSummary(rawSummary) : null;
   const jobId = str(pick(root, "jobId", "job_id", "id")) || null;
   const progressField = pick(root, "progress", "percent");
+  const existing = isRec(root["existing"]) ? root["existing"] : null;
+  const confirmationRequired =
+    stateStr === "confirmation-required" && existing && typeof existing["analysisId"] === "string"
+      ? {
+          analysisId: existing["analysisId"],
+          clips: num(existing["clips"]),
+          transcript: num(existing["transcript"]),
+          visualEvidence: num(existing["visualEvidence"]),
+          selects: num(existing["selects"]),
+          stories: num(existing["stories"]),
+        }
+      : null;
   return {
-    accepted: acceptedField === undefined ? true : bool(acceptedField, true),
+    accepted: confirmationRequired
+      ? false
+      : acceptedField === undefined
+        ? true
+        : bool(acceptedField, true),
     jobId,
     progress: progressField === undefined ? null : num(progressField),
     state,
     summary,
+    confirmationRequired,
   };
 }
 
@@ -590,6 +621,7 @@ export function normalizeProjectPatch(payload: unknown): Partial<ProjectBrain> {
     patch.aiIssues = root["aiIssues"].map(normalizeAiTask).filter((e): e is AiTaskStatus => e !== null);
   }
   if ("analysisMessage" in root) patch.analysisMessage = str(root["analysisMessage"]) || null;
+  if ("analysisNote" in root) patch.analysisNote = str(root["analysisNote"]) || null;
   // Always set (never conditionally omitted) so a resolved error clears on the next
   // successful poll instead of lingering in state after the user re-runs Analyze.
   if ("error" in root || "analysisState" in root || "state" in root) {

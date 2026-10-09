@@ -90,8 +90,19 @@ You should see:
 Assistant Editor AI worker listening on http://127.0.0.1:32145
 ```
 
-If the desktop app is launched while this standalone worker is running, it reuses it
-(and leaves it running on quit) instead of starting a second one.
+A worker started like this has no token, so it answers anyone (`npm run dev:web`
+uses it from a plain browser tab). The desktop app does NOT use it — it only uses a
+worker it started itself, so no other app can change your projects through it. To
+share a hand-started worker with the desktop app, start both with the same
+`ASSISTANT_EDITOR_WORKER_TOKEN` (at least 16 characters); the app then sends it with
+every request and leaves that worker running on quit.
+
+The saved analysis (`.ae_analysis.json` beside the media) is never replaced
+blindly: re-analyzing needs the filmmaker's confirmation for that analysis, the
+previous file is first copied into `.ae_analysis_history/` (content-addressed,
+never deleted by the app), and an analysis that lost transcript or visual evidence
+— for example because no AI provider is set up — does not replace it unless the
+filmmaker explicitly allowed that.
 
 ## Using it
 

@@ -39,6 +39,7 @@ if (process.env.FAKE_REPORT_KEYS) {
   console.log("RAW " + (process.env.OPENAI_API_KEY || ""));
   console.log("ARGV " + JSON.stringify(process.argv.slice(1)));
 }
+if (process.env.FAKE_REPORT_TOKEN) console.log("TOKEN " + (process.env.ASSISTANT_EDITOR_WORKER_TOKEN || ""));
 if (mode === "exit") { console.error("ModuleNotFoundError: No module named 'flask'"); process.exit(3); }
 if (mode === "ignore-term") process.on("SIGTERM", () => console.log("ignoring SIGTERM"));
 if (mode === "never") { setInterval(() => {}, 1000); return; }
@@ -198,20 +199,65 @@ describe("WorkerSupervisor — startup", () => {
 });
 
 describe("WorkerSupervisor — port already in use", () => {
-  it("adopts a healthy Assistant Editor worker that is already running, without spawning or owning it", async () => {
+  const TOKEN = "dev-shared-token-0123456789abcdef";
+  /** An Assistant Editor worker already on the port (another app's, or by hand). */
+  const otherWorker = (port: number, auth: "token" | "open") =>
+    serve(port, (req, res) => {
+      if (req.url === "/health")
+        return res.end(
+          JSON.stringify({ ok: true, service: "assistant-editor-worker", pid: 4242, auth }),
+        );
+      const ok = auth === "open" || req.headers["x-assistant-editor-token"] === TOKEN;
+      res.statusCode = ok ? 200 : 401;
+      res.end(JSON.stringify(ok ? { project: {} } : { error: "unauthorized" }));
+    });
+
+  it("never adopts an Assistant Editor worker it didn't start — another copy or build of the app — and leaves it running", async () => {
+    for (const auth of ["open", "token"] as const) {
+      const port = await freePort();
+      await otherWorker(port, auth);
+      const spawnImpl = vi.fn();
+      const s = makeSupervisor(port, { spawnImpl });
+      const status = await s.start();
+      expect(status.state).toBe("error");
+      expect(status.error!.kind).toBe("port-conflict");
+      expect(status.error!.message).toMatch(
+        /Another Assistant Editor engine is already running.*only uses an engine it started itself/,
+      );
+      expect(spawnImpl).not.toHaveBeenCalled();
+      expect(s.authHeaders()).toEqual({});
+      expect((await sup.fetchHealth({ port })).ok).toBe(true); // untouched
+    }
+  });
+
+  it("adopts one only with a developer-supplied token that the worker actually enforces", async () => {
     const port = await freePort();
-    await serve(port, (_req, res) =>
-      res.end(JSON.stringify({ ok: true, service: "assistant-editor-worker", pid: 4242 })),
-    );
+    await otherWorker(port, "token");
     const spawnImpl = vi.fn();
-    const s = makeSupervisor(port, { spawnImpl });
+    const s = makeSupervisor(port, {
+      spawnImpl,
+      extraEnv: { ASSISTANT_EDITOR_WORKER_TOKEN: TOKEN },
+    });
     const status = await s.start();
-    expect(status.state).toBe("ready");
-    expect(status.owned).toBe(false);
-    expect(status.pid).toBe(4242);
+    expect(status).toMatchObject({ state: "ready", owned: false, pid: 4242 });
+    expect(s.authHeaders()).toEqual({ "x-assistant-editor-token": TOKEN });
+    expect(JSON.stringify(status)).not.toContain(TOKEN);
     expect(spawnImpl).not.toHaveBeenCalled();
     await s.stop(); // must not touch the adopted worker
     expect((await sup.fetchHealth({ port })).ok).toBe(true);
+  });
+
+  it("refuses an open worker, or one that rejects the token, even when a token is configured", async () => {
+    const open = await freePort();
+    await otherWorker(open, "open"); // accepts anything: proves nothing
+    const a = makeSupervisor(open, { extraEnv: { ASSISTANT_EDITOR_WORKER_TOKEN: TOKEN } });
+    expect((await a.start()).error!.kind).toBe("port-conflict");
+    const other = await freePort();
+    await otherWorker(other, "token");
+    const b = makeSupervisor(other, {
+      extraEnv: { ASSISTANT_EDITOR_WORKER_TOKEN: "a-different-token-0123456789" },
+    });
+    expect((await b.start()).error!.kind).toBe("port-conflict");
   });
 
   it("reports an unrelated HTTP server as a conflict and leaves it running", async () => {
@@ -328,6 +374,7 @@ describe("WorkerSupervisor — provider credentials (Step 7)", () => {
     port: number,
     store: unknown,
     spawnSpy?: ReturnType<typeof vi.fn>,
+    extraEnv: Record<string, string> = {},
   ) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { spawn } = require("node:child_process");
@@ -336,7 +383,13 @@ describe("WorkerSupervisor — provider credentials (Step 7)", () => {
       port,
       startTimeoutMs: 8000,
       stopGraceMs: 1000,
-      env: { ...process.env, FAKE_MODE: "healthy", FAKE_PORT: String(port), FAKE_REPORT_KEYS: "1" },
+      env: {
+        ...process.env,
+        FAKE_MODE: "healthy",
+        FAKE_PORT: String(port),
+        FAKE_REPORT_KEYS: "1",
+        ...extraEnv,
+      },
       credentials: () => svc!.workerEnv(),
       launch: () => ({
         ok: true,
@@ -397,16 +450,56 @@ describe("WorkerSupervisor — provider credentials (Step 7)", () => {
 
   it("never kills or restarts an adopted worker when a key changes", async () => {
     const port = await freePort();
-    await serve(port, (_req, res) =>
-      res.end(JSON.stringify({ ok: true, service: "assistant-editor-worker", pid: 4242 })),
-    );
+    const token = "dev-shared-token-0123456789abcdef";
+    await serve(port, (req, res) => {
+      if (req.url === "/health")
+        return res.end(
+          JSON.stringify({
+            ok: true,
+            service: "assistant-editor-worker",
+            pid: 4242,
+            auth: "token",
+          }),
+        );
+      const ok = req.headers["x-assistant-editor-token"] === token;
+      res.statusCode = ok ? 200 : 401;
+      res.end(JSON.stringify(ok ? { project: { analysisState: "complete" } } : {}));
+    });
     const spawnSpy = vi.fn();
-    const { s, svc } = credentialedSupervisor(port, new cred.MemoryCredentialStore(), spawnSpy);
+    const { s, svc } = credentialedSupervisor(port, new cred.MemoryCredentialStore(), spawnSpy, {
+      ASSISTANT_EDITOR_WORKER_TOKEN: token, // adoption needs the worker's token now
+    });
     expect((await s.start()).owned).toBe(false);
     const res = await svc.save("openai", KEY_A);
     expect(res.worker).toMatchObject({ applied: false, reason: "adopted" });
     expect(spawnSpy).not.toHaveBeenCalled();
     expect((await sup.fetchHealth({ port })).ok).toBe(true); // still running, untouched
+  });
+});
+
+describe("WorkerSupervisor — the worker it starts belongs to it", () => {
+  it("gets a fresh random token through its environment only — never argv, logs or status()", async () => {
+    const tokens: string[] = [];
+    for (let i = 0; i < 2; i += 1) {
+      const port = await freePort();
+      const s = makeSupervisor(port, {
+        extraEnv: { FAKE_REPORT_TOKEN: "1", FAKE_REPORT_KEYS: "1" },
+      });
+      const status = await s.start();
+      expect(status.state).toBe("ready");
+      expect(status.owned).toBe(true);
+      const token = s.authHeaders()["x-assistant-editor-token"]!;
+      expect(token).toMatch(/^[0-9a-f]{64}$/);
+      tokens.push(token);
+      const tail = s.logTail.join("\n");
+      expect(tail).toContain("TOKEN [redacted]"); // the worker had it; the log doesn't
+      expect(tail).not.toContain(token);
+      expect(tail).toMatch(/ARGV \[[^\]]*\]/);
+      expect(tail.match(/ARGV (.*)/)![1]).not.toContain(token);
+      expect(JSON.stringify(status)).not.toContain(token);
+      await s.stop();
+    }
+    expect(tokens[0]).not.toBe(tokens[1]); // a new token every start
   });
 });
 

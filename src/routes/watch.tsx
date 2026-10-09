@@ -12,6 +12,7 @@ import {
   ScanEye,
 } from "lucide-react";
 import { MediaPlayer } from "@/components/ae/MediaPlayer";
+import { ReanalyzeDialog, type ReanalyzeRequest } from "@/components/ae/ReanalyzeDialog";
 import { PageHeader } from "@/components/ae/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -117,7 +118,52 @@ function WatchPage() {
     importMedia,
     projectBusy,
     desktopCapabilities,
+    selects,
+    stories,
   } = useAE();
+  // "Analyze Footage" on footage that already has a completed analysis asks
+  // first (ReanalyzeDialog) — for this project and that analysis only.
+  const [reanalyze, setReanalyze] = useState<ReanalyzeRequest | null>(null);
+  const [reanalyzeNote, setReanalyzeNote] = useState<string | null>(null);
+  const startAnalyze = async () => {
+    setReanalyzeNote(null);
+    if (activeProject && project?.analysisState === "complete" && project.analysisId) {
+      setReanalyze({
+        projectId: activeProject.id,
+        projectName: activeProject.name,
+        existing: {
+          analysisId: project.analysisId,
+          clips: project.clips.length,
+          transcript: project.transcript.length,
+          visualEvidence: project.visualEvidence.length,
+          selects: selects.length,
+          stories: stories.length,
+        },
+      });
+      return;
+    }
+    const r = await analyze();
+    // The engine found a saved analysis this screen didn't know about.
+    if (r.status === "confirmation-required" && activeProject)
+      setReanalyze({
+        projectId: activeProject.id,
+        projectName: activeProject.name,
+        existing: r.existing,
+      });
+  };
+  const confirmReanalyze = async (allowIncomplete: boolean) => {
+    const req = reanalyze;
+    setReanalyze(null);
+    if (!req) return;
+    const r = await analyze({
+      projectId: req.projectId,
+      analysisId: req.existing.analysisId,
+      allowIncomplete,
+    });
+    // The saved analysis is not the one confirmed (it changed): ask again about it.
+    if (r.status === "confirmation-required") setReanalyze({ ...req, existing: r.existing });
+    else if (r.status === "refused") setReanalyzeNote(r.reason);
+  };
   const [filter, setFilter] = useState<(typeof filters)[number]["id"]>("all");
   const [selected, setSelected] = useState<string | null>("clip-001");
   const [importNote, setImportNote] = useState<string | null>(null);
@@ -160,7 +206,7 @@ function WatchPage() {
             <Button variant="outline" onClick={() => void runImport()} disabled={projectBusy || connection === "demo"}>
               <FolderPlus className="size-4" /> Import media
             </Button>
-          <Button onClick={analyze} disabled={running || loading || !hasMedia}>
+          <Button data-testid="analyze-footage" onClick={() => void startAnalyze()} disabled={running || loading || !hasMedia}>
             {running ? (
               <>
                 <Loader2 className="size-4 animate-spin" /> Analyzing…
@@ -238,6 +284,14 @@ function WatchPage() {
             </span>
           </div>
           <Progress value={project?.analysisProgress ?? 0} className="mt-3 h-1.5" />
+          {(project?.analysisNote || reanalyzeNote) && (
+            <p
+              data-testid="analysis-note"
+              className="mt-3 rounded border border-warning/40 bg-warning/[0.06] px-3 py-2 text-[11px] text-warning"
+            >
+              {project?.analysisNote ?? reanalyzeNote}
+            </p>
+          )}
           {project?.analysisState === "error" && project.analysisError && (
             <p className="mt-3 rounded border border-warning/40 bg-warning/[0.06] px-3 py-2 text-[11px] text-warning">
               {project.analysisError}
@@ -504,6 +558,11 @@ function WatchPage() {
           </aside>
         </div>
       </div>
+      <ReanalyzeDialog
+        request={reanalyze}
+        onCancel={() => setReanalyze(null)}
+        onConfirm={(allowIncomplete) => void confirmReanalyze(allowIncomplete)}
+      />
     </div>
   );
 }

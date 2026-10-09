@@ -10,6 +10,7 @@ Run: `python server.py` (see README.md for setup).
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import threading
@@ -45,6 +46,23 @@ app = Flask(__name__)
 
 _analysis_lock = threading.Lock()
 
+# Set by the desktop app that starts this worker (electron/worker-supervisor.cjs):
+# then only that app — which sends it in X-Assistant-Editor-Token — may use
+# the worker; another app (e.g. a different build reusing the port) is refused.
+# A worker started by hand without it stays open, as before (dev:web).
+WORKER_TOKEN = os.environ.get("ASSISTANT_EDITOR_WORKER_TOKEN") or ""
+TOKEN_HEADER = "X-Assistant-Editor-Token"
+
+
+@app.before_request
+def require_owner():
+    if not WORKER_TOKEN or request.method == "OPTIONS" or request.path == "/health":
+        return None
+    given = request.headers.get(TOKEN_HEADER, "")
+    if hmac.compare_digest(given.encode("utf-8", "replace"), WORKER_TOKEN.encode("utf-8")):
+        return None
+    return jsonify({"error": "This engine belongs to another Assistant Editor app."}), 401
+
 
 @app.after_request
 def add_cors(resp):
@@ -69,12 +87,21 @@ def analyze():
     project_id = body.get("projectId") or body.get("project")
     media_root = body.get("mediaRoot") or body.get("path")
 
+    # A completed analysis already saved for this folder is replaced only with
+    # the filmmaker's confirmation for THAT analysis (its id).
+    saved = persistence.read_saved(media_root) if media_root and persistence.persistence_enabled() else None
+    summary = persistence.saved_summary(saved)
+    confirm = body.get("confirmReplace")
+    if summary and not (isinstance(confirm, dict) and confirm.get("analysisId") == summary["analysisId"]):
+        return jsonify({"accepted": False, "state": "confirmation-required", "existing": summary})
+    allow_incomplete = bool(summary and isinstance(confirm, dict) and confirm.get("allowIncomplete") is True)
+
     if not _analysis_lock.acquire(blocking=False):
         return jsonify({"accepted": False, "state": STORE.analysis_state, "progress": STORE.analysis_progress})
 
     def run():
         try:
-            pipeline.run_analysis(project_id, media_root)
+            pipeline.run_analysis(project_id, media_root, allow_incomplete)
         finally:
             _analysis_lock.release()
 

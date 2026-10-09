@@ -95,6 +95,9 @@ class ProjectStore:
             self.analysis_state = "idle"  # idle | running | complete | error
             self.analysis_progress = 0
             self.error: str | None = None
+            # Why a re-analysis did not replace the saved analysis (it was kept),
+            # shown to the filmmaker; None otherwise (persistence.py).
+            self.analysis_note: str | None = None
             # Identifies one completed analysis. The app stores it with its edit
             # state so saved cuts are only restored against the analysis (and
             # clip ids) they were built from.
@@ -194,6 +197,7 @@ class ProjectStore:
                 "analysisOutcome": self.analysis_outcome(),
                 "aiIssues": self.ai_issues(),
                 "aiTasks": dict(self.ai_tasks),
+                "analysisNote": self.analysis_note,
                 "analysisMessage": ai_status.headline(self.analysis_outcome() or "succeeded", self.ai_issues()),
                 # The evidence WATCH's Clip Inspector shows. Previously only
                 # per-clip counts were sent, so the inspector reported "No
@@ -218,6 +222,8 @@ class ProjectStore:
                 "service": "assistant-editor-worker",
                 "pid": os.getpid(),
                 "version": "0.1.0-real-engine",
+                # "token": requests need the owning app's token (server.py).
+                "auth": "token" if os.environ.get("ASSISTANT_EDITOR_WORKER_TOKEN") else "open",
                 "uptimeSeconds": round(time.time() - self.started_at),
                 "gpu": "cloud (OpenAI Whisper + Claude)",
                 "queue": 1 if self.analysis_state == "running" else 0,

@@ -367,3 +367,33 @@ describe("shouldInjectKeychainCredentials", () => {
     ).toBe(true);
   });
 });
+
+describe("CredentialService talks to the worker as its owner", () => {
+  it("sends the worker token when asking whether an analysis is running", async () => {
+    const token = "owner-token-0123456789abcdef";
+    const srv = http.createServer((req, res) => {
+      const ok = req.headers["x-assistant-editor-token"] === token;
+      res.statusCode = ok ? 200 : 401;
+      res.end(
+        JSON.stringify(ok ? { project: { analysisState: "running" } } : { error: "unauthorized" }),
+      );
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const { port } = srv.address() as { port: number };
+    const supervisor = (headers: Record<string, string>) => ({
+      status: () => ({ state: "ready", owned: true, url: `http://127.0.0.1:${port}` }),
+      authHeaders: () => headers,
+    });
+    try {
+      const svc = (h: Record<string, string>) =>
+        new cred.CredentialService({
+          store: new cred.MemoryCredentialStore(),
+          supervisor: supervisor(h),
+        });
+      expect(await svc({ "x-assistant-editor-token": token }).analysisRunning()).toBe(true);
+      expect(await svc({}).analysisRunning()).toBe(false); // refused without it
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
+  });
+});

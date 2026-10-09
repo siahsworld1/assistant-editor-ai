@@ -219,6 +219,9 @@ export interface ProjectBrain {
   /** One sentence for the user, e.g. "AI analysis incomplete — transcription
    * couldn't connect to OpenAI." Null when nothing failed. */
   analysisMessage?: string | null | undefined;
+  /** Why a re-analysis did not replace the saved analysis (it was kept):
+   * the engine explains, the filmmaker reads it on WATCH. */
+  analysisNote?: string | null | undefined;
 }
 
 export interface EngineHealth {

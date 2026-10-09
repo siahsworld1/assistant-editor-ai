@@ -82,6 +82,8 @@ export const fakeAnalysis: {
    * projectClips, no dialogue assessment). */
   visualEvidence?: unknown[];
   clips?: Clip[];
+  /** The engine's note after a re-analysis kept the saved analysis. */
+  analysisNote?: string;
 } = {
   transcript: [],
   selects: [],
@@ -96,6 +98,12 @@ export const fakeStory: {
   requests: Array<{ instruction: string; context: Record<string, unknown> }>;
   delayMs: number;
 } = { replies: [], requests: [], delayMs: 0 };
+
+/** Scripted engine: what POST /analyze answers, and what it was asked. */
+export const fakeAnalyze: {
+  replies: unknown[];
+  requests: Array<Record<string, unknown>>;
+} = { replies: [], requests: [] };
 
 /** Scripted AI ranking: what POST /propose/coverage-rank answers (fake — no provider). */
 export const fakeRank: {
@@ -208,6 +216,7 @@ export function install(disk: Disk) {
     })),
     transcript: fakeAnalysis.transcript,
     visualEvidence: fakeAnalysis.visualEvidence ?? [],
+    ...(fakeAnalysis.analysisNote ? { analysisNote: fakeAnalysis.analysisNote } : {}),
     error: null,
   };
   window.assistantEditorBridge = {
@@ -234,6 +243,13 @@ export function install(disk: Disk) {
       if (path === "/project") return { status: 200, body: { project: engineProject } };
       if (path === "/selects") return { status: 200, body: { selects: fakeAnalysis.selects } };
       if (path === "/stories") return { status: 200, body: { stories: [] } };
+      if (path === "/analyze") {
+        const body = (req as unknown as { body: Record<string, unknown> }).body;
+        fakeAnalyze.requests.push(body);
+        const next =
+          fakeAnalyze.replies.length > 1 ? fakeAnalyze.replies.shift() : fakeAnalyze.replies[0];
+        return { status: 200, body: next ?? { accepted: true, state: "running", progress: 2 } };
+      }
       if (path === "/propose/coverage-rank") {
         const body = (req as unknown as { body: { context: Record<string, unknown> } }).body;
         fakeRank.requests.push(body);
@@ -396,6 +412,9 @@ export async function teardown() {
   fakeAnalysis.otherProject = false;
   delete fakeAnalysis.visualEvidence;
   delete fakeAnalysis.clips;
+  delete fakeAnalysis.analysisNote;
+  fakeAnalyze.replies = [];
+  fakeAnalyze.requests = [];
   fakeStory.replies = [];
   fakeStory.requests = [];
   fakeStory.delayMs = 0;

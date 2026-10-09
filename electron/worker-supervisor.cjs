@@ -9,10 +9,17 @@
 //   - WorkerSupervisor:      start (health-gated, bounded) / track / stop.
 //
 // Ownership rule: the supervisor only ever signals the ChildProcess it spawned
-// itself. It never kills anything by port or by pid lookup — a healthy
-// Assistant Editor worker that was already running is adopted (and left alone
-// on quit), and anything else on the port is reported as a conflict.
+// itself. It never kills anything by port or by pid lookup.
+//
+// Isolation: the worker it spawns gets a fresh random token (env only, masked
+// in logs) and refuses every request without it (worker/server.py), so no
+// other app — e.g. a different build of Assistant Editor reusing the port —
+// can use it. An Assistant Editor worker that was already running is NOT
+// adopted, unless a developer explicitly gave this app its token
+// (ASSISTANT_EDITOR_WORKER_TOKEN) and that worker proves it enforces it.
+// Anything else on the port is reported as a conflict.
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
@@ -219,6 +226,34 @@ class WorkerSupervisor {
     this.error = null;
     this.logTail = [];
     this.startPromise = null;
+    /** The token the worker in use requires (never in status() or logs). */
+    this.token = null;
+  }
+
+  /** Headers that authenticate this app to the worker it uses. */
+  authHeaders() {
+    return this.token ? { "x-assistant-editor-token": this.token } : {};
+  }
+
+  /** A developer-supplied token (to share a worker started by hand), if any. */
+  explicitToken() {
+    const t = this.env.ASSISTANT_EDITOR_WORKER_TOKEN;
+    return typeof t === "string" && t.length >= 16 ? t : null;
+  }
+
+  /** Does the worker on the port enforce a token, and accept this one? */
+  async acceptsToken(token) {
+    const health = await fetchHealth({ host: this.host, port: this.port, timeoutMs: 1500 });
+    if (!health.ok || health.body?.auth !== "token") return false;
+    try {
+      const res = await fetch(`${this.url}/project`, {
+        headers: { "x-assistant-editor-token": token },
+        signal: AbortSignal.timeout(2000),
+      });
+      return res.status === 200;
+    } catch {
+      return false;
+    }
   }
 
   get url() {
@@ -292,14 +327,24 @@ class WorkerSupervisor {
     this.logTail = [];
 
     const occupant = await probePort({ host: this.host, port: this.port });
+    const explicit = this.explicitToken();
+    if (explicit) this.addSecrets([explicit]);
     if (occupant.kind === "assistant-editor-worker") {
-      // Adopt, never own: it was started outside this app, so it's not ours to stop.
-      this.state = "ready";
-      this.pid = occupant.pid;
-      this.log(
-        `using an Assistant Editor worker that was already running on ${this.url} (pid ${occupant.pid ?? "?"}); it will be left running on quit`,
+      if (explicit && (await this.acceptsToken(explicit))) {
+        // Adopt, never own: started outside this app with the token a developer
+        // gave it, so it's ours to use but not to stop.
+        this.state = "ready";
+        this.pid = occupant.pid;
+        this.token = explicit;
+        this.log(
+          `using an Assistant Editor worker that was already running on ${this.url} (pid ${occupant.pid ?? "?"}), authenticated with the configured token; it will be left running on quit`,
+        );
+        return this.status();
+      }
+      return this.fail(
+        "port-conflict",
+        `Another Assistant Editor engine is already running on ${this.url} (pid ${occupant.pid ?? "?"}) — another copy or version of the app, or one started by hand. This app only uses an engine it started itself, so its projects can't be changed by another app. Quit the other copy, then Reconnect.`,
       );
-      return this.status();
     }
     if (occupant.kind === "legacy-assistant-editor-worker") {
       return this.fail(
@@ -327,6 +372,9 @@ class WorkerSupervisor {
     }
     if (!spec.ok) return this.fail(spec.kind, spec.message);
     this.log(`starting: ${spec.description}`);
+    // The token only this app knows: the worker refuses requests without it.
+    const token = explicit ?? crypto.randomBytes(32).toString("hex");
+    this.addSecrets([token]);
 
     let spawnError = null;
     let exitInfo = null;
@@ -345,6 +393,7 @@ class WorkerSupervisor {
           // worker/server.py exits on its own if this process disappears
           // without a clean quit, so a crash can't leave an orphan behind.
           ASSISTANT_EDITOR_PARENT_PID: String(process.pid),
+          ASSISTANT_EDITOR_WORKER_TOKEN: token,
         },
       });
     } catch (err) {
@@ -352,6 +401,7 @@ class WorkerSupervisor {
     }
     this.child = child;
     this.owned = true;
+    this.token = token;
     this.pid = child.pid ?? null;
     child.stdout?.on("data", (c) => this.record(c));
     child.stderr?.on("data", (c) => this.record(c));

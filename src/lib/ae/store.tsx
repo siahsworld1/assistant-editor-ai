@@ -10,6 +10,7 @@ import {
 } from "react";
 import { EngineClient, resolveTransport } from "./service";
 import type { BuildResult, DirectorProposalResult, SourceFrame } from "./service";
+import type { ExistingAnalysis } from "./normalize";
 import type { HostContext } from "./transport";
 import type { WorkerStatus } from "@/types/bridge";
 import type { History } from "@/lib/timeline/history";
@@ -298,7 +299,10 @@ interface AEContextValue {
   setMediaRole: (clipId: string, role: "b-roll" | "interview" | null) => Promise<boolean>;
   retryConnection: () => void;
   setMode: (mode: AppMode) => void;
-  analyze: () => void;
+  /** Starts an analysis. If a completed analysis is already saved for the
+   * footage, nothing starts until the filmmaker confirms replacing exactly
+   * that one (`confirm`, tied to the project and its analysis id). */
+  analyze: (confirm?: AnalyzeConfirmation) => Promise<AnalyzeStart>;
   /** Re-runs only the AI steps that failed in the loaded analysis — no proxy,
    * thumbnail or metadata work (POST /analyze/retry-ai). */
   retryAiAnalysis: () => void;
@@ -405,6 +409,20 @@ function saveErrorMessage(code: string | undefined): string {
     return "This version of the desktop app cannot save edited timelines. Your edits are still open here, but are not saved.";
   return "Your latest edits could not be saved. They are still open here — try saving again.";
 }
+
+/** The filmmaker's confirmation to replace one saved analysis. */
+export interface AnalyzeConfirmation {
+  projectId: string;
+  analysisId: string;
+  /** Allow the new analysis to replace it even if it loses transcript or
+   * visual evidence (e.g. no AI provider set up). */
+  allowIncomplete: boolean;
+}
+export type AnalyzeStart =
+  | { status: "started" }
+  | { status: "confirmation-required"; existing: ExistingAnalysis }
+  | { status: "refused"; reason: string }
+  | { status: "error" };
 
 const AEContext = createContext<AEContextValue | null>(null);
 
@@ -1344,7 +1362,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
     };
   }, [connection, project?.analysisState, refreshEvidence]);
 
-  const analyze = useCallback(() => {
+  const analyze = useCallback(async (confirm?: AnalyzeConfirmation): Promise<AnalyzeStart> => {
     const client = clientRef.current;
     if (!client && modeRef.current !== "demo") {
       setProject((p) =>
@@ -1356,46 +1374,63 @@ export function AEProvider({ children }: { children: ReactNode }) {
             }
           : p,
       );
-      return;
+      return { status: "error" };
     }
-    setProject((p) =>
-      p ? { ...p, analysisState: "running", analysisProgress: 2, analysisError: null } : p,
-    );
-    if (!client) return; // explicit Demo Mode: simulated below
-    void (async () => {
-      try {
-        // POST /analyze only *starts* a background job on a real engine (see
-        // worker/pipeline.py::run_analysis, run on a daemon thread) — it does not
-        // wait for it to finish. The job's actual progress, clip states,
-        // transcripts, visual evidence and summary only ever reach the UI through
-        // the polling effect above, which watches analysisState === "running" and
-        // keeps refetching GET /project until the worker itself reports completion
-        // (or a real error). This handler's only job is to kick the job off and
-        // record whatever the accept response says right now — it must never mark
-        // the run "complete" itself, or it would stop that polling effect before
-        // any real work has actually happened.
-        const res = await client.analyze({
-          projectId: activeRef.current.record?.id ?? PROJECT_ID,
-          mediaRoot: activeRef.current.record?.mediaRoot || undefined,
-        });
-        setProject((p) => {
-          if (!p) return p;
-          const state = res.state === "error" ? "error" : (res.state ?? "running");
-          return {
-            ...p,
-            analysisProgress: res.progress ?? p.analysisProgress,
-            analysisState: state,
-            ...(res.summary ? { summary: { ...p.summary, ...res.summary } } : {}),
-          };
-        });
-      } catch (err) {
-        // A real failure to even start analysis (engine unreachable, 4xx/5xx on
-        // POST /analyze) — surface the actual reason instead of silently resetting
-        // clip/transcript/evidence state back to as if nothing had been tried.
-        const errorMessage = err instanceof Error ? err.message : "Analyze request failed.";
-        setProject((p) => (p ? { ...p, analysisState: "error", analysisError: errorMessage } : p));
-      }
-    })();
+    if (!client) {
+      // explicit Demo Mode: simulated below
+      setProject((p) =>
+        p ? { ...p, analysisState: "running", analysisProgress: 2, analysisError: null } : p,
+      );
+      return { status: "started" };
+    }
+    // A confirmation is for one project's saved analysis: refused if the
+    // filmmaker has since switched project.
+    const projectId = activeRef.current.record?.id ?? PROJECT_ID;
+    if (confirm && confirm.projectId !== projectId)
+      return { status: "refused", reason: "The open project changed — nothing was started." };
+    try {
+      // POST /analyze only *starts* a background job on a real engine (see
+      // worker/pipeline.py::run_analysis, run on a daemon thread) — it does not
+      // wait for it to finish. The job's actual progress, clip states,
+      // transcripts, visual evidence and summary only ever reach the UI through
+      // the polling effect above, which watches analysisState === "running" and
+      // keeps refetching GET /project until the worker itself reports completion
+      // (or a real error). This handler's only job is to kick the job off and
+      // record whatever the accept response says right now — it must never mark
+      // the run "complete" itself, or it would stop that polling effect before
+      // any real work has actually happened.
+      const res = await client.analyze({
+        projectId,
+        mediaRoot: activeRef.current.record?.mediaRoot || undefined,
+        confirmReplace: confirm
+          ? { analysisId: confirm.analysisId, allowIncomplete: confirm.allowIncomplete }
+          : undefined,
+      });
+      // A completed analysis is saved for this footage: nothing starts
+      // until the filmmaker confirms replacing exactly that one.
+      if (res.confirmationRequired)
+        return { status: "confirmation-required", existing: res.confirmationRequired };
+      setProject((p) => {
+        if (!p) return p;
+        const state = res.state === "error" ? "error" : (res.state ?? "running");
+        return {
+          ...p,
+          analysisProgress: res.progress ?? p.analysisProgress,
+          analysisState: state,
+          analysisError: null,
+          analysisNote: null,
+          ...(res.summary ? { summary: { ...p.summary, ...res.summary } } : {}),
+        };
+      });
+      return { status: "started" };
+    } catch (err) {
+      // A real failure to even start analysis (engine unreachable, 4xx/5xx on
+      // POST /analyze) — surface the actual reason instead of silently resetting
+      // clip/transcript/evidence state back to as if nothing had been tried.
+      const errorMessage = err instanceof Error ? err.message : "Analyze request failed.";
+      setProject((p) => (p ? { ...p, analysisState: "error", analysisError: errorMessage } : p));
+      return { status: "error" };
+    }
   }, []);
 
   const retryAiAnalysis = useCallback(() => {

@@ -319,7 +319,9 @@ ipcMain.handle("assistant-editor:request", async (_event, payload) => {
     const res = await fetch(check.url, {
       method: check.method,
       signal: controller.signal,
-      headers: sanitizeHeaders(payload?.headers),
+      // The renderer can't set the worker token (sanitizeHeaders drops it);
+      // only the main process adds it, for the worker this app started.
+      headers: { ...sanitizeHeaders(payload?.headers), ...worker.authHeaders() },
       ...(check.method === "POST" ? { body: JSON.stringify(payload?.body ?? {}) } : {}),
     });
     const text = await res.text();

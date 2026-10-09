@@ -171,8 +171,11 @@ export class EngineClient {
   async analyze(meta: {
     projectId?: string | undefined;
     mediaRoot?: string | undefined;
+    /** The filmmaker confirmed replacing THIS saved analysis. */
+    confirmReplace?: { analysisId: string; allowIncomplete: boolean } | undefined;
   }): Promise<AnalyzeResult> {
     const body: Record<string, unknown> = {};
+    if (meta.confirmReplace) body["confirmReplace"] = meta.confirmReplace;
     if (meta.projectId) {
       body["projectId"] = meta.projectId;
       body["project"] = meta.projectId;

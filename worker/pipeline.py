@@ -46,12 +46,57 @@ MAX_TRANSCRIPT_CHARS = 160_000
 FRAMES_PER_CLIP = 6
 
 
-def run_analysis(project_id: str | None, media_root: str | None):
+def run_analysis(project_id: str | None, media_root: str | None, allow_incomplete: bool = False):
+    """allow_incomplete: the filmmaker explicitly allowed a new analysis that
+    lost transcript or visual evidence to replace the saved one."""
+    had_saved = bool(media_root) and persistence.read_saved(media_root) is not None
     try:
-        _run_analysis(project_id, media_root)
+        _run_analysis(project_id, media_root, allow_incomplete)
     except Exception as exc:  # noqa: BLE001 - top-level background job guard
         log.error("analysis failed: %s\n%s", exc, traceback.format_exc())
         STORE.fail(str(exc))
+    if had_saved and STORE.analysis_state == "error":
+        _keep_previous(
+            project_id,
+            media_root,
+            f"Re-analysis failed ({STORE.error or 'unknown error'}), so the previous analysis was kept.",
+        )
+
+
+def _keep_previous(project_id: str | None, media_root: str | None, note: str) -> None:
+    """Puts the saved analysis back in place of one that was not saved, and
+    says why. If it can't be reloaded (its media changed), the saved file is
+    still untouched — the note says so."""
+    res = persistence.restore_snapshot(STORE, project_id, media_root or "")
+    if res.get("restored"):
+        STORE.analysis_note = note
+    else:
+        STORE.analysis_note = f"{note} (The saved analysis on disk is unchanged but couldn't be reloaded: {res.get('reason')}.)"
+
+
+def _save_or_keep_previous(project_id: str | None, media_root: str | None, allow_incomplete: bool) -> None:
+    """Saves the completed analysis — or, when it must not replace the saved
+    one, keeps that one (persistence.write_snapshot)."""
+    outcome = persistence.write_snapshot(STORE, allow_incomplete=allow_incomplete)
+    reason = outcome.get("reason")
+    if reason == "would-lose-evidence":
+        lost = outcome.get("lost") or []
+        files_t = sum(1 for x in lost if x.startswith("transcript"))
+        files_v = sum(1 for x in lost if x.startswith("visual"))
+        parts = ([f"the transcript of {files_t} file{'s' if files_t != 1 else ''}"] if files_t else []) + (
+            [f"the visual evidence of {files_v} file{'s' if files_v != 1 else ''}"] if files_v else []
+        )
+        _keep_previous(
+            project_id,
+            media_root,
+            f"Re-analysis did not produce {' and '.join(parts)} the saved analysis has (for example, no AI "
+            "provider is set up, or a step failed), so the previous analysis was kept. To replace it anyway, "
+            "re-analyze and allow an incomplete analysis.",
+        )
+    elif reason == "preserve-failed":
+        _keep_previous(project_id, media_root, "The previous analysis couldn't be backed up first, so it was not replaced and was kept.")
+    elif reason == "write-failed":
+        _keep_previous(project_id, media_root, "The new analysis couldn't be written to disk, so the previous analysis was kept.")
 
 
 def _resolve_transcription_provider() -> TranscriptionProvider | None:
@@ -124,7 +169,10 @@ def _retry_failed_ai():
             STORE.set_progress(88)
             _generate_stories(reasoning_provider)
         STORE.complete(keep_analysis_id=True)
-        persistence.save_snapshot(STORE)
+        outcome = persistence.write_snapshot(STORE)
+        if outcome.get("reason") in ("preserve-failed", "write-failed"):
+            STORE.analysis_note = "The retried analysis couldn't be saved to disk; the saved analysis is unchanged."
+
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
@@ -162,7 +210,7 @@ def _call_ai(task: str, provider, kind: str, fn):
         return None, entry
 
 
-def _run_analysis(project_id: str | None, media_root: str | None):
+def _run_analysis(project_id: str | None, media_root: str | None, allow_incomplete: bool = False):
     STORE.begin_analysis(project_id, media_root)
 
     if not media_root:
@@ -198,7 +246,7 @@ def _run_analysis(project_id: str | None, media_root: str | None):
         STORE.set_progress(88)
         _generate_stories(reasoning_provider)
         STORE.complete()
-        persistence.save_snapshot(STORE)
+        _save_or_keep_previous(project_id, media_root, allow_incomplete)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
