@@ -7,6 +7,7 @@ import { linkedIds } from "../selectors";
 import type { Command, CommandType, Sequence } from "../types";
 import { deleteEdit } from "./delete";
 import { moveEdit } from "./move";
+import { placeEdit } from "./place";
 import { setProtection } from "./protection";
 import { reorderEdit } from "./reorder";
 import { replaceAssembly } from "./replace-assembly";
@@ -26,6 +27,7 @@ const notYet =
 
 /** Every command type the model knows, routed to its handler. */
 const HANDLERS: Record<CommandType, Handler> = {
+  PlaceEdit: placeEdit as Handler,
   MoveEdit: moveEdit as Handler,
   TrimEdit: trimEdit as Handler,
   SplitEdit: splitEdit as Handler,
@@ -68,6 +70,12 @@ function make<T extends keyof CommandParamsByType>(
 
 /** Command builders. The sequence is consulted only to pre-generate ids. */
 export const commands = {
+  place: (ids: IdGenerator, params: Omit<CommandParamsByType["PlaceEdit"], "itemId">) =>
+    make(ids, "PlaceEdit", {
+      ...params,
+      mediaRate: { ...params.mediaRate },
+      itemId: ids.next("item"),
+    }),
   move: (ids: IdGenerator, itemIds: string[], deltaFrames: number) =>
     make(ids, "MoveEdit", { itemIds: [...itemIds], deltaFrames }),
   trim: (ids: IdGenerator, itemId: string, edge: "in" | "out", deltaSourceFrames: number) =>

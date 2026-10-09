@@ -189,8 +189,9 @@ export interface LegacySequenceProvenance {
 /* ------------------------- transactions & commands ------------------------ */
 // Declared now so every layer shares one shape; behaviour lands in later steps.
 
-/** Implemented in Phase 1. */
+/** Implemented timeline commands. */
 export type CoreCommandType =
+  | "PlaceEdit"
   | "MoveEdit"
   | "TrimEdit"
   | "SplitEdit"

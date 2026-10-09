@@ -42,9 +42,9 @@ import {
   type HistoryEntry,
 } from "./history";
 import { stableId, type IdGenerator } from "./ids";
-import type { MediaInventory } from "./invariants";
+import { introducedViolations, type MediaInventory } from "./invariants";
 import { legacyToSequence, sequenceToLegacy } from "./legacy-adapter";
-import { applyTransaction } from "./transactions";
+import { applyTransaction, type ApplyOptions } from "./transactions";
 import type { ClipItem, Sequence, Transaction } from "./types";
 
 export interface Workspace {
@@ -53,7 +53,7 @@ export interface Workspace {
   histories: Record<string, History>;
 }
 
-type ClipRates = ReadonlyArray<Pick<Clip, "id" | "fps">>;
+type ClipRates = ReadonlyArray<Pick<Clip, "id" | "fps"> & Partial<Pick<Clip, "durationSeconds">>>;
 
 export function workspaceFromVersions(versions: EditVersion[]): Workspace {
   return { versions, histories: {} };
@@ -433,6 +433,7 @@ function deepEqual(a: unknown, b: unknown): boolean {
 export function restoreHistory(
   p: unknown,
   parent: Sequence | null = null,
+  options: ApplyOptions = {},
 ): { history: History; lost: boolean } | null {
   if (!isRecord(p) || !isSequence(p["present"])) return null;
   // References resolve only against the very import they were written against.
@@ -450,7 +451,7 @@ export function restoreHistory(
   if (!base || !Array.isArray(p["past"]) || !Array.isArray(p["future"])) return presentOnly;
   let h = createHistory(base, cap);
   for (const txn of p["past"] as Transaction[]) {
-    const c = commit(h, txn);
+    const c = commit(h, txn, options);
     if (!c.ok) return presentOnly;
     h = c.history;
   }
@@ -466,7 +467,7 @@ export function restoreHistory(
   const future: HistoryEntry[] = [];
   let cur = h.present;
   for (const txn of p["future"] as Transaction[]) {
-    const out = applyTransaction(cur, txn);
+    const out = applyTransaction(cur, txn, options);
     if (!out.ok) break; // keep what replays; drop the rest of the redo stack
     future.push({
       transaction: txn,
@@ -508,6 +509,13 @@ export function parseSavedEditStateV2(
   if (!analysisId || !isRecord(raw)) return null;
   if (raw["schema"] !== EDIT_STATE_V2_SCHEMA || raw["analysisId"] !== analysisId) return null;
   if (!Array.isArray(raw["versions"])) return null;
+  // New placements require verified source bounds, including during undo-log
+  // replay. Old rate-only callers can still restore cuts without placements.
+  const media: MediaInventory | undefined = clips?.every(
+    (c) => typeof c.durationSeconds === "number" && Number.isFinite(c.durationSeconds),
+  )
+    ? new Map(clips.map((c) => [c.id, { durationSeconds: c.durationSeconds! }]))
+    : undefined;
   const savedHistories = isRecord(raw["histories"]) ? raw["histories"] : {};
   const warnings: string[] = [];
   const histories: Record<string, History> = {};
@@ -531,7 +539,7 @@ export function parseSavedEditStateV2(
     if (v["kind"] === "edited") {
       const parentVersion = parentOf(directors, v as unknown as EditVersion);
       const parent = parentVersion && clips ? importedSequence(parentVersion, clips) : null;
-      const restored = restoreHistory(savedHistories[id], parent);
+      const restored = restoreHistory(savedHistories[id], parent, { media });
       if (!restored) {
         warnings.push(`Edited version ${String(v["version"] ?? id)} could not be restored.`);
         continue;
@@ -540,6 +548,21 @@ export function parseSavedEditStateV2(
         warnings.push(
           `Undo history for ${String(v["version"] ?? id)} could not be fully restored.`,
         );
+      // Integrity report only — nothing is repaired or rewritten: media
+      // problems the saved cut has GAINED since its parent was imported
+      // (unknown media, sources past the media's end). Problems an imported
+      // legacy cut already had are not reported again.
+      if (media) {
+        const found = introducedViolations(
+          parent ?? { ...restored.history.present, items: {}, links: {} },
+          restored.history.present,
+          { media },
+        ).filter((x) => x.code === "missing-media" || x.code === "out-of-media-bounds");
+        if (found.length)
+          warnings.push(
+            `${String(v["version"] ?? id)} refers to media that is missing or shorter than the cut uses (${found.length} clip${found.length === 1 ? "" : "s"}). It was opened unchanged — check it before exporting.`,
+          );
+      }
       histories[id] = restored.history;
       versions.push(
         refreshed(

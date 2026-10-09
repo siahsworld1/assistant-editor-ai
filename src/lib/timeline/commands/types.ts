@@ -7,6 +7,7 @@ import type {
   ClipItem,
   Command,
   EditOwner,
+  FrameRate,
   LinkGroup,
   Sequence,
   TransactionOrigin,
@@ -47,6 +48,19 @@ export type CommandOutcome =
   | { ok: false; error: TimelineError };
 
 /* ------------------------------- parameters ------------------------------- */
+
+/** Place picture-only media on an overlay video track, without ripple.
+ * All ids are fixed when built; media bounds must be known when applied. */
+export interface PlaceEditParams {
+  itemId: string;
+  mediaClipId: string;
+  mediaRate: FrameRate;
+  sourceInFrame: number;
+  sourceOutFrame: number;
+  startFrame: number;
+  trackId: string;
+  label: string;
+}
 
 /** Move items (and everything linked to them) along their tracks. */
 export interface MoveEditParams {
@@ -107,6 +121,7 @@ export interface SetProtectionParams {
 }
 
 export interface CommandParamsByType {
+  PlaceEdit: PlaceEditParams;
   MoveEdit: MoveEditParams;
   TrimEdit: TrimEditParams;
   SplitEdit: SplitEditParams;
