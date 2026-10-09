@@ -16,11 +16,13 @@ import {
   type ProposalContext,
   type ProposalOp,
 } from "./proposals";
-import { endFrame, isLockedFrom } from "./selectors";
+import { endFrame, isLockedFrom, sequenceEndFrame } from "./selectors";
+import { rateFromFps, secondsToFrames, sequenceDurationFrames } from "./time";
 import type { ClipItem, Sequence } from "./types";
 import { sequenceOf } from "./workspace";
 
 export type DemoKind =
+  | "place-broll"
   | "move-broll"
   | "trim-interview"
   | "ripple-remove"
@@ -29,6 +31,7 @@ export type DemoKind =
   | "protected-conflict";
 
 export const DEMO_KINDS: ReadonlyArray<{ kind: DemoKind; label: string }> = [
+  { kind: "place-broll", label: "Add a B-roll clip" },
   { kind: "move-broll", label: "Move a B-roll clip" },
   { kind: "trim-interview", label: "Trim an interview clip" },
   { kind: "ripple-remove", label: "Remove a section" },
@@ -69,6 +72,42 @@ export function demoProposal(kind: DemoKind, ctx: ProposalContext): DemoResult {
   };
 
   switch (kind) {
+    case "place-broll": {
+      const overlays = onTrack(seq, "V2");
+      const track = seq.tracks.find((t) => t.name === "V2" && t.kind === "video" && t.order > 0);
+      if (!track || !overlays.length)
+        return { ok: false, reason: "This demo needs a V2 track and an existing B-roll source." };
+      const candidates: Array<Record<string, unknown>> = [];
+      for (const source of overlays) {
+        const clip = ctx.clips.find((c) => c.id === source.mediaClipId);
+        if (!clip || !(clip.fps > 0)) continue; // no guessed frame rates
+        const rate = rateFromFps(clip.fps);
+        const out = secondsToFrames(2, rate);
+        const duration = sequenceDurationFrames(0, out, rate, seq.rate);
+        for (const start of [0, ...overlays.map(endFrame)]) {
+          if (start + duration > sequenceEndFrame(seq)) continue;
+          candidates.push(
+            make(
+              [
+                {
+                  op: "place",
+                  mediaClipId: clip.id,
+                  trackId: track.id,
+                  sourceInFrame: 0,
+                  sourceOutFrame: out,
+                  startFrame: start,
+                  label: "Demo B-roll placement",
+                },
+              ],
+              "Add a picture-only B-roll clip",
+              "Adds a short cutaway in a free V2 space. Interview picture and audio are unchanged.",
+              "Development demonstration only: uses an existing cutaway source to test placement, not relevance or coverage selection.",
+            ),
+          );
+        }
+      }
+      return firstValid(candidates);
+    }
     case "move-broll":
       return firstValid(
         onTrack(seq, "V2")

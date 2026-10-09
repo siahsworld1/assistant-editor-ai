@@ -12,6 +12,7 @@ import { useCallback, useMemo, useState } from "react";
 import type { AcceptOutcome, ProposalIssue, ProposalOp, Review } from "@/lib/timeline/proposals";
 import { reviewProposal } from "@/lib/timeline/proposals";
 import type { Interpretation } from "@/lib/timeline/instructions";
+import { frameToTc } from "@/lib/timeline/time";
 import type { ClipItem, Sequence } from "@/lib/timeline/types";
 import { derivedTimeline } from "@/lib/timeline/workspace";
 import type { EditorApi } from "./store";
@@ -57,6 +58,11 @@ function clipName(seq: Sequence | null, id: string): string {
 /** One operation, in words, against the cut it was proposed for. */
 export function describeOperation(op: ProposalOp, seq: Sequence | null): string {
   switch (op.op) {
+    case "place": {
+      const track = seq?.tracks.find((t) => t.id === op.trackId)?.name ?? op.trackId;
+      const at = seq ? frameToTc(op.startFrame, seq.rate) : `${op.startFrame} frames`;
+      return `Add "${op.label}" on ${track} at ${at} (picture only; interview audio stays)`;
+    }
     case "move": {
       const n = Math.abs(op.deltaFrames);
       const who = op.itemIds.map((id) => clipName(seq, id)).join(", ");

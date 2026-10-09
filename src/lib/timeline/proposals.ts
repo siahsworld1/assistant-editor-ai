@@ -32,6 +32,7 @@ import type { IdGenerator } from "./ids";
 import { seededIds } from "./ids";
 import type { MediaInventory } from "./invariants";
 import { expandLinked, isLockedFrom } from "./selectors";
+import { rateFromFps } from "./time";
 import { applyTransaction, makeTransaction } from "./transactions";
 import type { ClipItem, Command, Sequence, Transaction } from "./types";
 import {
@@ -55,6 +56,17 @@ export type SourceRef =
 
 /** The operations proposals support, each compiled 1:1 to an existing command. */
 export type ProposalOp =
+  /** PlaceEdit: add picture-only media on an overlay track. Source rate and
+   * item id are derived locally, never supplied by a proposal. */
+  | {
+      op: "place";
+      mediaClipId: string;
+      trackId: string;
+      sourceInFrame: number;
+      sourceOutFrame: number;
+      startFrame: number;
+      label: string;
+    }
   /** MoveEdit: move items (linked partners follow) by whole sequence frames. */
   | { op: "move"; itemIds: string[]; deltaFrames: number }
   /** TrimEdit: move one edge of an item (linked partners follow) in source frames. */
@@ -296,7 +308,38 @@ function parseOp(
     if (v === 0) return bad(`${path}.${k}`, `${k} must not be zero.`, "invalid-range");
     if (Math.abs(v) > MAX_ABS_FRAMES) bad(`${path}.${k}`, `${k} is out of range.`, "invalid-range");
   };
-  if (kind === "move") {
+  if (kind === "place") {
+    keys([
+      "op",
+      "mediaClipId",
+      "trackId",
+      "sourceInFrame",
+      "sourceOutFrame",
+      "startFrame",
+      "label",
+    ]);
+    for (const k of ["mediaClipId", "trackId"]) {
+      if (typeof op[k] !== "string" || !ID_RE.test(op[k] as string))
+        bad(`${path}.${k}`, "Invalid id.");
+    }
+    for (const k of ["sourceInFrame", "sourceOutFrame", "startFrame"]) {
+      const v = op[k];
+      if (!isInt(v) || v < 0 || v > MAX_ABS_FRAMES)
+        bad(
+          `${path}.${k}`,
+          `${k} must be a non-negative whole frame within range.`,
+          "invalid-range",
+        );
+    }
+    if (
+      isInt(op["sourceInFrame"]) &&
+      isInt(op["sourceOutFrame"]) &&
+      op["sourceOutFrame"] <= op["sourceInFrame"]
+    )
+      bad(`${path}.sourceOutFrame`, "Source out must be after source in.", "invalid-range");
+    if (typeof op["label"] !== "string" || !op["label"].trim() || op["label"].length > MAX_TEXT)
+      bad(`${path}.label`, "Placement needs a non-empty, bounded label.");
+  } else if (kind === "move") {
     keys(["op", "itemIds", "deltaFrames"]);
     itemList("itemIds");
     frames("deltaFrames");
@@ -448,7 +491,7 @@ export interface AnalysisInventory {
 export interface ProposalContext {
   workspace: Workspace;
   activeVersionId: string;
-  clips: ReadonlyArray<Pick<Clip, "id" | "fps">>;
+  clips: ReadonlyArray<Pick<Clip, "id" | "fps"> & Partial<Pick<Clip, "filename">>>;
   media?: MediaInventory | undefined;
   /** Required for proposals that cite evidence; without it, evidence cannot be
    * verified and the proposal is refused. */
@@ -467,9 +510,26 @@ export type Review =
     }
   | { ok: false; proposal: EditProposal | null; issues: ProposalIssue[] };
 
-function compile(p: EditProposal, ids: IdGenerator): TypedCommand[] {
-  return p.operations.map((op) => {
+function compile(
+  p: EditProposal,
+  ids: IdGenerator,
+  seq: Sequence,
+  ctx: ProposalContext,
+): TypedCommand[] {
+  return p.operations.map((op, index) => {
     switch (op.op) {
+      case "place": {
+        const { op: _kind, ...params } = op;
+        const clip = ctx.clips.find((c) => c.id === op.mediaClipId)!;
+        // The new clip's id is derived from the proposal itself (see
+        // placementItemId): preview and accept create the SAME id, and the
+        // proposal never chooses it. Review has already refused media with no
+        // usable frame rate, so nothing is guessed here.
+        return commands.place(placementIds(p.id, index), {
+          ...params,
+          mediaRate: rateFromFps(clip.fps),
+        });
+      }
       case "move":
         return commands.move(ids, op.itemIds, op.deltaFrames);
       case "trim":
@@ -484,8 +544,26 @@ function compile(p: EditProposal, ids: IdGenerator): TypedCommand[] {
   });
 }
 
-function transactionFor(p: EditProposal, ids: IdGenerator, createdAt?: string): Transaction {
-  const cmds = compile(p, ids) as unknown as Command[]; // typed builders → the log's shape
+/** Ids for the clip a proposal's `place` operation adds — fixed by the
+ * proposal id and the operation's position, never chosen by the proposal. */
+function placementIds(proposalId: string, opIndex: number): IdGenerator {
+  return seededIds(`proposal-place:${proposalId}:${opIndex}`);
+}
+
+/** The id the clip added by `operations[opIndex]` will have, in the preview
+ * and after acceptance alike. */
+export function placementItemId(proposalId: string, opIndex: number): string {
+  return placementIds(proposalId, opIndex).next("item");
+}
+
+function transactionFor(
+  p: EditProposal,
+  ids: IdGenerator,
+  seq: Sequence,
+  ctx: ProposalContext,
+  createdAt?: string,
+): Transaction {
+  const cmds = compile(p, ids, seq, ctx) as unknown as Command[]; // typed builders → the log's shape
   const label = `Director: ${p.instruction.trim()}`.slice(0, 120);
   return makeTransaction(ids, label, "director", cmds, createdAt);
 }
@@ -525,6 +603,23 @@ export function reviewProposal(raw: unknown, ctx: ProposalContext): Review {
   const issues: ProposalIssue[] = [];
   const referenced: string[] = [];
   p.operations.forEach((op, i) => {
+    if (op.op === "place") {
+      const clip = ctx.clips.find((c) => c.id === op.mediaClipId);
+      if (!clip)
+        issues.push({
+          code: "invalid-range",
+          path: `operations[${i}].mediaClipId`,
+          message: "Placement references media that is not in this project.",
+        });
+      else if (!(typeof clip.fps === "number" && Number.isFinite(clip.fps) && clip.fps > 0))
+        issues.push({
+          code: "invalid-range",
+          path: `operations[${i}].mediaClipId`,
+          message:
+            "That media's frame rate isn't known, so its source frames can't be placed exactly.",
+        });
+      return; // New media is not an existing timeline item.
+    }
     const list = op.op === "trim" ? [op.itemId] : op.itemIds;
     list.forEach((id, j) => {
       if (!seq.items[id])
@@ -574,9 +669,13 @@ export function reviewProposal(raw: unknown, ctx: ProposalContext): Review {
   if (issues.length) return fail(issues);
 
   // 5. Dry run: the exact transaction acceptance would commit.
-  const run = applyTransaction(seq, transactionFor(p, seededIds(`preview:${p.id}`), "preview"), {
-    media: ctx.media,
-  });
+  const run = applyTransaction(
+    seq,
+    transactionFor(p, seededIds(`preview:${p.id}`), seq, ctx, "preview"),
+    {
+      media: ctx.media,
+    },
+  );
   if (!run.ok) {
     // The engine refuses a Director change to manual / unknown-owned material
     // on its own (e.g. a ripple shifting a hand-edited clip). Say which, and why.
@@ -662,7 +761,12 @@ export function acceptProposal(
   const review = reviewProposal(raw, ctx);
   if (!review.ok) return { ok: false, issues: review.issues };
   const p = review.proposal;
-  const txn = transactionFor(p, ctx.ids);
+  const txn = transactionFor(
+    p,
+    ctx.ids,
+    sequenceOf(ctx.workspace, ctx.activeVersionId, ctx.clips)!,
+    ctx,
+  );
   const out: DispatchOutcome = dispatchTransaction(ctx.workspace, ctx.activeVersionId, txn, {
     clips: ctx.clips,
     media: ctx.media,

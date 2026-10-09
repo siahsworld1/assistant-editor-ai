@@ -23,7 +23,14 @@ import { describeStory, type StoryAskResult, type StoryShown } from "@/lib/ae/st
 import type { EditorApi } from "@/lib/ae/store";
 import { DEMO_KINDS, demoProposal } from "@/lib/timeline/demo-proposals";
 import { EXAMPLES, interpretInstruction } from "@/lib/timeline/instructions";
-import type { EditProposal, ProposalIssue, ProposalIssueCode } from "@/lib/timeline/proposals";
+import {
+  placementItemId,
+  type EditProposal,
+  type ProposalIssue,
+  type ProposalIssueCode,
+  type ProposalOp,
+} from "@/lib/timeline/proposals";
+import { frameToTc, rateFromFps, sequenceDurationFrames } from "@/lib/timeline/time";
 import { cn } from "@/lib/utils";
 
 const ISSUE_TITLE: Record<ProposalIssueCode, string> = {
@@ -412,6 +419,13 @@ export function ProposalPanel({
                 {proposal.operations.map((op, i) => (
                   <li key={i}>
                     {describeOperation(op, editor.sequence)}
+                    {op.op === "place" && (
+                      <PlacementDetail
+                        op={op}
+                        editor={editor}
+                        newItemId={placementItemId(proposal.id, i)}
+                      />
+                    )}
                     {op.op === "reorder" && (
                       <ReorderDetail order={op.itemIds} seq={editor.sequence} />
                     )}
@@ -601,6 +615,47 @@ function StoryDetail({ shown }: { shown: StoryShown }) {
         </ul>
       )}
     </div>
+  );
+}
+
+/** What a placement adds, from the project's own media and the validated
+ * operation: which clip, its source range, where and on which track. */
+function PlacementDetail({
+  op,
+  editor,
+  newItemId,
+}: {
+  op: Extract<ProposalOp, { op: "place" }>;
+  editor: EditorApi;
+  newItemId: string;
+}) {
+  const seq = editor.sequence;
+  const clip = editor.proposalContext().clips.find((c) => c.id === op.mediaClipId) as
+    { id: string; fps: number; filename?: string } | undefined;
+  if (!seq || !clip || !(clip.fps > 0)) return null; // review explains why
+  const rate = rateFromFps(clip.fps);
+  const duration = sequenceDurationFrames(op.sourceInFrame, op.sourceOutFrame, rate, seq.rate);
+  const track = seq.tracks.find((t) => t.id === op.trackId)?.name ?? op.trackId;
+  return (
+    <dl
+      className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 text-[11px] text-muted-foreground"
+      data-testid="placement-detail"
+      data-new-item-id={newItemId}
+    >
+      <dt>Source</dt>
+      <dd data-testid="placement-source">{clip.filename ?? op.mediaClipId}</dd>
+      <dt>Source in / out</dt>
+      <dd data-testid="placement-source-range">
+        {frameToTc(op.sourceInFrame, rate)} – {frameToTc(op.sourceOutFrame, rate)} (out exclusive)
+      </dd>
+      <dt>Timeline in / out</dt>
+      <dd data-testid="placement-timeline">
+        {track} · {frameToTc(op.startFrame, seq.rate)} –{" "}
+        {frameToTc(op.startFrame + duration, seq.rate)} ({duration} frames, picture only)
+      </dd>
+      <dt>New clip</dt>
+      <dd className="font-tc">{newItemId}</dd>
+    </dl>
   );
 }
 
