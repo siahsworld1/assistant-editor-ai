@@ -488,6 +488,9 @@ describe("protection", () => {
     improve();
     await settle(() => aiState() === "refused");
     expect(aiText()).toMatch(/nothing to rank/);
+    // No recommendation is under review, so none is said to be "still available".
+    expect(aiText()).toMatch(/Nothing was changed\.$/);
+    expect(aiText()).not.toMatch(/deterministic recommendation/);
     expect(fakeRank.requests).toHaveLength(0);
   }, 30000);
 

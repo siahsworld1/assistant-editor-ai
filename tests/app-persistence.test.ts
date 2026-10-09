@@ -141,6 +141,27 @@ describe("schema-2 edit state (1.1) beside beta.1's schema-1 file", () => {
   const leftovers = (c: { userDataDir: string }) =>
     readdirSync(path.join(c.userDataDir, "edit-state")).filter((f) => f.endsWith(".partial"));
 
+  it("a damaged file reads as no state, and a copy is kept (once) before a later save can replace it", async () => {
+    const { c, file } = await withSavedFile();
+    const damaged = readFileSync(file).subarray(0, 20);
+    writeFileSync(file, damaged);
+    const dir = path.join(c.userDataDir, "edit-state");
+    const first = await handleDesktopAction(c, "loadEditStateV2", { id: "proj-1" });
+    expect(first).toMatchObject({ ok: true, state: null, unreadable: true });
+    expect(first.preservedAs).toMatch(/^proj-1\.v2\.unreadable-[0-9a-f]{12}\.json$/);
+    expect(readFileSync(path.join(dir, first.preservedAs)).equals(damaged)).toBe(true);
+    // Reopening the same damaged file keeps the one copy.
+    const again = await handleDesktopAction(c, "loadEditStateV2", { id: "proj-1" });
+    expect(again.preservedAs).toBe(first.preservedAs);
+    expect(readdirSync(dir).filter((f) => f.includes("unreadable"))).toEqual([first.preservedAs]);
+    // The next save replaces the damaged file; the copy stays.
+    expect((await c.saveEditStateV2("proj-1", v2State("a2"))).ok).toBe(true);
+    expect((await c.loadEditStateV2("proj-1")).state).toEqual(v2State("a2"));
+    expect(readFileSync(path.join(dir, first.preservedAs)).equals(damaged)).toBe(true);
+    // A readable file is never copied.
+    expect(readdirSync(dir).filter((f) => f.includes("unreadable"))).toHaveLength(1);
+  });
+
   it("rejects an oversize save (in bytes, not characters) and keeps the previous file", async () => {
     const { c, file, before } = await withSavedFile();
     const huge = { ...v2State("a1"), blob: "x".repeat(9 * 1024 * 1024) };

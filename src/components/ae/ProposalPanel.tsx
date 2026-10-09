@@ -1091,6 +1091,7 @@ function CoverPanel({
         <AiRankPanel
           ai={ai}
           aiAssisted={shownPlan?.ranking === "ai-assisted"}
+          hasProposal={pending}
           requesting={requesting}
           onImprove={onImprove}
           onCancel={onCancelImprove}
@@ -1219,6 +1220,7 @@ function CoverPanel({
 function AiRankPanel({
   ai,
   aiAssisted,
+  hasProposal,
   requesting,
   onImprove,
   onCancel,
@@ -1226,12 +1228,16 @@ function AiRankPanel({
 }: {
   ai: AiRankState | null;
   aiAssisted: boolean;
+  /** A recommendation is under review (it stays when the AI fails). */
+  hasProposal: boolean;
   requesting: boolean;
   onImprove: () => void;
   onCancel: () => void;
   onDeterministic: () => void;
 }) {
-  const kept = "Nothing was changed; the deterministic recommendation is still available.";
+  const kept = hasProposal
+    ? "Nothing was changed; the deterministic recommendation is still available."
+    : "Nothing was changed.";
   const text: Record<AiRankState["state"], string> = {
     requesting: "Asking the AI to rank the B-roll candidates…",
     ready: `AI-assisted recommendation ready — preview it below, then accept or reject it.${ai?.message ? ` AI summary: “${ai.message}”` : ""}`,

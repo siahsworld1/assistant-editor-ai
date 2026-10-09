@@ -9,6 +9,7 @@ import {
   type PreviewTarget,
 } from "@/components/ae/SourceVisuals";
 import { ProposalPanel } from "@/components/ae/ProposalPanel";
+import { RestoreWarnings } from "@/components/ae/RestoreWarnings";
 import { TimelineEditor } from "@/components/ae/TimelineEditor";
 import { useProposalPreview } from "@/lib/ae/proposal-preview";
 import { decisionSourceRange } from "@/lib/ae/source-range";
@@ -69,6 +70,7 @@ function CutPage() {
     coverCuts,
     askCoverageRanking,
     setMediaRole,
+    restoreWarnings,
   } = useAE();
 
   const version = versions.find((v) => v.id === activeVersionId) ?? versions[0]!;
@@ -245,6 +247,8 @@ function CutPage() {
                 </div>
               </div>
             )}
+
+            <RestoreWarnings warnings={restoreWarnings} />
 
             <ProposalPanel
               editor={editor}

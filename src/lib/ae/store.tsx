@@ -330,6 +330,10 @@ interface AEContextValue {
    * returns, then planned by the deterministic engine. Never applies. */
   askCoverageRanking: () => Promise<CoverageRankAsk>;
   setActiveVersion: (id: string) => void;
+  /** What couldn't be restored when the project's saved edits were opened
+   * (damaged or out-of-date file, undo history dropped, media the cut no
+   * longer matches). Shown to the filmmaker; nothing is repaired silently. */
+  restoreWarnings: string[];
   /** The canonical schema-2 editor for the active version (see EditorApi). */
   editor: EditorApi;
   setTargetSeconds: (s: number) => void;
@@ -567,6 +571,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
   const storeRef = useRef<ProjectStore | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [activeProject, setActiveProject] = useState<ProjectRecord | null>(null);
+  const [restoreWarnings, setRestoreWarnings] = useState<string[]>([]);
   const [projectStoreLabel, setProjectStoreLabel] = useState("In-memory (not persisted)");
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [projectBusy, setProjectBusy] = useState(false);
@@ -891,14 +896,20 @@ export function AEProvider({ children }: { children: ReactNode }) {
       // rewritten. Schema 1 converts to Sequences in memory, on demand.
       let v2: ReturnType<typeof parseSavedEditStateV2> = null;
       let saved: SavedEditState | null = null;
+      const warnings: string[] = [];
       if (desktop?.available) {
         if (desktop.loadEditStateV2) {
           try {
-            v2 = parseSavedEditStateV2(
-              (await desktop.loadEditStateV2(projectId)).state,
-              analysisId,
-              clips,
-            );
+            const res = await desktop.loadEditStateV2(projectId);
+            v2 = parseSavedEditStateV2(res.state, analysisId, clips);
+            if (res.unreadable)
+              warnings.push(
+                `This project's saved edits couldn't be read (the file is damaged), so its last readable versions are shown.${res.preservedAs ? ` A copy of the damaged file was kept as "${res.preservedAs}" in the app's data folder.` : ""}`,
+              );
+            else if (res.state && !v2)
+              warnings.push(
+                "This project's saved edits belong to a different analysis of its media (or aren't readable), so they weren't opened; its Director versions are shown. Your next edit replaces them.",
+              );
           } catch {
             v2 = null;
           }
@@ -913,6 +924,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
         }
       }
       if (activeRef.current.record?.id !== projectId) return; // switched meanwhile
+      setRestoreWarnings([...warnings, ...(v2?.warnings ?? [])]);
       schema2Ref.current = !!v2;
       persistedRef.current = null;
       setPersistence(SAVED); // what is on screen is what is on disk
@@ -977,6 +989,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
     hydratedKeyRef.current = null;
     saveAttemptRef.current += 1; // a write still in flight no longer reports here
     setPersistence(SAVED);
+    setRestoreWarnings([]);
     setSelects([]);
     setStories([]);
     setChosenStoryId(null);
@@ -1875,6 +1888,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       coverCuts,
       askCoverageRanking,
       setActiveVersion: (id: string) => setActiveVersionId(id),
+      restoreWarnings,
       editor,
       setTargetSeconds,
       updateSettings: (patch: Partial<SettingsState>) => setSettings((s) => ({ ...s, ...patch })),
@@ -1916,6 +1930,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       askStory,
       coverCuts,
       askCoverageRanking,
+      restoreWarnings,
       setMode,
       projects,
       activeProject,

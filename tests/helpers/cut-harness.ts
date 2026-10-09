@@ -11,6 +11,7 @@ import { act, createElement, Fragment, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { expect, vi } from "vitest";
 import { ProposalPanel } from "@/components/ae/ProposalPanel";
+import { RestoreWarnings } from "@/components/ae/RestoreWarnings";
 import { TimelineEditor } from "@/components/ae/TimelineEditor";
 import { useProposalPreview, type ProposalPreview } from "@/lib/ae/proposal-preview";
 import { AEProvider, useAE } from "@/lib/ae/store";
@@ -181,7 +182,8 @@ export function Harness(): ReactNode {
     },
     clips,
   });
-  return createElement(Fragment, null, panel, timeline);
+  const warnings = createElement(RestoreWarnings, { warnings: ae.restoreWarnings });
+  return createElement(Fragment, null, warnings, panel, timeline);
 }
 
 export function install(disk: Disk) {
@@ -300,7 +302,20 @@ export function install(disk: Disk) {
       disk.v1 = JSON.stringify(state);
       return { ok: true };
     }),
-    loadEditStateV2: vi.fn(async () => ({ ok: true, state: disk.v2 ? JSON.parse(disk.v2) : null })),
+    loadEditStateV2: vi.fn(async () => {
+      if (!disk.v2) return { ok: true, state: null };
+      try {
+        return { ok: true, state: JSON.parse(disk.v2) };
+      } catch {
+        // As the main process does: unreadable, a copy kept under this name.
+        return {
+          ok: true,
+          state: null,
+          unreadable: true,
+          preservedAs: "proj-1.v2.unreadable-x.json",
+        };
+      }
+    }),
     saveEditStateV2: vi.fn(async (_id: string, state: unknown) => {
       if (disk.fail2) return { ok: false, code: disk.fail2 };
       disk.v2 = JSON.stringify(state);

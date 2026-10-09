@@ -59,7 +59,14 @@ export interface DesktopCapabilitiesApi {
   ): Promise<{ ok: boolean; error?: string; code?: string }>;
   /** Schema-2 editor state (1.1+), kept in its own file so the schema-1 file
    * above stays exactly as beta.1 wrote it. Optional: older bridges lack it. */
-  loadEditStateV2?(id: string): Promise<{ ok: boolean; state?: unknown; error?: string }>;
+  loadEditStateV2?(id: string): Promise<{
+    ok: boolean;
+    state?: unknown;
+    error?: string;
+    /** The file exists but couldn't be read; a copy was kept as `preservedAs`. */
+    unreadable?: boolean;
+    preservedAs?: string;
+  }>;
   saveEditStateV2?(
     id: string,
     state: unknown,

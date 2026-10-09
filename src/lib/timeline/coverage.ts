@@ -237,6 +237,19 @@ export function analyzeCoverage(seq: Sequence, versionId: string): CoverageAnaly
     else union.push([o.startFrame, endFrame(o)]);
   }
 
+  // Indexed once, so each cut looks only at what is near it (a long cut was
+  // O(cuts × items) before). Results and their order are unchanged.
+  const overlayIndex = rangeIndex(overlays);
+  const belowIndex = rangeIndex(
+    overlayTrack
+      ? Object.values(seq.items).filter((i) => {
+          const t = seq.tracks.find((x) => x.id === i.trackId);
+          return t?.kind === "video" && t.order < overlayTrack.order;
+        })
+      : [],
+  );
+  const onOverlayIndex = rangeIndex(overlayTrack ? itemsOnTrack(seq, overlayTrack.id) : []);
+
   const cuts: CoverageCut[] = [];
   for (let n = 1; n < clips.length; n += 1) {
     const left = clips[n - 1]!;
@@ -248,7 +261,7 @@ export function analyzeCoverage(seq: Sequence, versionId: string): CoverageAnaly
     const kind: CutKind =
       gap === null ? "source-change" : Math.abs(gap) > 1 ? "jump" : "continuous";
 
-    const span = union.find(([a, b]) => a < frame && b > frame);
+    const span = spanAt(union, frame);
     const before = span ? frame - span[0] : 0;
     const after = span ? span[1] - frame : 0;
     const coverage: CutCoverage = !span
@@ -256,25 +269,13 @@ export function analyzeCoverage(seq: Sequence, versionId: string): CoverageAnaly
       : before >= margin && after >= margin
         ? "covered"
         : "partial";
-    const coveringIds = span
-      ? overlays
-          .filter((o) => intersects(o.startFrame, endFrame(o), span[0], span[1]))
-          .map((o) => o.id)
-      : [];
+    const coveringIds = span ? intersecting(overlayIndex, span[0], span[1]).map((o) => o.id) : [];
 
     // What would stop the Director covering it (nothing is decided here).
     const blockers: CoverBlocker[] = [];
     const lo = frame - margin;
     const hi = frame + margin;
-    const beneath = Object.values(seq.items).filter((i) => {
-      const t = seq.tracks.find((x) => x.id === i.trackId);
-      return (
-        t?.kind === "video" &&
-        overlayTrack !== null &&
-        t.order < overlayTrack.order &&
-        intersects(i.startFrame, endFrame(i), lo, hi)
-      );
-    });
+    const beneath = intersecting(belowIndex, lo, hi);
     const lockedBeneath = beneath.filter((i) => isLockedFrom(seq, i, "director"));
     const hardLocked = lockedBeneath.filter((i) => isLockedFrom(seq, i, "manual"));
     const aiOnly = lockedBeneath.filter((i) => !isLockedFrom(seq, i, "manual"));
@@ -303,9 +304,7 @@ export function analyzeCoverage(seq: Sequence, versionId: string): CoverageAnaly
       if (overlayTrack.hidden)
         blockers.push({ code: "hidden-track", message: `${overlayTrack.name} is hidden.` });
       if (coverage !== "covered") {
-        const occupying = itemsOnTrack(seq, overlayTrack.id).filter((i) =>
-          intersects(i.startFrame, endFrame(i), lo, hi),
-        );
+        const occupying = intersecting(onOverlayIndex, lo, hi);
         if (occupying.length)
           blockers.push({
             code: "overlay-conflict",
@@ -357,6 +356,52 @@ export function analyzeCoverage(seq: Sequence, versionId: string): CoverageAnaly
       potentialJumpsNeedingCover: count((c) => c.potentialJump),
     },
   };
+}
+
+/** Items sorted by start (with their original positions), for range queries. */
+interface RangeIndex {
+  byStart: Array<{ item: ClipItem; at: number }>;
+  maxLength: number;
+}
+function rangeIndex(list: readonly ClipItem[]): RangeIndex {
+  const byStart = list
+    .map((item, at) => ({ item, at }))
+    .sort((a, b) => a.item.startFrame - b.item.startFrame || a.at - b.at);
+  let maxLength = 0;
+  for (const { item } of byStart) maxLength = Math.max(maxLength, endFrame(item) - item.startFrame);
+  return { byStart, maxLength };
+}
+/** The indexed items intersecting [lo, hi), in their original order. */
+function intersecting(ix: RangeIndex, lo: number, hi: number): ClipItem[] {
+  let a = 0;
+  let b = ix.byStart.length;
+  while (a < b) {
+    const m = (a + b) >> 1;
+    if (ix.byStart[m]!.item.startFrame < hi) a = m + 1;
+    else b = m;
+  }
+  const hits: Array<{ item: ClipItem; at: number }> = [];
+  for (let k = a - 1; k >= 0; k -= 1) {
+    const e = ix.byStart[k]!;
+    if (e.item.startFrame + ix.maxLength <= lo) break; // nothing earlier reaches lo
+    if (intersects(e.item.startFrame, endFrame(e.item), lo, hi)) hits.push(e);
+  }
+  return hits.sort((x, y) => x.at - y.at).map((e) => e.item);
+}
+/** The span of `union` (sorted, disjoint) strictly around `frame`, if any. */
+function spanAt(
+  union: ReadonlyArray<[number, number]>,
+  frame: number,
+): [number, number] | undefined {
+  let a = 0;
+  let b = union.length;
+  while (a < b) {
+    const m = (a + b) >> 1;
+    if (union[m]![0] < frame) a = m + 1;
+    else b = m;
+  }
+  const span = union[a - 1];
+  return span && span[1] > frame ? span : undefined;
 }
 
 const names = (items: ClipItem[]) => items.map((i) => `"${i.label}"`).join(", ");

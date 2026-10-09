@@ -9,6 +9,7 @@
 //  - Project metadata is persisted by the main process into userData/projects.json
 //    after strict sanitisation, with hard caps on count and string lengths.
 //  - No shell execution, no arbitrary write paths, no network access here.
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
@@ -241,12 +242,31 @@ class DesktopCapabilities {
   async loadEditStateV2(id) {
     if (!(typeof id === "string" && PROJECT_ID_RE.test(id)))
       return { ok: false, error: "Invalid project id." };
+    const file = this.editStateV2Path(id);
+    let raw;
     try {
-      const raw = await fsp.readFile(this.editStateV2Path(id), "utf8");
+      raw = await fsp.readFile(file, "utf8");
+    } catch {
+      return { ok: true, state: null }; // no saved edits yet
+    }
+    try {
       const state = JSON.parse(raw);
       return { ok: true, state: state && typeof state === "object" ? state : null };
     } catch {
-      return { ok: true, state: null };
+      // Damaged: keep a copy before a later save can replace it. Named by its
+      // content, so reopening the same damaged file doesn't pile up copies.
+      const digest = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12);
+      const preservedAs = `${id}.v2.unreadable-${digest}.json`;
+      try {
+        await fsp.copyFile(
+          file,
+          path.join(path.dirname(file), preservedAs),
+          fs.constants.COPYFILE_EXCL,
+        );
+      } catch (err) {
+        if (!err || err.code !== "EEXIST") return { ok: true, state: null, unreadable: true };
+      }
+      return { ok: true, state: null, unreadable: true, preservedAs };
     }
   }
 
