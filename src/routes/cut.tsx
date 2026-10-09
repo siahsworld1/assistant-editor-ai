@@ -66,6 +66,8 @@ function CutPage() {
     editor,
     askDirector,
     askStory,
+    coverCuts,
+    setMediaRole,
   } = useAE();
 
   const version = versions.find((v) => v.id === activeVersionId) ?? versions[0]!;
@@ -79,6 +81,8 @@ function CutPage() {
   const proposals = useProposalPreview(editor);
   // The timeline's selection — what "this clip" means in a Director instruction.
   const [selection, setSelection] = useState<string[]>([]);
+  // Cover mode marks potential jump cuts on the timeline ruler.
+  const [coverageVisible, setCoverageVisible] = useState(false);
   const playback = useTimelinePlayback(proposals.previewTimeline ?? timeline, clips);
 
   const [preview, setPreview] = useState<PreviewTarget | null>(null);
@@ -247,6 +251,9 @@ function CutPage() {
               selection={selection}
               askDirector={askDirector}
               askStory={askStory}
+              coverCuts={coverCuts}
+              setMediaRole={setMediaRole}
+              onModeChange={(m) => setCoverageVisible(m === "cover")}
               onBeforeChange={playback.pause}
               demo={import.meta.env.DEV}
             />
@@ -283,6 +290,7 @@ function CutPage() {
                 playback={playback}
                 clips={clips}
                 compare={proposals.compare}
+                showCoverage={coverageVisible}
                 onSelectionChange={setSelection}
               />
             </div>

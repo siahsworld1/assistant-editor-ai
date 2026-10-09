@@ -5,7 +5,10 @@
 // Proposals come from a typed instruction, interpreted deterministically
 // (src/lib/timeline/instructions.ts — no AI provider), or from the clearly
 // labeled developer demonstration (development builds only).
-import { useEffect, useRef, useState } from "react";
+// Cover mode (Phase 7) proposes B-roll over potential jump cuts with the
+// deterministic planner (src/lib/ae/coverage-request.ts) — no AI provider;
+// switching modes or leaving CUT cancels its proposal unapplied.
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -17,10 +20,12 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import { CUT_STATE_TEXT, cutState, type CoverageRun } from "@/lib/ae/coverage-request";
 import type { DirectorProposalResult } from "@/lib/ae/service";
 import { describeOperation, type ProposalPreview } from "@/lib/ae/proposal-preview";
 import { describeStory, type StoryAskResult, type StoryShown } from "@/lib/ae/story-request";
 import type { EditorApi } from "@/lib/ae/store";
+import type { PlannedPlacement } from "@/lib/timeline/coverage-plan";
 import { DEMO_KINDS, demoProposal } from "@/lib/timeline/demo-proposals";
 import { EXAMPLES, interpretInstruction } from "@/lib/timeline/instructions";
 import {
@@ -47,6 +52,24 @@ const ISSUE_TITLE: Record<ProposalIssueCode, string> = {
   "ownership-unknown": "Unverified material",
   "engine-rejected": "Not allowed by the timeline rules",
 };
+
+type DirectorMode = "edit" | "story" | "cover";
+const MODES: readonly DirectorMode[] = ["edit", "story", "cover"];
+
+/** The last time Cover was asked for a proposal: a proposal, or why not. */
+interface CoverOutcome {
+  /** The cut it was asked about (null: there was no cut). */
+  revision: string | null;
+  code:
+    | "proposed"
+    | "refused"
+    | "no-cut"
+    | "stale"
+    | "no-overlay-track"
+    | "nothing-to-cover"
+    | "no-safe-coverage";
+  message: string;
+}
 
 /** Why a proposal can't go ahead, in the filmmaker's terms. */
 function plainReason(issue: ProposalIssue): string {
@@ -80,6 +103,9 @@ export function ProposalPanel({
   selection = [],
   askDirector,
   askStory,
+  coverCuts,
+  setMediaRole,
+  onModeChange,
   onBeforeChange,
   demo,
 }: {
@@ -100,6 +126,13 @@ export function ProposalPanel({
   /** Story mode (Phase 6): the AI Director's story plan for the current cut,
    * bound, compiled and reviewed by the store. Absent: no Story mode. */
   askStory?: (instruction: string) => Promise<StoryAskResult>;
+  /** Cover mode (Phase 7): the deterministic coverage run for the cut on
+   * screen. Absent: no Cover mode. */
+  coverCuts?: () => CoverageRun | null;
+  /** Filmmaker override of a file's role (null = automatic). */
+  setMediaRole?: (clipId: string, role: "b-roll" | "interview" | null) => Promise<boolean>;
+  /** Told when the mode changes (CUT shows coverage markers in Cover). */
+  onModeChange?: (mode: DirectorMode) => void;
 }) {
   const { review, pending, notice, interpretation } = preview;
   const proposal: EditProposal | null = review?.proposal ?? null;
@@ -108,8 +141,21 @@ export function ProposalPanel({
   const [text, setText] = useState("");
   // Edit: precise commands (and the AI Director for other wording).
   // Story: whole-interview-clip restructuring, always through the AI Director.
-  const [mode, setMode] = useState<"edit" | "story">("edit");
+  // Cover: deterministic B-roll over potential jump cuts (no AI).
+  const [mode, setMode] = useState<DirectorMode>("edit");
   const story = mode === "story" && !!askStory;
+  const cover = mode === "cover" && !!coverCuts;
+  // The run whose proposal is under review (its placements explain the ops),
+  // and the outcome of the last time coverage was asked for.
+  const [proposedRun, setProposedRun] = useState<CoverageRun | null>(null);
+  const [coverOutcome, setCoverOutcome] = useState<CoverOutcome | null>(null);
+  const [roleSaving, setRoleSaving] = useState(false);
+  // The live analysis of the cut on screen, while in Cover mode.
+  const liveSeq = editor.sequence;
+  const run = useMemo(
+    () => (cover && liveSeq && coverCuts ? coverCuts() : null),
+    [cover, liveSeq, coverCuts],
+  );
   const [shown, setShown] = useState<StoryShown | null>(null);
 
   // The AI Director's progress for the last instruction it was asked.
@@ -200,14 +246,62 @@ export function ProposalPanel({
     }
   };
 
-  const switchMode = (next: "edit" | "story") => {
+  /** Plans coverage for the cut on screen and puts the proposal up for
+   * review — or says why there is none. Never applies anything. */
+  const proposeCoverage = () => {
+    if (!coverCuts) return;
+    onBeforeChange?.();
+    request.current += 1;
+    setAi(null);
+    preview.clear();
+    setProposedRun(null);
+    const r = coverCuts();
+    if (!r) {
+      setCoverOutcome({ revision: null, code: "no-cut", message: "There is no cut to cover yet." });
+      return;
+    }
+    const revision = r.analysis.revision;
+    if (r.compiled?.ok) {
+      setCoverOutcome({ revision, code: "proposed", message: "" });
+      setProposedRun(r);
+      preview.propose(r.compiled.proposal);
+    } else if (r.compiled) {
+      setCoverOutcome({ revision, code: "refused", message: r.compiled.message });
+    } else if (!r.plan.ok) {
+      setCoverOutcome({ revision, code: r.plan.code, message: r.plan.message });
+    }
+  };
+
+  const switchMode = (next: DirectorMode) => {
     if (next === mode) return;
     request.current += 1; // a reply still on its way is dropped
     setMode(next);
+    onModeChange?.(next);
     setAi(null);
     setShown(null);
-    preview.clear();
+    setProposedRun(null);
+    setCoverOutcome(null);
+    preview.clear(); // a pending proposal is cancelled, never applied
+    if (next === "cover") proposeCoverage();
   };
+
+  const [rolesChanged, setRolesChanged] = useState(0);
+  const changeRole = async (clipId: string, role: "b-roll" | "interview" | null) => {
+    if (!setMediaRole || roleSaving) return;
+    setRoleSaving(true);
+    const saved = await setMediaRole(clipId, role);
+    setRoleSaving(false);
+    if (saved) setRolesChanged((n) => n + 1);
+  };
+  // After a role change the inventory changes: plan again on the new roles
+  // (coverCuts is rebuilt from the saved overrides).
+  const lastRoles = useRef(0);
+  useEffect(() => {
+    if (rolesChanged === lastRoles.current) return;
+    lastRoles.current = rolesChanged;
+    if (cover) proposeCoverage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once per saved change
+  }, [rolesChanged, coverCuts]);
 
   const submit = () => {
     if (!text.trim() || ai?.state === "generating") return;
@@ -231,6 +325,12 @@ export function ProposalPanel({
     }
   };
   const generating = ai?.state === "generating";
+  // A coverage proposal's own placements (op i ↔ placement i), when the
+  // proposal under review is the one Cover made.
+  const planned =
+    proposedRun?.compiled?.ok && proposal && proposedRun.compiled.proposal["id"] === proposal.id
+      ? proposedRun.compiled.plan.placements
+      : null;
 
   return (
     <div className="panel p-4" data-testid="proposal-panel">
@@ -238,7 +338,7 @@ export function ProposalPanel({
         <div className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
           Director proposal
         </div>
-        {askStory && (
+        {(askStory || coverCuts) && (
           <div
             className="inline-flex overflow-hidden rounded border border-border"
             role="group"
@@ -246,32 +346,38 @@ export function ProposalPanel({
             data-testid="director-mode"
             data-mode={mode}
           >
-            {(["edit", "story"] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                data-testid={`mode-${m}`}
-                aria-pressed={mode === m}
-                disabled={pending !== null}
-                title={
-                  m === "edit"
-                    ? "Precise edits: move, trim, remove, reorder"
-                    : "Story: rearrange or remove whole interview clips"
-                }
-                onClick={() => switchMode(m)}
-                className={cn(
-                  "h-6 px-2.5 text-[11px] disabled:opacity-40",
-                  mode === m
-                    ? "bg-primary/15 text-primary"
-                    : "text-muted-foreground hover:bg-accent/40",
-                )}
-              >
-                {m === "edit" ? "Edit" : "Story"}
-              </button>
-            ))}
+            {MODES.filter((m) => m === "edit" || (m === "story" ? !!askStory : !!coverCuts)).map(
+              (m) => (
+                <button
+                  key={m}
+                  type="button"
+                  data-testid={`mode-${m}`}
+                  aria-pressed={mode === m}
+                  // Leaving Cover cancels its proposal; Edit and Story keep theirs
+                  // until accepted or rejected.
+                  disabled={pending !== null && mode !== "cover"}
+                  title={
+                    m === "edit"
+                      ? "Precise edits: move, trim, remove, reorder"
+                      : m === "story"
+                        ? "Story: rearrange or remove whole interview clips"
+                        : "Cover: B-roll over potential jump cuts — local, no AI"
+                  }
+                  onClick={() => switchMode(m)}
+                  className={cn(
+                    "h-6 px-2.5 text-[11px] disabled:opacity-40",
+                    mode === m
+                      ? "bg-primary/15 text-primary"
+                      : "text-muted-foreground hover:bg-accent/40",
+                  )}
+                >
+                  {m === "edit" ? "Edit" : m === "story" ? "Story" : "Cover"}
+                </button>
+              ),
+            )}
           </div>
         )}
-        {demo && !story && (
+        {demo && mode === "edit" && (
           <div className="flex flex-wrap items-center gap-1.5" data-testid="proposal-demo">
             <span
               className="inline-flex items-center gap-1 rounded border border-dashed border-border px-1.5 py-0.5 font-tc text-[10px] text-muted-foreground"
@@ -299,7 +405,19 @@ export function ProposalPanel({
         )}
       </div>
 
+      {cover && (
+        <CoverPanel
+          run={run}
+          outcome={coverOutcome}
+          pending={pending !== null}
+          canSetRoles={!!setMediaRole && !roleSaving}
+          onPropose={proposeCoverage}
+          onRole={(id, role) => void changeRole(id, role)}
+        />
+      )}
+
       <form
+        hidden={cover}
         className="mt-2 flex items-center gap-2"
         onSubmit={(e) => {
           e.preventDefault();
@@ -424,18 +542,20 @@ export function ProposalPanel({
                         op={op}
                         editor={editor}
                         newItemId={placementItemId(proposal.id, i)}
+                        planned={planned?.[i]}
                       />
                     )}
                     {op.op === "reorder" && (
                       <ReorderDetail order={op.itemIds} seq={editor.sequence} />
                     )}
-                    {proposal.rationale
-                      ?.filter((r) => r.opIndex === i)
-                      .map((r, j) => (
-                        <span key={j} className="block text-[11px] text-muted-foreground">
-                          Why: {r.reason}
-                        </span>
-                      ))}
+                    {!planned?.[i] &&
+                      proposal.rationale
+                        ?.filter((r) => r.opIndex === i)
+                        .map((r, j) => (
+                          <span key={j} className="block text-[11px] text-muted-foreground">
+                            Why: {r.reason}
+                          </span>
+                        ))}
                   </li>
                 ))}
               </ol>
@@ -624,10 +744,13 @@ function PlacementDetail({
   op,
   editor,
   newItemId,
+  planned,
 }: {
   op: Extract<ProposalOp, { op: "place" }>;
   editor: EditorApi;
   newItemId: string;
+  /** Cover mode: the planner's account of this placement. */
+  planned?: PlannedPlacement | undefined;
 }) {
   const seq = editor.sequence;
   const clip = editor.proposalContext().clips.find((c) => c.id === op.mediaClipId) as
@@ -653,6 +776,31 @@ function PlacementDetail({
         {track} · {frameToTc(op.startFrame, seq.rate)} –{" "}
         {frameToTc(op.startFrame + duration, seq.rate)} ({duration} frames, picture only)
       </dd>
+      {planned && (
+        <>
+          <dt>Covers</dt>
+          <dd data-testid="placement-cut">
+            the potential jump cut at {planned.cutTc} ({planned.before} frames before,{" "}
+            {planned.after} after)
+          </dd>
+          <dt>Visual evidence</dt>
+          <dd data-testid="placement-evidence">
+            “{planned.evidenceLabel}” — logged at {planned.evidenceAtTc} ({planned.evidenceId})
+          </dd>
+          <dt>Why</dt>
+          <dd data-testid="placement-why" className="text-foreground/80">
+            {planned.reason}
+          </dd>
+          <dt>Uncertain</dt>
+          <dd>
+            <ul data-testid="placement-uncertainty" className="list-disc pl-4 text-warning">
+              {planned.uncertainty.map((u, k) => (
+                <li key={k}>{u}</li>
+              ))}
+            </ul>
+          </dd>
+        </>
+      )}
       <dt>New clip</dt>
       <dd className="font-tc">{newItemId}</dd>
     </dl>
@@ -764,6 +912,187 @@ function AiStatus({
         >
           <RotateCcw className="size-3" /> Retry
         </button>
+      )}
+    </div>
+  );
+}
+
+const ROLE_TEXT = { interview: "Interview", "b-roll": "B-roll", uncertain: "Uncertain" } as const;
+
+/**
+ * Cover mode: the live cut's potential jump cuts and their coverage, why a
+ * cut gets no recommendation, the media-role controls, and a button to plan
+ * again. The proposal itself is reviewed below in the shared review UI.
+ */
+function CoverPanel({
+  run,
+  outcome,
+  pending,
+  canSetRoles,
+  onPropose,
+  onRole,
+}: {
+  run: CoverageRun | null;
+  outcome: CoverOutcome | null;
+  pending: boolean;
+  canSetRoles: boolean;
+  onPropose: () => void;
+  onRole: (clipId: string, role: "b-roll" | "interview" | null) => void;
+}) {
+  const h = "text-[11px] uppercase tracking-wide text-muted-foreground";
+  const jumps = run ? run.analysis.cuts.filter((c) => c.kind === "jump") : [];
+  const plan = run ? (run.plan.ok ? run.plan.plan : run.plan.plan) : undefined;
+  const skipOf = new Map((plan?.skipped ?? []).map((sk) => [sk.cutId, sk]));
+  const placeOf = new Map((plan?.placements ?? []).map((p) => [p.cutId, p]));
+  const counts = { uncovered: 0, partial: 0, covered: 0, blocked: 0 };
+  for (const c of jumps) counts[cutState(c)] += 1;
+  const uncertainEvidence =
+    run?.inventory.excluded.filter((e) => e.code === "uncertain-role").length ?? 0;
+  const candidates = run?.inventory.candidates.filter((c) => c.role.role === "b-roll") ?? [];
+  const brollFiles = new Set(candidates.map((c) => c.mediaClipId)).size;
+  // The last outcome, only while it still describes the cut on screen.
+  const shownOutcome =
+    outcome &&
+    !pending &&
+    outcome.code !== "proposed" &&
+    (outcome.revision === null || outcome.revision === run?.analysis.revision)
+      ? outcome
+      : null;
+  const roles = run?.inventory.roles ?? [];
+  const uncertainRoles = roles.filter((r) => r.role === "uncertain").length;
+
+  return (
+    <div className="mt-3 space-y-3 text-xs" data-testid="coverage-panel">
+      <p className="text-muted-foreground">
+        Cover recommends B-roll on V2 over potential jump cuts — where two pieces of the same
+        interview take meet. Whether a cut actually reads as a jump isn&apos;t verified. Local and
+        deterministic: no AI request. Nothing changes until you accept; the interview picture and
+        audio stay as they are.
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          data-testid="cover-propose"
+          onClick={onPropose}
+          className="inline-flex h-7 items-center gap-1 rounded border border-border px-2.5 text-[11px] text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+        >
+          <Sparkles className="size-3.5" /> {pending ? "Recommend again" : "Recommend B-roll"}
+        </button>
+        {run && (
+          <span data-testid="coverage-summary" className="text-muted-foreground">
+            {jumps.length} potential jump cut{jumps.length === 1 ? "" : "s"}
+            {jumps.length > 0 &&
+              ` · ${counts.uncovered} uncovered · ${counts.partial} partly covered · ${counts.covered} covered · ${counts.blocked} can't be covered safely`}
+          </span>
+        )}
+      </div>
+
+      {shownOutcome && (
+        <p
+          data-testid="coverage-outcome"
+          data-code={shownOutcome.code}
+          className={cn(
+            shownOutcome.code === "nothing-to-cover" ? "text-muted-foreground" : "text-warning",
+          )}
+        >
+          {shownOutcome.code === "refused"
+            ? `The timeline rules refused the recommendation: ${shownOutcome.message} Nothing was changed.`
+            : shownOutcome.message}
+        </p>
+      )}
+
+      {jumps.length > 0 && (
+        <ul className="space-y-0.5" data-testid="coverage-cuts">
+          {jumps.map((c) => {
+            const st = cutState(c);
+            const sk = skipOf.get(c.id);
+            const p = placeOf.get(c.id);
+            return (
+              <li key={c.id} data-testid="coverage-cut" data-state={st} data-cut-tc={c.tc}>
+                <span className="font-tc">{c.tc}</span> · {CUT_STATE_TEXT[st]}
+                {c.handEdited && " · hand-edited (covering won't change it)"}
+                {p && pending && ` · recommended: “${p.evidenceLabel}”`}
+                {sk && sk.code !== "already-covered" && (
+                  <span className="block pl-3 text-muted-foreground" data-skip={sk.code}>
+                    {sk.message}
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {plan && plan.placements.length > 0 && (
+        <ul className="space-y-0.5 text-muted-foreground" data-testid="coverage-limitations">
+          {plan.limitations.map((l, i) => (
+            <li key={i}>Note: {l}</li>
+          ))}
+          <li>
+            Note: recommendations use only the stored analysis (logged visual moments and the
+            transcript); the footage hasn&apos;t been examined again.
+          </li>
+        </ul>
+      )}
+
+      {run && (
+        <details open={uncertainRoles > 0} data-testid="media-roles">
+          <summary className={cn(h, "cursor-pointer")}>
+            Media roles · {brollFiles} B-roll file{brollFiles === 1 ? "" : "s"},{" "}
+            <span data-testid="coverage-inventory" data-candidates={candidates.length}>
+              {candidates.length} logged B-roll moment{candidates.length === 1 ? "" : "s"}
+            </span>
+            {uncertainRoles > 0 && (
+              <span className="text-warning"> · {uncertainRoles} uncertain</span>
+            )}
+          </summary>
+          {uncertainEvidence > 0 && (
+            <p className="mt-1 text-warning" data-testid="coverage-uncertain-hint">
+              {uncertainEvidence} logged moment{uncertainEvidence === 1 ? " is" : "s are"} in files
+              whose role is uncertain and aren&apos;t used — confirm a file as B-roll to use it.
+            </p>
+          )}
+          <ul className="mt-1 space-y-1">
+            {roles.map((r) => (
+              <li
+                key={r.clipId}
+                data-testid="media-role"
+                data-clip-id={r.clipId}
+                data-role={r.role}
+                data-source={r.source}
+                className={cn(
+                  "flex items-center gap-2 rounded border px-2 py-1",
+                  r.role === "uncertain" ? "border-warning/60 bg-warning/10" : "border-border",
+                )}
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate font-medium">{r.file}</span>
+                  <span className="block truncate text-[11px] text-muted-foreground">
+                    {r.source === "override" ? "Set by you" : "Automatic"}: {ROLE_TEXT[r.role]}
+                    {r.source === "automatic" && r.reasons.length
+                      ? ` — ${r.reasons.join("; ")}`
+                      : ""}
+                  </span>
+                </span>
+                <select
+                  aria-label={`Role of ${r.file}`}
+                  data-testid="media-role-select"
+                  disabled={!canSetRoles}
+                  value={r.source === "override" ? r.role : "auto"}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    onRole(r.clipId, v === "b-roll" || v === "interview" ? v : null);
+                  }}
+                  className="h-6 shrink-0 rounded border border-border bg-surface px-1 text-[11px] disabled:opacity-50"
+                >
+                  <option value="auto">Automatic</option>
+                  <option value="interview">Interview</option>
+                  <option value="b-roll">B-roll</option>
+                </select>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
     </div>
   );

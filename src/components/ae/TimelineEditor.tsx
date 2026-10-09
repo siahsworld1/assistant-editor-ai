@@ -49,6 +49,8 @@ import type { EditorApi } from "@/lib/ae/store";
 import type { TimelinePlayback } from "@/lib/ae/timeline-playback";
 import type { Clip } from "@/lib/ae/types";
 import { commands } from "@/lib/timeline/commands";
+import { analyzeCoverage } from "@/lib/timeline/coverage";
+import { CUT_STATE_TEXT, cutState, type CutState } from "@/lib/ae/coverage-request";
 import type { TypedCommand } from "@/lib/timeline/commands/types";
 import type { MediaInventory } from "@/lib/timeline/invariants";
 import {
@@ -141,6 +143,7 @@ export function TimelineEditor({
   className,
   compare = null,
   onSelectionChange,
+  showCoverage = false,
 }: {
   editor: EditorApi;
   playback: TimelineTransport;
@@ -152,6 +155,8 @@ export function TimelineEditor({
   compare?: ProposalCompare | null;
   /** Reports the selected clip ids (e.g. for "this clip" in a Director instruction). */
   onSelectionChange?: (ids: string[]) => void;
+  /** Cover mode: mark potential jump cuts on the ruler with their coverage. */
+  showCoverage?: boolean;
 }) {
   const seq = editor.sequence;
   const readOnly = !!compare;
@@ -821,6 +826,17 @@ export function TimelineEditor({
     [seq, selected],
   );
 
+  // Cover mode's markers, for the picture on screen (current or proposed).
+  const coverageMarks = useMemo(
+    () =>
+      showCoverage && shown
+        ? analyzeCoverage(shown, "view")
+            .cuts.filter((c) => c.kind === "jump")
+            .map((c) => ({ cut: c, state: cutState(c) }))
+        : [],
+    [showCoverage, shown],
+  );
+
   if (!seq || !shown) {
     return (
       <div className={cn("text-xs text-muted-foreground", className)}>No sequence to edit.</div>
@@ -976,6 +992,21 @@ export function TimelineEditor({
         </div>
       )}
 
+      {showCoverage && (
+        <div
+          data-testid="coverage-legend"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground"
+        >
+          <span>Potential jump cuts (same interview take — not a confirmed defect):</span>
+          {(Object.keys(CUT_STATE_TEXT) as CutState[]).map((k) => (
+            <span key={k} className="inline-flex items-center gap-1">
+              <span className={cn("inline-block size-2 rotate-45 border", MARK_CLASS[k])} />
+              {CUT_STATE_TEXT[k]}
+            </span>
+          ))}
+        </div>
+      )}
+
       <div className="flex">
         <div className="w-[112px] shrink-0">
           <div className="h-6" />
@@ -1002,6 +1033,22 @@ export function TimelineEditor({
               data-testid="timeline-ruler"
               onPointerDown={onRulerPointerDown}
             >
+              {coverageMarks.map(({ cut, state }) => (
+                <span
+                  key={cut.id}
+                  data-testid="coverage-marker"
+                  data-state={state}
+                  data-frame={cut.frame}
+                  role="img"
+                  aria-label={`Potential jump cut at ${cut.tc}: ${CUT_STATE_TEXT[state]}`}
+                  title={`Potential jump cut at ${cut.tc} (same interview take; not visually verified): ${CUT_STATE_TEXT[state]}${state === "blocked" ? ` — ${cut.blockers.map((b) => b.message).join(" ")}` : ""}`}
+                  className={cn(
+                    "pointer-events-none absolute bottom-0.5 z-10 size-2 -translate-x-1/2 rotate-45 border",
+                    MARK_CLASS[state],
+                  )}
+                  style={{ left: px(cut.frame) }}
+                />
+              ))}
               {ticks.map((f) => (
                 <span
                   key={f}
@@ -1135,6 +1182,13 @@ export function TimelineEditor({
 }
 
 /** Ruler tick spacing in frames: the smallest "nice" step at least 64px wide. */
+const MARK_CLASS: Record<CutState, string> = {
+  uncovered: "border-warning bg-warning",
+  partial: "border-warning bg-background",
+  covered: "border-positive bg-positive",
+  blocked: "border-destructive bg-destructive/40",
+};
+
 function rulerStep(pxPerFrame: number, fps: number): number {
   const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
   const nominal = Math.max(1, Math.round(fps));

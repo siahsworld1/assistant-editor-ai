@@ -73,7 +73,15 @@ export const fakeDirector: {
 
 /** The analysis the fake engine reports (transcript and selects), and an
  * optional second project to switch to. Set before launch(). */
-export const fakeAnalysis: { transcript: unknown[]; selects: unknown[]; otherProject: boolean } = {
+export const fakeAnalysis: {
+  transcript: unknown[];
+  selects: unknown[];
+  otherProject: boolean;
+  /** Cover mode: logged visual evidence and the engine's clips (default:
+   * projectClips, no dialogue assessment). */
+  visualEvidence?: unknown[];
+  clips?: Clip[];
+} = {
   transcript: [],
   selects: [],
   otherProject: false,
@@ -105,6 +113,8 @@ export interface Disk {
   v2: string | null;
   saves2: number;
   fail2?: "write-failed" | null;
+  /** The project record as last saved (e.g. with media-role overrides). */
+  project?: unknown;
 }
 
 export type Ctx = ReturnType<typeof useAE>;
@@ -126,6 +136,7 @@ export function Harness(): ReactNode {
   const proposals = useProposalPreview(ae.editor);
   const [selection, setSelection] = useState<string[]>([]);
   pr = proposals;
+  const [coverage, setCoverage] = useState(false);
   const playback = useTimelinePlayback(proposals.previewTimeline ?? version.timeline, clips);
   pb = playback;
   const panel = createElement(ProposalPanel, {
@@ -134,11 +145,15 @@ export function Harness(): ReactNode {
     selection,
     askDirector: ae.askDirector,
     askStory: ae.askStory,
+    coverCuts: ae.coverCuts,
+    setMediaRole: ae.setMediaRole,
+    onModeChange: (m: string) => setCoverage(m === "cover"),
     onBeforeChange: playback.pause,
     demo: true,
   });
   const timeline = createElement(TimelineEditor, {
     compare: proposals.compare,
+    showCoverage: coverage,
     onSelectionChange: setSelection,
     editor: ae.editor,
     playback: {
@@ -168,16 +183,17 @@ export function install(disk: Disk) {
     analysisState: "complete",
     analysisProgress: 100,
     analysisId: ANALYSIS,
-    clips: projectClips.map((c) => ({
+    clips: (fakeAnalysis.clips ?? projectClips).map((c) => ({
       id: c.id,
       filename: c.filename,
       state: "analyzed",
       fps: c.fps,
       durationSeconds: c.durationSeconds,
       hasTranscript: true,
+      ...(c.dialogue ? { dialogue: c.dialogue } : {}),
     })),
     transcript: fakeAnalysis.transcript,
-    visualEvidence: [],
+    visualEvidence: fakeAnalysis.visualEvidence ?? [],
     error: null,
   };
   window.assistantEditorBridge = {
@@ -248,10 +264,13 @@ export function install(disk: Disk) {
     listProjects: vi.fn(async () => ({
       ok: true,
       projects: fakeAnalysis.otherProject
-        ? [project, { ...project, id: "proj-2", name: "Other" }]
-        : [project],
+        ? [disk.project ?? project, { ...project, id: "proj-2", name: "Other" }]
+        : [disk.project ?? project],
     })),
-    saveProject: vi.fn(async () => ({ ok: true, projects: [project] })),
+    saveProject: vi.fn(async (saved: { id: string }) => {
+      if (saved.id === project.id) disk.project = saved;
+      return { ok: true, projects: [disk.project ?? project] };
+    }),
     deleteProject: vi.fn(async () => ({ ok: true, projects: [project] })),
     chooseMediaFolder: vi.fn(async () => ({ ok: false })),
     indexMedia: vi.fn(async () => ({ ok: false })),
@@ -318,6 +337,8 @@ export async function teardown() {
   fakeAnalysis.transcript = [];
   fakeAnalysis.selects = [];
   fakeAnalysis.otherProject = false;
+  delete fakeAnalysis.visualEvidence;
+  delete fakeAnalysis.clips;
   fakeStory.replies = [];
   fakeStory.requests = [];
   fakeStory.delayMs = 0;

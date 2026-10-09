@@ -120,6 +120,38 @@ describe("project persistence", () => {
     expect(res.error).toMatch(/desktop picker/);
   });
 
+  it("keeps the filmmaker's media-role overrides across save and reload; anything else in them is dropped", async () => {
+    const root = fixtureTree();
+    const c = makeCaps(root);
+    await handleDesktopAction(c, "chooseMediaFolder", {});
+    const saved = await handleDesktopAction(c, "saveProject", {
+      project: {
+        id: "doc-03",
+        name: "Roles",
+        mediaRoot: root,
+        mediaRoles: {
+          "day1/18C_0691.MP4": "b-roll",
+          "A.MOV": "interview",
+          "B.MOV": "ambient",
+          "": "b-roll",
+          "C\u0001.MOV": "b-roll",
+        },
+      },
+    });
+    expect(saved.ok).toBe(true);
+    const roles = { "day1/18C_0691.MP4": "b-roll", "A.MOV": "interview" };
+    expect(saved.projects[0].mediaRoles).toEqual(roles);
+    const reloaded = new DesktopCapabilities({
+      userDataDir: c.userDataDir,
+      showFolderDialog: async () => null,
+    });
+    const listed = await handleDesktopAction(reloaded, "listProjects", {});
+    expect(listed.projects[0].mediaRoles).toEqual(roles);
+    expect(sanitizeProjectRecord({ id: "x", name: "y", mediaRoles: ["b-roll"] }).mediaRoles).toBe(
+      undefined,
+    );
+  });
+
   it("rejects malformed records outright", () => {
     expect(sanitizeProjectRecord({ id: "../x", name: "y" })).toBeNull();
     expect(sanitizeProjectRecord({ id: "x", name: "y", mediaRoot: "/a/../b" })).toBeNull();

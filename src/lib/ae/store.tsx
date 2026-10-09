@@ -31,6 +31,7 @@ import { bindStoryPlan } from "@/lib/timeline/story-binding";
 import { buildStoryContext } from "@/lib/timeline/story-context";
 import { compileStoryPlan } from "@/lib/timeline/story-plan";
 import { storyEvidence, type StoryAskResult } from "./story-request";
+import { runCoverage, type CoverageRun } from "./coverage-request";
 import type { Sequence, Transaction } from "@/lib/timeline/types";
 import {
   dispatchTransaction as dispatchToWorkspace,
@@ -313,6 +314,10 @@ interface AEContextValue {
    * current cut, binds it to the exact cut it was asked about, compiles and
    * reviews it. The result is only ever a proposal for the filmmaker. */
   askStory: (instruction: string) => Promise<StoryAskResult>;
+  /** Cover mode (Phase 7): the deterministic B-roll coverage analysis, plan
+   * and reviewed proposal for the version on screen — local, no AI request,
+   * nothing applied. Null when there is no cut. */
+  coverCuts: () => CoverageRun | null;
   setActiveVersion: (id: string) => void;
   /** The canonical schema-2 editor for the active version (see EditorApi). */
   editor: EditorApi;
@@ -1691,6 +1696,23 @@ export function AEProvider({ children }: { children: ReactNode }) {
     },
     [proposalContext, selects, project?.transcript, stories, chosenStoryId, editorClips],
   );
+  const mediaRoleOverrides = activeProject?.mediaRoles;
+  const coverCuts = useCallback(
+    (): CoverageRun | null =>
+      runCoverage(proposalContext(), {
+        clips: editorClips,
+        visualEvidence: project?.visualEvidence ?? [],
+        transcript: project?.transcript ?? [],
+        overrides: mediaRoleOverrides,
+      }),
+    [
+      proposalContext,
+      editorClips,
+      project?.visualEvidence,
+      project?.transcript,
+      mediaRoleOverrides,
+    ],
+  );
   const acceptEditorProposal = useCallback(
     (raw: unknown): AcceptOutcome => {
       const out = acceptProposalIn(raw, { ...proposalContext(), ids: randomIds });
@@ -1783,6 +1805,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       runCommand,
       askDirector,
       askStory,
+      coverCuts,
       setActiveVersion: (id: string) => setActiveVersionId(id),
       editor,
       setTargetSeconds,
@@ -1823,6 +1846,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       runCommand,
       askDirector,
       askStory,
+      coverCuts,
       setMode,
       projects,
       activeProject,

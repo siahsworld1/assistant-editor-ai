@@ -91,6 +91,22 @@ function sanitizeProjectRecord(input) {
     profile,
     mediaRoot,
     mediaCount,
+    // Filmmaker media-role overrides, keyed by relative filename.
+    ...(input.mediaRoles && typeof input.mediaRoles === "object" && !Array.isArray(input.mediaRoles)
+      ? {
+          mediaRoles: Object.fromEntries(
+            Object.entries(input.mediaRoles)
+              .slice(0, 10000)
+              .filter(
+                ([key, value]) =>
+                  key.length > 0 &&
+                  key.length <= 1024 &&
+                  !/[\u0000-\u001f]/.test(key) &&
+                  (value === "b-roll" || value === "interview"),
+              ),
+          ),
+        }
+      : {}),
     createdAt: clampString(input.createdAt, 40) || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
