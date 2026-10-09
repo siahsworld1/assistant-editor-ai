@@ -9,7 +9,9 @@ import type { Clip, VisualEvidence } from "@/lib/ae/types";
 import {
   ctx,
   fakeAnalysis,
+  ANALYSIS,
   freshDisk,
+  itemOf,
   launch,
   q,
   quit,
@@ -153,6 +155,110 @@ describe("restoring saved edits", () => {
     const { disk, state } = await acceptedDisk();
     await reopen(disk, JSON.stringify({ ...state, analysisId: "another-analysis" }));
     act(() => q("restore-warnings-dismiss")!.click());
+    expect(q("restore-warnings")).toBeNull();
+  }, 30000);
+});
+
+/** A filmmaker edit (protect the first interview clip), saved like any edit. */
+function anEdit() {
+  act(() => {
+    const out = ctx!.editor.dispatchTransaction({
+      id: ctx!.editor.ids.next("transaction"),
+      label: "Protect",
+      origin: "manual",
+      createdAt: "fixed",
+      commands: [
+        {
+          id: ctx!.editor.ids.next("command"),
+          type: "SetProtection",
+          params: { itemIds: [itemOf(seq(), "event-1").id], aiLocked: true },
+        },
+      ] as never,
+    });
+    expect(out.ok).toBe(true);
+  });
+}
+
+describe("restoration warnings (Milestone 8)", () => {
+  it("a cut naming media that isn't in the project: opened unchanged, with the missing-media warning", async () => {
+    const { disk, state } = await acceptedDisk();
+    const id = edited(state);
+    const placed = Object.values(state.histories[id]!.present.items).find(
+      (i): i is SavedItem => typeof i === "object" && i.mediaClipId === "clip-005",
+    )!;
+    placed.mediaClipId = "clip-999";
+    await reopen(disk, JSON.stringify(state));
+    expect(ctx!.activeVersionId).toBe(id);
+    expect(warnings().join(" ")).toMatch(
+      /refers to media that is missing or shorter than the cut uses \(1 clip\)\. It was opened unchanged/,
+    );
+    // File names only — no folders, no exception details.
+    expect(warnings().join(" ")).not.toMatch(/\/Users|Error|ENOENT|at \w+ \(/);
+  }, 30000);
+});
+
+describe("saved edits that couldn't be opened are kept before anything replaces them", () => {
+  it("another analysis's edits: the warning says they stay; the first save keeps them, then saves; later saves are ordinary", async () => {
+    const { disk, state } = await acceptedDisk();
+    const other = JSON.stringify({ ...state, analysisId: "another-analysis" });
+    await reopen(disk, other);
+    expect(warnings()[0]).toMatch(
+      /They stay on disk unchanged — before anything new is saved, they're kept as a separate copy/,
+    );
+    anEdit();
+    await settle(() => disk.saves2 > 0 && q("persistence-status")?.dataset.status === "saved");
+    expect(disk.kept).toEqual([other]); // byte for byte
+    expect(JSON.parse(disk.v2!).analysisId).toBe(ANALYSIS);
+    expect(warnings().at(-1)).toMatch(
+      /earlier saved edits were kept unchanged as "proj-1\.v2\.kept-x\.json"/,
+    );
+    act(() => ctx!.editor.undo()); // a later, ordinary save
+    await settle(() => q("persistence-status")?.dataset.status === "saved");
+    expect(disk.kept).toHaveLength(1); // ordinary saves from now on
+  }, 30000);
+
+  it("a damaged file: the first save keeps it before replacing it", async () => {
+    const { disk, state } = await acceptedDisk();
+    const text = JSON.stringify(state);
+    const damaged = text.slice(0, text.length / 2);
+    await reopen(disk, damaged);
+    anEdit();
+    await settle(() => disk.saves2 > 0 && q("persistence-status")?.dataset.status === "saved");
+    expect(disk.kept).toEqual([damaged]);
+    // The load warning already named the kept copy: it isn't announced twice.
+    expect(warnings().filter((w) => w.includes("proj-1.v2.unreadable-x.json"))).toHaveLength(1);
+  }, 30000);
+
+  it("fails closed: if the old file can't be kept, nothing is saved, the file stays, the edit stays open and the reason is shown", async () => {
+    const { disk, state } = await acceptedDisk();
+    const other = JSON.stringify({ ...state, analysisId: "another-analysis" });
+    await reopen(disk, other);
+    disk.failKeep = true;
+    const saves = disk.saves2;
+    anEdit();
+    await settle(() => q("persistence-status")?.dataset.status === "error");
+    expect(ctx!.editor.persistence).toMatchObject({
+      status: "error",
+      message: expect.stringMatching(
+        /earlier saved edits could not be kept first, so they were left untouched/,
+      ),
+    });
+    expect([disk.v2, disk.saves2, disk.kept]).toEqual([other, saves, undefined]);
+    expect(itemOf(seq(), "event-1").protection.aiLocked).toBe(true); // still open here
+    // Once keeping works again, retrying saves.
+    disk.failKeep = false;
+    act(() => ctx!.editor.retrySave());
+    await settle(() => q("persistence-status")?.dataset.status === "saved");
+    expect(disk.kept).toEqual([other]);
+  }, 30000);
+
+  it("a healthy project: edits save normally and nothing is kept", async () => {
+    const { disk, state } = await acceptedDisk();
+    await reopen(disk, JSON.stringify(state));
+    const saves = disk.saves2;
+    anEdit();
+    await settle(() => disk.saves2 > saves && q("persistence-status")?.dataset.status === "saved");
+    expect(disk.kept).toBeUndefined();
     expect(q("restore-warnings")).toBeNull();
   }, 30000);
 });

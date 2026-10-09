@@ -188,6 +188,45 @@ class DesktopCapabilities {
     return { ok: true, projects };
   }
 
+  /**
+   * Before `file` is replaced, keeps a byte-identical copy of what is there —
+   * unless there is nothing, or `isOwn(saved)` says it is this project's own
+   * readable state for the same analysis (an ordinary save). Saved edits from
+   * another analysis, or a damaged file, are never silently replaced. The copy
+   * is named by its content (`<prefix>.kept-…` / `<prefix>.unreadable-…`), so
+   * the same file is kept once. Returns { ok: true, preservedAs? }, or
+   * { ok: false } when a needed copy couldn't be made — the caller must then
+   * not write (fail closed).
+   */
+  async keepBeforeReplacing(file, prefix, isOwn) {
+    let raw;
+    try {
+      raw = await fsp.readFile(file, "utf8");
+    } catch (err) {
+      return err && err.code === "ENOENT" ? { ok: true } : { ok: false };
+    }
+    let saved;
+    let readable = true;
+    try {
+      saved = JSON.parse(raw);
+    } catch {
+      readable = false;
+    }
+    if (readable && saved && typeof saved === "object" && isOwn(saved)) return { ok: true };
+    const digest = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12);
+    const preservedAs = `${prefix}.${readable ? "kept" : "unreadable"}-${digest}.json`;
+    try {
+      await fsp.copyFile(
+        file,
+        path.join(path.dirname(file), preservedAs),
+        fs.constants.COPYFILE_EXCL,
+      );
+    } catch (err) {
+      if (!err || err.code !== "EEXIST") return { ok: false };
+    }
+    return { ok: true, preservedAs };
+  }
+
   /** Write-then-rename: `file` is either its previous contents or the new
    * ones, never a partial write. A failed write leaves the previous file as it
    * was, removes its own partial file, and rethrows. */
@@ -253,20 +292,11 @@ class DesktopCapabilities {
       const state = JSON.parse(raw);
       return { ok: true, state: state && typeof state === "object" ? state : null };
     } catch {
-      // Damaged: keep a copy before a later save can replace it. Named by its
-      // content, so reopening the same damaged file doesn't pile up copies.
-      const digest = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 12);
-      const preservedAs = `${id}.v2.unreadable-${digest}.json`;
-      try {
-        await fsp.copyFile(
-          file,
-          path.join(path.dirname(file), preservedAs),
-          fs.constants.COPYFILE_EXCL,
-        );
-      } catch (err) {
-        if (!err || err.code !== "EEXIST") return { ok: true, state: null, unreadable: true };
-      }
-      return { ok: true, state: null, unreadable: true, preservedAs };
+      // Damaged: keep a copy now, before a later save could replace it.
+      const kept = await this.keepBeforeReplacing(file, `${id}.v2`, () => false);
+      return kept.preservedAs
+        ? { ok: true, state: null, unreadable: true, preservedAs: kept.preservedAs }
+        : { ok: true, state: null, unreadable: true };
     }
   }
 
@@ -279,12 +309,27 @@ class DesktopCapabilities {
     // Checked before anything touches the disk: the previous file stays as it is.
     if (Buffer.byteLength(text, "utf8") > MAX_EDIT_STATE_BYTES)
       return { ok: false, code: "too-large", error: "Edit state is too large to save." };
+    const file = this.editStateV2Path(id);
+    const kept = await this.keepBeforeReplacing(
+      file,
+      `${id}.v2`,
+      (saved) =>
+        saved.schema === 2 &&
+        saved.analysisId === state.analysisId &&
+        Array.isArray(saved.versions),
+    );
+    if (!kept.ok)
+      return {
+        ok: false,
+        code: "preserve-failed",
+        error: "The earlier saved edits could not be kept, so nothing was saved.",
+      };
     try {
-      await this.writeAtomic(this.editStateV2Path(id), text);
+      await this.writeAtomic(file, text);
     } catch {
       return { ok: false, code: "write-failed", error: "The edit state could not be written." };
     }
-    return { ok: true };
+    return kept.preservedAs ? { ok: true, preservedAs: kept.preservedAs } : { ok: true };
   }
 
   async loadEditState(id) {
@@ -307,8 +352,23 @@ class DesktopCapabilities {
     const text = JSON.stringify(state);
     if (text.length > MAX_EDIT_STATE_BYTES)
       return { ok: false, error: "Edit state is too large to save." };
-    await this.writeAtomic(this.editStatePath(id), text);
-    return { ok: true };
+    const file = this.editStatePath(id);
+    const kept = await this.keepBeforeReplacing(
+      file,
+      id,
+      (saved) =>
+        (saved.schema ?? 1) === (state.schema ?? 1) &&
+        saved.analysisId === state.analysisId &&
+        Array.isArray(saved.versions),
+    );
+    if (!kept.ok)
+      return {
+        ok: false,
+        code: "preserve-failed",
+        error: "The earlier saved edits could not be kept, so nothing was saved.",
+      };
+    await this.writeAtomic(file, text);
+    return kept.preservedAs ? { ok: true, preservedAs: kept.preservedAs } : { ok: true };
   }
 
   /** User-gated: opens the OS folder picker. The renderer cannot pass a path in. */

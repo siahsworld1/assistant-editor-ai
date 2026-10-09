@@ -56,7 +56,14 @@ export interface DesktopCapabilitiesApi {
   saveEditState(
     id: string,
     state: unknown,
-  ): Promise<{ ok: boolean; error?: string; code?: string }>;
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    code?: string;
+    /** The file it replaced (another analysis's or damaged edits) was first
+     * kept as this file name, beside it. */
+    preservedAs?: string;
+  }>;
   /** Schema-2 editor state (1.1+), kept in its own file so the schema-1 file
    * above stays exactly as beta.1 wrote it. Optional: older bridges lack it. */
   loadEditStateV2?(id: string): Promise<{
@@ -70,7 +77,14 @@ export interface DesktopCapabilitiesApi {
   saveEditStateV2?(
     id: string,
     state: unknown,
-  ): Promise<{ ok: boolean; error?: string; code?: string }>;
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    code?: string;
+    /** The file it replaced (another analysis's or damaged edits) was first
+     * kept as this file name, beside it. */
+    preservedAs?: string;
+  }>;
 }
 
 /** Snapshot from electron/worker-supervisor.cjs::WorkerSupervisor.status(). */

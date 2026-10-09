@@ -64,9 +64,14 @@ describe("per-project edit state (versions, active cut, chosen story)", () => {
     // A crash mid-write leaves only a .partial next to the real file.
     writeFileSync(path.join(dir, "proj-1.json.partial"), "{ truncated");
     expect((await c.loadEditState("proj-1")).state).toEqual(savedState("a1"));
-    await c.saveEditState("proj-1", savedState("a2"));
+    const res = await c.saveEditState("proj-1", savedState("a2"));
     expect((await c.loadEditState("proj-1")).state.analysisId).toBe("a2");
-    expect(readdirSync(dir)).toEqual(["proj-1.json"]);
+    // No partial file is left; the a1 edits it replaced were kept, not lost
+    // (Milestone 8: saved edits from another analysis are never silently replaced).
+    expect(readdirSync(dir).sort()).toEqual(["proj-1.json", res.preservedAs].sort());
+    expect(JSON.parse(readFileSync(path.join(dir, res.preservedAs!), "utf8"))).toEqual(
+      savedState("a1"),
+    );
   });
 
   it("rejects ids that could escape the edit-state folder, and oversized state", async () => {
@@ -236,6 +241,122 @@ describe("schema-2 edit state (1.1) beside beta.1's schema-1 file", () => {
     await c.deleteProject("proj-1");
     expect((await c.loadEditState("proj-1")).state).toBeNull();
     expect((await c.loadEditStateV2("proj-1")).state).toBeNull();
+  });
+
+  describe("saved edits are never silently replaced (Phase 7, Milestone 8)", () => {
+    const dirOf = (c: { userDataDir: string }) => path.join(c.userDataDir, "edit-state");
+    const kept = (c: { userDataDir: string }) =>
+      readdirSync(dirOf(c)).filter((f) => /\.(kept|unreadable)-[0-9a-f]{12}\.json$/.test(f));
+
+    it("a healthy project saves normally: same analysis, no copies, nothing extra in the reply", async () => {
+      const { c, file } = await withSavedFile();
+      const res = await c.saveEditStateV2("proj-1", { ...v2State("a1"), targetSeconds: 45 });
+      expect(res).toEqual({ ok: true });
+      expect(JSON.parse(readFileSync(file, "utf8")).targetSeconds).toBe(45);
+      expect(kept(c)).toEqual([]);
+    });
+
+    it("edits from another analysis are kept, byte for byte, before the new save replaces them — once", async () => {
+      const { c, file, before } = await withSavedFile(); // analysis a1
+      const res = await c.saveEditStateV2("proj-1", v2State("a2"));
+      expect(res.ok).toBe(true);
+      expect(res.preservedAs).toMatch(/^proj-1\.v2\.kept-[0-9a-f]{12}\.json$/);
+      expect(readFileSync(path.join(dirOf(c), res.preservedAs!)).equals(before)).toBe(true);
+      expect(JSON.parse(readFileSync(file, "utf8")).analysisId).toBe("a2");
+      // Later saves for a2 are ordinary saves.
+      expect(await c.saveEditStateV2("proj-1", { ...v2State("a2"), targetSeconds: 50 })).toEqual({
+        ok: true,
+      });
+      expect(kept(c)).toEqual([res.preservedAs]);
+      // Back to a1 (e.g. the old analysis restored): a2's edits are kept too.
+      const back = await c.saveEditStateV2("proj-1", v2State("a1"));
+      expect(back.preservedAs).toMatch(/^proj-1\.v2\.kept-/);
+      expect(kept(c)).toHaveLength(2);
+    });
+
+    it("a file that isn't a usable schema-2 state for this analysis is kept too", async () => {
+      for (const bad of [
+        { schema: 2, analysisId: "a1" },
+        { schema: 3, analysisId: "a1", versions: [] },
+        [],
+      ]) {
+        const { c, file } = await withSavedFile();
+        writeFileSync(file, JSON.stringify(bad));
+        const res = await c.saveEditStateV2("proj-1", v2State("a1"));
+        expect(res.preservedAs).toMatch(/^proj-1\.v2\.kept-/);
+        expect(JSON.parse(readFileSync(path.join(dirOf(c), res.preservedAs!), "utf8"))).toEqual(
+          bad,
+        );
+      }
+    });
+
+    it("a damaged file is kept under the same name its loading used, not twice", async () => {
+      const { c, file } = await withSavedFile();
+      const damaged = readFileSync(file).subarray(0, 25);
+      writeFileSync(file, damaged);
+      const loaded = await c.loadEditStateV2("proj-1");
+      const saved = await c.saveEditStateV2("proj-1", v2State("a1"));
+      expect(saved.preservedAs).toBe(loaded.preservedAs);
+      expect(kept(c)).toEqual([loaded.preservedAs]);
+      expect(readFileSync(path.join(dirOf(c), saved.preservedAs!)).equals(damaged)).toBe(true);
+    });
+
+    it("fails closed: if the copy can't be made, nothing is written and the old file stays", async () => {
+      const { c, file, before } = await withSavedFile();
+      const copy = vi
+        .spyOn(fsp, "copyFile")
+        .mockRejectedValueOnce(Object.assign(new Error("EACCES: /private/x"), { code: "EACCES" }));
+      try {
+        const res = await c.saveEditStateV2("proj-1", v2State("a2"));
+        expect(res).toEqual({
+          ok: false,
+          code: "preserve-failed",
+          error: "The earlier saved edits could not be kept, so nothing was saved.",
+        });
+        expect(JSON.stringify(res)).not.toMatch(/EACCES|private/);
+      } finally {
+        copy.mockRestore();
+      }
+      expect(readFileSync(file).equals(before)).toBe(true);
+      expect(kept(c)).toEqual([]);
+      expect(leftovers(c)).toEqual([]);
+      // Once the copy can be made, the save goes through.
+      expect((await c.saveEditStateV2("proj-1", v2State("a2"))).preservedAs).toMatch(/kept/);
+    });
+
+    it.skipIf(process.getuid?.() === 0)(
+      "fails closed when the existing file can't even be read",
+      async () => {
+        const { c, file, before } = await withSavedFile();
+        chmodSync(file, 0o000);
+        try {
+          expect((await c.saveEditStateV2("proj-1", v2State("a2"))).code).toBe("preserve-failed");
+        } finally {
+          chmodSync(file, 0o600);
+        }
+        expect(readFileSync(file).equals(before)).toBe(true);
+      },
+    );
+
+    it("schema 1 (beta.1's file): the same rule — another analysis is kept, the same analysis saves normally", async () => {
+      const c = caps();
+      expect(await c.saveEditState("proj-1", savedState("a1"))).toEqual({ ok: true }); // first save: nothing to keep
+      const v1 = path.join(dirOf(c), "proj-1.json");
+      const before = readFileSync(v1);
+      expect(await c.saveEditState("proj-1", savedState("a1"))).toEqual({ ok: true });
+      const res = await c.saveEditState("proj-1", savedState("a2"));
+      expect(res.preservedAs).toMatch(/^proj-1\.kept-[0-9a-f]{12}\.json$/);
+      expect(readFileSync(path.join(dirOf(c), res.preservedAs!)).equals(before)).toBe(true);
+    });
+
+    it("legacy migration is unchanged: the first schema-2 save beside a schema-1 file copies nothing", async () => {
+      const c = caps();
+      await c.saveEditState("proj-1", savedState("a1"));
+      const v1Bytes = readFileSync(path.join(dirOf(c), "proj-1.json"));
+      expect(await c.saveEditStateV2("proj-1", v2State("a1"))).toEqual({ ok: true });
+      expect(kept(c)).toEqual([]);
+      expect(readFileSync(path.join(dirOf(c), "proj-1.json")).equals(v1Bytes)).toBe(true);
+    });
   });
 });
 

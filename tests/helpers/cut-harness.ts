@@ -123,6 +123,10 @@ export interface Disk {
   fail2?: "write-failed" | null;
   /** The project record as last saved (e.g. with media-role overrides). */
   project?: unknown;
+  /** Earlier schema-2 files the main process kept before replacing them. */
+  kept?: string[];
+  /** Make keeping such a file fail (the save is then refused). */
+  failKeep?: boolean;
 }
 
 export type Ctx = ReturnType<typeof useAE>;
@@ -318,9 +322,30 @@ export function install(disk: Disk) {
     }),
     saveEditStateV2: vi.fn(async (_id: string, state: unknown) => {
       if (disk.fail2) return { ok: false, code: disk.fail2 };
+      // As the main process does: a file that isn't this analysis's readable
+      // state is kept before it is replaced — or the save is refused.
+      let preservedAs: string | undefined;
+      if (disk.v2) {
+        let old: { schema?: unknown; analysisId?: unknown; versions?: unknown } | null = null;
+        try {
+          old = JSON.parse(disk.v2);
+        } catch {
+          old = null;
+        }
+        const own =
+          !!old &&
+          old.schema === 2 &&
+          old.analysisId === (state as { analysisId?: unknown }).analysisId &&
+          Array.isArray(old.versions);
+        if (!own) {
+          if (disk.failKeep) return { ok: false, code: "preserve-failed" };
+          (disk.kept ??= []).push(disk.v2);
+          preservedAs = old ? "proj-1.v2.kept-x.json" : "proj-1.v2.unreadable-x.json";
+        }
+      }
       disk.v2 = JSON.stringify(state);
       disk.saves2 += 1;
-      return { ok: true };
+      return preservedAs ? { ok: true, preservedAs } : { ok: true };
     }),
   };
 }

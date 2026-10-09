@@ -399,6 +399,8 @@ const SAVING: EditorPersistence = { status: "saving", message: null };
 function saveErrorMessage(code: string | undefined): string {
   if (code === "too-large")
     return "Your latest edits are too large to save. They are still open here, but are not saved.";
+  if (code === "preserve-failed")
+    return "Your latest edits were not saved: this project's earlier saved edits could not be kept first, so they were left untouched. Your edits are still open here.";
   if (code === "unsupported")
     return "This version of the desktop app cannot save edited timelines. Your edits are still open here, but are not saved.";
   return "Your latest edits could not be saved. They are still open here — try saving again.";
@@ -908,7 +910,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
               );
             else if (res.state && !v2)
               warnings.push(
-                "This project's saved edits belong to a different analysis of its media (or aren't readable), so they weren't opened; its Director versions are shown. Your next edit replaces them.",
+                "This project's saved edits belong to a different analysis of its media (or aren't readable), so they weren't opened; its Director versions are shown. They stay on disk unchanged — before anything new is saved, they're kept as a separate copy.",
               );
           } catch {
             v2 = null;
@@ -1080,16 +1082,31 @@ export function AEProvider({ children }: { children: ReactNode }) {
           ? desktop.saveEditStateV2!(projectId, stamped)
           : desktop.saveEditState(projectId, stamped);
       const done = saveChainRef.current.then(write).then(
-        (res) => ({ ok: !!res?.ok, code: res?.ok ? undefined : res?.code }),
-        () => ({ ok: false, code: undefined }),
+        (res) => ({
+          ok: !!res?.ok,
+          code: res?.ok ? undefined : res?.code,
+          preservedAs: res?.ok ? res.preservedAs : undefined,
+        }),
+        () => ({ ok: false, code: undefined, preservedAs: undefined }),
       );
       saveChainRef.current = done;
-      void done.then(({ ok, code }) => {
+      void done.then(({ ok, code, preservedAs }) => {
         if (hydratedKeyRef.current !== key) return; // project switched meanwhile
         if (ok) {
           persistedRef.current = fingerprint;
           if (useV2) schema2Ref.current = true;
         }
+        // The file this save replaced (another analysis's or damaged edits)
+        // was kept first — say where, by file name only.
+        if (ok && preservedAs)
+          setRestoreWarnings((w) =>
+            w.some((x) => x.includes(`"${preservedAs}"`)) // already said (a damaged file)
+              ? w
+              : [
+                  ...w,
+                  `Before saving, this project's earlier saved edits were kept unchanged as "${preservedAs}" in the app's data folder.`,
+                ],
+          );
         if (attempt !== saveAttemptRef.current) return; // a newer save will report
         // On failure nothing else changes: the edit stays in memory, the
         // last good file stays on disk, and the next change (or retrySave)
