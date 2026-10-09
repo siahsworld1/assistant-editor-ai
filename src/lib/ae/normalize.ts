@@ -446,12 +446,22 @@ function normalizeClips(v: unknown): Clip[] {
     const audioChannels = Math.floor(num(pick(raw, "audioChannels", "audio_channels"), 0));
     const ai = normalizeAiMap(pick(raw, "ai"));
     const aiStatus = normalizeOutcome(pick(raw, "aiStatus"));
+    const dialogueRaw = pick(raw, "dialogue") as
+      { status?: unknown; reasons?: unknown } | undefined;
+    const dialogue =
+      dialogueRaw && ["dialogue", "non-dialogue", "uncertain"].includes(String(dialogueRaw.status))
+        ? {
+            status: dialogueRaw.status as "dialogue" | "non-dialogue" | "uncertain",
+            reasons: strList(dialogueRaw.reasons),
+          }
+        : undefined;
     return {
       id: str(pick(raw, "id", "clipId"), `clip-${i + 1}`),
       filename: str(pick(raw, "filename", "name", "file", "path"), `clip-${i + 1}`),
       ...(relPath ? { relPath } : {}),
       ...(proxyRelPath ? { proxyRelPath } : {}),
       ...(thumbnailRelPath ? { thumbnailRelPath } : {}),
+      ...(dialogue ? { dialogue } : {}),
       role: (CLIP_ROLES as string[]).includes(role) ? (role as Clip["role"]) : "interview",
       durationSeconds: num(pick(raw, "durationSeconds", "duration"), 0),
       camera: str(pick(raw, "camera", "device"), "—"),

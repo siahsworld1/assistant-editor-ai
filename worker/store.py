@@ -175,10 +175,15 @@ class ProjectStore:
 
     def project_json(self) -> dict:
         with self._lock:
+            # Deterministic, local classification (dialogue.py) — no AI call,
+            # never rewrites the transcript. The app decides media roles from it.
+            from dialogue import assess_project
+
+            dialogue = assess_project(self.clips, self.transcript, self.visual_evidence)
             return {
                 "id": self.project_id or "proj-local",
                 "mediaRoot": self.media_root or "",
-                "clips": [c.to_json() for c in self.clips.values()],
+                "clips": [{**c.to_json(), "dialogue": dialogue[c.id]} for c in self.clips.values()],
                 "summary": self.snapshot_summary(),
                 "analysisState": self.analysis_state,
                 "analysisProgress": self.analysis_progress,

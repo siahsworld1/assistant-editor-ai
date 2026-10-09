@@ -285,6 +285,10 @@ interface AEContextValue {
   openProject: (id: string) => Promise<void>;
   deleteProject: (id: string) => Promise<void>;
   importMedia: () => Promise<MediaImportOutcome>;
+  /** Filmmaker override of a media file's role (B-roll / interview), saved
+   * on the project record by relative filename; null clears it. An override
+   * always wins over automatic classification. */
+  setMediaRole: (clipId: string, role: "b-roll" | "interview" | null) => Promise<boolean>;
   retryConnection: () => void;
   setMode: (mode: AppMode) => void;
   analyze: () => void;
@@ -738,6 +742,45 @@ export function AEProvider({ children }: { children: ReactNode }) {
     [applyActive, reindex],
   );
 
+  const roleSavingRef = useRef(false);
+  const setMediaRole = useCallback(
+    async (clipId: string, role: "b-roll" | "interview" | null): Promise<boolean> => {
+      const record = activeRef.current.record;
+      const clip = projectClipsRef.current.find((c) => c.id === clipId);
+      const store = storeRef.current;
+      if (!record || !clip || !store || roleSavingRef.current || modeRef.current === "demo")
+        return false;
+      roleSavingRef.current = true;
+      setProjectBusy(true);
+      setProjectError(null);
+      const mediaRoles = { ...record.mediaRoles };
+      const key = clip.relPath ?? clip.filename;
+      if (role === null) delete mediaRoles[key];
+      else mediaRoles[key] = role;
+      try {
+        const list = await store.save({
+          ...record,
+          mediaRoles,
+          updatedAt: new Date().toISOString(),
+        });
+        setProjects(list);
+        if (activeRef.current.record?.id === record.id) {
+          const updated = list.find((r) => r.id === record.id)!;
+          activeRef.current = { ...activeRef.current, record: updated };
+          setActiveProject(updated);
+        }
+        return true;
+      } catch (err) {
+        setProjectError(err instanceof Error ? err.message : "The media role could not be saved.");
+        return false;
+      } finally {
+        roleSavingRef.current = false;
+        setProjectBusy(false);
+      }
+    },
+    [],
+  );
+
   /** User-gated media import. Indexing happens in the desktop main process. */
   const importMedia = useCallback(async (): Promise<MediaImportOutcome> => {
     const store = storeRef.current;
@@ -761,6 +804,8 @@ export function AEProvider({ children }: { children: ReactNode }) {
       const updated: ProjectRecord = {
         ...record,
         mediaRoot: outcome.index.root,
+        // Overrides belong to the files of ONE media folder.
+        mediaRoles: record.mediaRoot === outcome.index.root ? (record.mediaRoles ?? {}) : {},
         mediaCount: outcome.index.files.length,
         updatedAt: new Date().toISOString(),
       };
@@ -1723,6 +1768,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       openProject,
       deleteProject,
       importMedia,
+      setMediaRole,
       retryConnection,
       setMode,
       analyze,
@@ -1790,6 +1836,7 @@ export function AEProvider({ children }: { children: ReactNode }) {
       openProject,
       deleteProject,
       importMedia,
+      setMediaRole,
       fetchFrames,
     ],
   );

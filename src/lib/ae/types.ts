@@ -77,6 +77,9 @@ export interface Clip {
    * gradient/play-icon placeholder for audio-only clips or a failed/missing image. */
   thumbnailRelPath?: string | undefined;
   role: ClipRole;
+  /** Deterministic worker dialogue assessment (worker/dialogue.py); never
+   * rewrites the transcript. Absent from older engines. */
+  dialogue?: { status: "dialogue" | "non-dialogue" | "uncertain"; reasons: string[] } | undefined;
   durationSeconds: number;
   camera: string;
   resolution: string;

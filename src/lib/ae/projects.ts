@@ -18,6 +18,9 @@ export interface ProjectRecord {
   /** Absolute folder chosen by the user in the desktop picker. "" until imported. */
   mediaRoot: string;
   mediaCount: number;
+  /** Filmmaker media-role overrides, keyed by relative filename (not the
+   * transient clip id). An override always wins over automatic classification. */
+  mediaRoles?: Record<string, "b-roll" | "interview"> | undefined;
   createdAt: string;
   updatedAt: string;
 }
@@ -64,6 +67,23 @@ export function slugId(name: string): string {
 }
 
 /** Pure, defensive normalizer shared by every persistence backend. */
+/** Only well-formed overrides survive: bounded keys without control
+ * characters, values "b-roll" | "interview". */
+export function sanitizeMediaRoles(raw: unknown): Record<string, "b-roll" | "interview"> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return Object.fromEntries(
+    Object.entries(raw)
+      .slice(0, 10000)
+      .filter(
+        ([key, value]) =>
+          key.length > 0 &&
+          key.length <= 1024 &&
+          ![...key].some((ch) => ch.charCodeAt(0) < 32) &&
+          (value === "b-roll" || value === "interview"),
+      ),
+  ) as Record<string, "b-roll" | "interview">;
+}
+
 export function sanitizeProject(input: unknown): ProjectRecord | null {
   if (!input || typeof input !== "object") return null;
   const raw = input as Record<string, unknown>;
@@ -81,6 +101,9 @@ export function sanitizeProject(input: unknown): ProjectRecord | null {
     format: str(raw["format"], 80, "Documentary"),
     profile: PROJECT_PROFILES.includes(profileRaw) ? profileRaw : "documentary",
     mediaRoot,
+    ...(Object.keys(sanitizeMediaRoles(raw["mediaRoles"])).length
+      ? { mediaRoles: sanitizeMediaRoles(raw["mediaRoles"]) }
+      : {}),
     mediaCount: Number.isFinite(count) ? Math.max(0, Math.min(100000, Math.floor(count))) : 0,
     createdAt: str(raw["createdAt"], 40) || new Date().toISOString(),
     updatedAt: str(raw["updatedAt"], 40) || new Date().toISOString(),
